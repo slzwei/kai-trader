@@ -155,6 +155,7 @@ kai-trader/
 | SUPABASE_URL          | yes      | `https://<project-ref>.supabase.co`.               |
 | SUPABASE_DB_PASSWORD  | yes      | Postgres password from Supabase dashboard.         |
 | SUPABASE_KEY          | no       | Service role JWT. Reserved for later phases.       |
+| DATABASE_URL          | no       | Full Postgres URL. Set on IPv4-only networks, use the Session pooler string from the Supabase dashboard. Overrides the computed direct host. |
 | ENV                   | no       | `dev`, `staging`, or `prod`. Default `dev`.        |
 | LOG_LEVEL             | no       | `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default INFO. |
 | TIMEZONE              | no       | IANA name. Default `Asia/Singapore`.               |

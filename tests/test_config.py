@@ -46,3 +46,16 @@ def test_trailing_slash_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SUPABASE_URL", "https://test-ref.supabase.co/")
     config_module.reset_settings_cache()
     assert config_module.get_settings().supabase_url == "https://test-ref.supabase.co"
+
+
+def test_database_url_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    override = (
+        "postgresql://postgres.test-ref:override-pw"
+        "@aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres"
+    )
+    monkeypatch.setenv("DATABASE_URL", override)
+    config_module.reset_settings_cache()
+    s = config_module.get_settings()
+    assert s.database_url == override
+    # Direct host pieces must not leak through when the override is set.
+    assert "db.test-ref.supabase.co" not in s.database_url

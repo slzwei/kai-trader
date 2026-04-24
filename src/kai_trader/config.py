@@ -38,6 +38,16 @@ class Settings(BaseSettings):
         description="Service role JWT. Reserved for later phases.",
     )
     supabase_db_password: SecretStr = Field(..., alias="SUPABASE_DB_PASSWORD")
+    database_url_override: SecretStr | None = Field(
+        default=None,
+        alias="DATABASE_URL",
+        description=(
+            "Full Postgres connection string. When set, used verbatim and the "
+            "direct-host URL is not computed. Needed on IPv4-only networks "
+            "where db.<ref>.supabase.co is unreachable, in which case paste "
+            "the Session pooler string from the Supabase dashboard."
+        ),
+    )
 
     env: Environment = Field(default="dev", alias="ENV")
     log_level: LogLevel = Field(default="INFO", alias="LOG_LEVEL")
@@ -60,7 +70,14 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        """Direct Postgres connection string for the Supabase project."""
+        """Postgres connection string for the Supabase project.
+
+        Prefers ``DATABASE_URL`` when set so operators on IPv4-only networks
+        can point at the Supavisor pooler. Falls back to the direct host,
+        which on modern projects is IPv6-only.
+        """
+        if self.database_url_override is not None:
+            return self.database_url_override.get_secret_value()
         password = self.supabase_db_password.get_secret_value()
         return (
             f"postgresql://postgres:{password}"
