@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import uuid
 from typing import Any
+from urllib.parse import urlparse
 
 import asyncpg
 
@@ -23,13 +24,14 @@ async def get_pool(settings: Settings | None = None) -> asyncpg.Pool:
     global _pool
     if _pool is None:
         cfg = settings or get_settings()
+        dsn = cfg.database_url
         _pool = await asyncpg.create_pool(
-            dsn=cfg.database_url,
+            dsn=dsn,
             min_size=1,
             max_size=5,
             command_timeout=30,
         )
-        _log.info("db.pool.created", dsn_host=f"db.{cfg.supabase_project_ref}.supabase.co")
+        _log.info("db.pool.created", dsn_host=urlparse(dsn).hostname or "unknown")
     assert _pool is not None
     return _pool
 
