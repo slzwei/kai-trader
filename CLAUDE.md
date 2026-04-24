@@ -3,6 +3,49 @@
 Reference for Claude (and humans) working inside this repo. Keep it current as
 the project evolves.
 
+## Product vision
+
+Kai Trader is a single-owner automated options trading system. One person
+runs it, one person watches it, and nothing about the design caters to a
+second user. Control and monitoring happen through a private Telegram bot.
+Supabase Postgres holds the truth for every flag, every command, every trade,
+every notification.
+
+### What it trades
+
+A defensive, premium-capture wheel on Alpaca. Paper trading comes first. Live
+trading follows only after explicit flags are flipped. Capital is split across
+three risk sleeves:
+
+- Index core. Broad market exposure, the steady base.
+- Stable large-cap. High-quality single names with reliable premium.
+- Opportunistic. A smaller, selective bucket for setups that earn their way in.
+
+Entries are regime-aware, exits lean conservative, and the bot does not chase.
+No heroics.
+
+### Non-negotiable design values
+
+- Defence over offence. The kill-switch, the new-entries gate, and the global
+  trading-enabled flag are always respected. If one says stop, the system
+  stops. No hidden overrides.
+- Audit everything. Every inbound command and every outbound trade writes a
+  row. State never changes in the dark.
+- Silent-ignore for strangers. Unauthorised Telegram users get no reply, not
+  even an error. The bot will not confirm its own identity to probers.
+- Small surface area. Nothing ships outside the active phase spec. Feature
+  creep is worse than a missing feature.
+- Quality gates are not optional. Type hints, `ruff`, `mypy --strict`, and a
+  real test suite are the floor, not the ceiling.
+
+### Phased build plan
+
+- Phase 1: foundation and bot skeleton. Complete.
+- Phase 2+: Alpaca integration, the wheel strategy itself, regime detection,
+  risk-sleeve allocation, a notification delivery worker, and eventually a
+  dashboard. Each phase gets its own spec and its own acceptance criteria
+  before anything merges.
+
 ## Architecture
 
 Kai Trader is a standalone automated options wheel trading system that the
