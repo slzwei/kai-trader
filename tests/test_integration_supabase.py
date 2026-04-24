@@ -26,7 +26,12 @@ def _enabled() -> bool:
 
 
 @pytest.mark.skipif(not _enabled(), reason="SUPABASE_INTEGRATION_TEST != 1")
-async def test_migrations_apply_cleanly() -> None:
+async def test_migrations_apply_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The autouse _env fixture moves CWD into a tmp dir so stray .env files
+    # cannot leak into unit tests. For this test we want the opposite: the
+    # real .env at the repo root is exactly what we need loaded.
+    monkeypatch.chdir(REPO_ROOT)
+
     # Reload settings from the real .env, not the conftest stubs.
     for key in (
         "TELEGRAM_BOT_TOKEN",
@@ -35,7 +40,7 @@ async def test_migrations_apply_cleanly() -> None:
         "SUPABASE_KEY",
         "SUPABASE_DB_PASSWORD",
     ):
-        os.environ.pop(key, None)
+        monkeypatch.delenv(key, raising=False)
 
     from kai_trader import config as config_module
 
