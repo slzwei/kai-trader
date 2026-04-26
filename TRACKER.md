@@ -3,6 +3,42 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-26 . Phase 2.9: Account snapshot history
+
+Shipped:
+
+- Migration 005 creates `account_snapshots` (equity, last_equity, cash,
+  buying_power, portfolio_value, day_pl, status, paper, captured_at)
+  with a desc index on captured_at. Applied to Supabase.
+- `src/kai_trader/db/account_snapshots.py` exposes
+  `record_snapshot(snapshot)` (returns row uuid) and
+  `recent_snapshots(limit)` (returns `StoredSnapshot` dataclasses
+  newest first; rejects limit < 1).
+- `/snapshot_now` command pulls a fresh `AccountSnapshot` from Alpaca
+  and writes it to Postgres, replying with the row id and key fields.
+- `/history [N]` command renders the most recent N (default 10, max
+  50) snapshots with timestamp, equity, cash, and day P&L. Empty
+  state nudges the operator toward `/snapshot_now`. Bad input
+  ("/history banana", "/history 999") replies with a clean error
+  rather than crashing.
+- 4 helper unit tests, 5 handler tests, /help and bot-main updates.
+  132 passing total, 2 skipped, 94% coverage.
+
+Why not /db_positions? The original 2.9 plan was to mirror Alpaca
+positions into our `positions` table. That table is purpose-built
+for the wheel (requires strike, expiration, contracts, sleeve);
+equity positions don't fit. Account snapshot history is the
+genuinely useful thing we can do with the read-only surface, and it
+gives us free P&L tracking pre-strategy.
+
+Not shipped (deliberate):
+
+- Periodic background snapshot writer. Manual is enough for now;
+  add a worker once we know the right cadence (likely tied to the
+  regime-check interval that lands in Phase 3).
+- /db_positions or any positions-table mirroring. That belongs to
+  Phase 3 once the wheel populates the table.
+
 ## 2026-04-26 . Phase 2.8: Market data read
 
 Shipped:

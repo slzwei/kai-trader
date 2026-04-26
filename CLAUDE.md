@@ -183,14 +183,16 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8 shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9 shipped:
 
 - Repo scaffolding, typed config, structlog, pyproject.
-- Four SQL migrations: system flags, bot commands, notifications, positions.
+- Five SQL migrations: system flags, bot commands, notifications, positions,
+  account snapshots.
 - Idempotent migration runner with checksum drift detection.
 - Telegram bot with `/start`, `/help`, `/health`, `/status` (mocked),
   `/account` (live Alpaca paper), `/positions` (live Alpaca paper),
-  `/flags`, `/flag`, `/kill`, `/notify_test`, `/quote`.
+  `/flags`, `/flag`, `/kill`, `/notify_test`, `/quote`, `/snapshot_now`,
+  `/history`.
 - Whitelist auth middleware with silent-ignore for non-owners.
 - Read-only Alpaca client at `src/kai_trader/broker/alpaca.py`. Wraps the
   sync `alpaca-py` SDK with `asyncio.to_thread`. Exposes `get_account`,
@@ -199,6 +201,12 @@ Phases 1, 2, 2.5, 2.7, 2.8 shipped:
   async-via-to_thread pattern around Alpaca's StockHistoricalDataClient.
   Exposes `get_latest_quote` and `get_latest_trade` returning
   `QuoteSnapshot` / `TradeSnapshot` dataclasses. Free IEX feed by default.
+- Account snapshot history via migration 005 + `src/kai_trader/db/
+  account_snapshots.py`. `record_snapshot` persists an `AccountSnapshot`,
+  `recent_snapshots(limit)` reads them back newest first. The bot exposes
+  `/snapshot_now` to capture and `/history [N]` to view. Periodic
+  background snapshots are intentionally not wired yet; manual is enough
+  pre-strategy.
 - System-flag helpers at `src/kai_trader/db/system_flags.py`. Reads and
   atomically updates `trading_enabled`, `new_entries_enabled`, and
   `kill_switch`. Records the actor's Telegram ID in `updated_by`.
