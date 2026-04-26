@@ -23,6 +23,8 @@ COMMANDS: list[tuple[str, str]] = [
     ("/snapshot_now", "capture an Alpaca account snapshot into Postgres"),
     ("/history", "recent account snapshots, /history N for the last N (max 50)"),
     ("/chain", "option chain snapshot, /chain SPY or /chain AAPL 2026-05-15"),
+    ("/sleeves", "per-sleeve trading config (allocation, deltas, symbols)"),
+    ("/regime", "live regime classifier output and inputs (VIX, SPY MAs, RV)"),
 ]
 
 

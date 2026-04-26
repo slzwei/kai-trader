@@ -14,12 +14,17 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
+from alpaca.data.requests import (
+    StockBarsRequest,
+    StockLatestQuoteRequest,
+    StockLatestTradeRequest,
+)
+from alpaca.data.timeframe import TimeFrame
 
 from kai_trader.config import Settings, get_settings
 from kai_trader.logging import get_logger
@@ -56,6 +61,19 @@ class TradeSnapshot:
     price: Decimal
     size: Decimal
     timestamp: datetime
+
+
+@dataclass(frozen=True)
+class DailyBar:
+    """Narrow view of a daily OHLCV bar."""
+
+    symbol: str
+    timestamp: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
 
 
 def _build_client(cfg: Settings) -> StockHistoricalDataClient:
@@ -102,6 +120,44 @@ async def get_latest_quote(symbol: str) -> QuoteSnapshot:
         ask_size=_to_decimal(quote.ask_size),
         timestamp=quote.timestamp,
     )
+
+
+async def get_daily_bars(symbol: str, lookback_days: int) -> list[DailyBar]:
+    """Fetch the most recent ``lookback_days`` daily bars for ``symbol``.
+
+    The window pulls more calendar days than ``lookback_days`` to absorb
+    weekends and holidays. Caller can slice the returned list to whatever
+    bar count they need (e.g. last 50 trading days for a 50dma).
+    """
+    if lookback_days < 1:
+        raise ValueError(f"lookback_days must be >= 1, got {lookback_days}")
+    upper = symbol.upper()
+    client = _get_client()
+    end = datetime.now(UTC)
+    # Pad to absorb weekends, holidays, and the request being made before market open.
+    start = end - timedelta(days=lookback_days * 2 + 7)
+    request = StockBarsRequest(
+        symbol_or_symbols=upper,
+        timeframe=TimeFrame.Day,
+        start=start,
+        end=end,
+    )
+    result = await asyncio.to_thread(client.get_stock_bars, request)
+    raw_bars: list[Any] = []
+    if hasattr(result, "data") and isinstance(result.data, dict):
+        raw_bars = result.data.get(upper, [])
+    return [
+        DailyBar(
+            symbol=upper,
+            timestamp=bar.timestamp,
+            open=_to_decimal(bar.open),
+            high=_to_decimal(bar.high),
+            low=_to_decimal(bar.low),
+            close=_to_decimal(bar.close),
+            volume=_to_decimal(bar.volume),
+        )
+        for bar in raw_bars
+    ]
 
 
 async def get_latest_trade(symbol: str) -> TradeSnapshot:

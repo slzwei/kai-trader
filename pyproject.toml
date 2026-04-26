@@ -16,6 +16,7 @@ dependencies = [
     "structlog>=24.1,<26",
     "tzdata>=2024.1",
     "alpaca-py>=0.32,<1",
+    "yfinance>=0.2.40,<1",
 ]
 
 [project.optional-dependencies]
@@ -84,6 +85,10 @@ disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
 module = ["asyncpg.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["yfinance.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
