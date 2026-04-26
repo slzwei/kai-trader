@@ -24,11 +24,13 @@ from kai_trader.bot.handlers import sleeves as sleeves_mod
 from kai_trader.bot.handlers import snapshot_now as snapshot_now_mod
 from kai_trader.bot.handlers import start as start_mod
 from kai_trader.bot.handlers import status as status_mod
+from kai_trader.bot.handlers import strategy_status as strategy_status_mod
 from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
 from kai_trader.broker.market_data import QuoteSnapshot, TradeSnapshot
 from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.account_snapshots import StoredSnapshot
 from kai_trader.db.sleeve_config import SleeveConfig
+from kai_trader.strategy.clock import ClockSnapshot
 from kai_trader.strategy.regime import RegimeSnapshot
 
 
@@ -76,7 +78,7 @@ async def test_help_lists_every_command(
         "/start", "/help", "/health", "/status", "/account",
         "/positions", "/flags", "/flag", "/kill", "/notify_test",
         "/quote", "/snapshot_now", "/history", "/chain",
-        "/sleeves", "/regime",
+        "/sleeves", "/regime", "/strategy_status",
     )
     for cmd in expected:
         assert cmd in text
@@ -915,6 +917,121 @@ async def test_regime_renders_risk_off_behaviour(
     text = _last_reply(update)
     assert "Regime: risk_off" in text
     assert "no new entries" in text
+
+
+async def test_strategy_status_renders_dryrun(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import timedelta
+    from unittest.mock import AsyncMock
+
+    now = datetime(2026, 4, 27, 14, 30, tzinfo=UTC)
+    monkeypatch.setattr(
+        strategy_status_mod,
+        "get_clock_snapshot",
+        AsyncMock(return_value=ClockSnapshot(
+            is_open=True,
+            next_open=now + timedelta(hours=1),
+            next_close=now + timedelta(hours=7),
+            timestamp=now,
+        )),
+    )
+    monkeypatch.setattr(
+        strategy_status_mod,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": False}),
+    )
+    monkeypatch.setattr(
+        strategy_status_mod,
+        "evaluate",
+        AsyncMock(return_value=RegimeSnapshot(
+            regime="risk_on",
+            vix=14.0, vix_5d_change_pct=-1.0,
+            spy_price=505.0, spy_20dma=495.0, spy_50dma=480.0,
+            realized_vol_10d_pct=12.0,
+        )),
+    )
+    monkeypatch.setattr(
+        strategy_status_mod,
+        "get_account",
+        AsyncMock(return_value=AccountSnapshot(
+            equity=Decimal("100000"), last_equity=Decimal("99500"),
+            cash=Decimal("100000"), buying_power=Decimal("400000"),
+            portfolio_value=Decimal("100000"), day_pl=Decimal("500"),
+            status="ACTIVE", paper=True,
+        )),
+    )
+    monkeypatch.setattr(strategy_status_mod, "get_all_sleeves", AsyncMock(return_value=[]))
+    # No sleeves => build_intents returns empty without ever calling get_chain.
+    monkeypatch.setattr(strategy_status_mod, "get_chain", AsyncMock(return_value=[]))
+
+    update = fake_update_factory(user_id=42, text="/strategy_status")
+    await strategy_status_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Strategy status" in text
+    assert "Market: open" in text
+    assert "Regime: risk_on" in text
+    assert "Kill switch: off" in text
+    assert "dry-run only" in text
+    assert "No candidate trades" in text
+
+
+async def test_strategy_status_marks_kill_switch_engaged(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import timedelta
+    from unittest.mock import AsyncMock
+
+    now = datetime(2026, 4, 27, 14, 30, tzinfo=UTC)
+    monkeypatch.setattr(
+        strategy_status_mod,
+        "get_clock_snapshot",
+        AsyncMock(return_value=ClockSnapshot(
+            is_open=False,
+            next_open=now + timedelta(hours=10),
+            next_close=now + timedelta(hours=17),
+            timestamp=now,
+        )),
+    )
+    monkeypatch.setattr(
+        strategy_status_mod,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": True}),
+    )
+    monkeypatch.setattr(
+        strategy_status_mod,
+        "evaluate",
+        AsyncMock(return_value=RegimeSnapshot(
+            regime="risk_off",
+            vix=28.0, vix_5d_change_pct=15.0,
+            spy_price=470.0, spy_20dma=480.0, spy_50dma=485.0,
+            realized_vol_10d_pct=22.0,
+        )),
+    )
+    monkeypatch.setattr(
+        strategy_status_mod,
+        "get_account",
+        AsyncMock(return_value=AccountSnapshot(
+            equity=Decimal("100000"), last_equity=Decimal("99500"),
+            cash=Decimal("100000"), buying_power=Decimal("400000"),
+            portfolio_value=Decimal("100000"), day_pl=Decimal("500"),
+            status="ACTIVE", paper=True,
+        )),
+    )
+    monkeypatch.setattr(strategy_status_mod, "get_all_sleeves", AsyncMock(return_value=[]))
+    monkeypatch.setattr(strategy_status_mod, "get_chain", AsyncMock(return_value=[]))
+
+    update = fake_update_factory(user_id=42, text="/strategy_status")
+    await strategy_status_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Market: closed" in text
+    assert "Kill switch: ENGAGED" in text
 
 
 async def test_kill_engages_both_flags(
