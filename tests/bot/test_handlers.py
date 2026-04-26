@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
 from kai_trader.bot.handlers import account as account_mod
+from kai_trader.bot.handlers import chain as chain_mod
 from kai_trader.bot.handlers import flag as flag_mod
 from kai_trader.bot.handlers import flags as flags_mod
 from kai_trader.bot.handlers import health as health_mod
@@ -23,6 +24,7 @@ from kai_trader.bot.handlers import start as start_mod
 from kai_trader.bot.handlers import status as status_mod
 from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
 from kai_trader.broker.market_data import QuoteSnapshot, TradeSnapshot
+from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.account_snapshots import StoredSnapshot
 
 
@@ -69,7 +71,7 @@ async def test_help_lists_every_command(
     expected = (
         "/start", "/help", "/health", "/status", "/account",
         "/positions", "/flags", "/flag", "/kill", "/notify_test",
-        "/quote", "/snapshot_now", "/history",
+        "/quote", "/snapshot_now", "/history", "/chain",
     )
     for cmd in expected:
         assert cmd in text
@@ -625,6 +627,167 @@ async def test_history_rejects_out_of_range_limit(
     text = _last_reply(update)
     assert "between 1 and 50" in text
     fetch_mock.assert_not_awaited()
+
+
+def _sample_chain() -> list[OptionContract]:
+    return [
+        OptionContract(
+            symbol="SPY260117P00450000",
+            underlying="SPY",
+            option_type="put",
+            strike=Decimal("450.00"),
+            expiration=date(2026, 1, 17),
+            bid=Decimal("2.10"),
+            ask=Decimal("2.20"),
+            last=Decimal("2.15"),
+            delta=Decimal("-0.20"),
+            gamma=Decimal("0.01"),
+            theta=Decimal("-0.05"),
+            vega=Decimal("0.10"),
+            implied_volatility=Decimal("0.18"),
+        ),
+        OptionContract(
+            symbol="SPY260117C00460000",
+            underlying="SPY",
+            option_type="call",
+            strike=Decimal("460.00"),
+            expiration=date(2026, 1, 17),
+            bid=None,
+            ask=None,
+            last=None,
+            delta=None,
+            gamma=None,
+            theta=None,
+            vega=None,
+            implied_volatility=None,
+        ),
+    ]
+
+
+async def test_chain_renders_contracts(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(chain_mod, "get_chain", AsyncMock(return_value=_sample_chain()))
+
+    update = fake_update_factory(user_id=42, text="/chain SPY")
+    await chain_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "SPY option chain" in text
+    assert "2 contracts" in text
+    assert "2026-01-17 P USD 450.00" in text
+    assert "delta -0.20" in text
+    # Contracts with no quote/greeks render n/a rather than crashing.
+    assert "2026-01-17 C USD 460.00" in text
+    assert "delta n/a" in text
+
+
+async def test_chain_with_expiration_filter(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    get_chain_mock = AsyncMock(return_value=_sample_chain()[:1])
+    monkeypatch.setattr(chain_mod, "get_chain", get_chain_mock)
+
+    update = fake_update_factory(user_id=42, text="/chain SPY 2026-01-17")
+    await chain_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "expiry 2026-01-17" in text
+    get_chain_mock.assert_awaited_once_with("SPY", date(2026, 1, 17))
+
+
+async def test_chain_empty_state(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(chain_mod, "get_chain", AsyncMock(return_value=[]))
+
+    update = fake_update_factory(user_id=42, text="/chain ZZZZ")
+    await chain_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "No option chain returned for ZZZZ" in text
+
+
+async def test_chain_shows_usage_when_called_without_args(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(chain_mod, "get_chain", AsyncMock())
+
+    update = fake_update_factory(user_id=42, text="/chain")
+    await chain_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Usage:" in text
+
+
+async def test_chain_rejects_bad_date(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    fetch_mock = AsyncMock()
+    monkeypatch.setattr(chain_mod, "get_chain", fetch_mock)
+
+    update = fake_update_factory(user_id=42, text="/chain SPY not-a-date")
+    await chain_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Cannot parse 'not-a-date'" in text
+    fetch_mock.assert_not_awaited()
+
+
+async def test_chain_truncates_long_chains(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    big_chain = []
+    for i in range(50):
+        big_chain.append(
+            OptionContract(
+                symbol=f"SPY260117P00{400 + i:05d}000",
+                underlying="SPY",
+                option_type="put",
+                strike=Decimal(f"{400 + i}.00"),
+                expiration=date(2026, 1, 17),
+                bid=Decimal("1.00"),
+                ask=Decimal("1.10"),
+                last=Decimal("1.05"),
+                delta=Decimal("-0.20"),
+                gamma=Decimal("0.01"),
+                theta=Decimal("-0.05"),
+                vega=Decimal("0.10"),
+                implied_volatility=Decimal("0.20"),
+            )
+        )
+    monkeypatch.setattr(chain_mod, "get_chain", AsyncMock(return_value=big_chain))
+
+    update = fake_update_factory(user_id=42, text="/chain SPY")
+    await chain_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "50 contracts" in text
+    assert "showing first 30 of 50" in text
 
 
 async def test_kill_engages_both_flags(

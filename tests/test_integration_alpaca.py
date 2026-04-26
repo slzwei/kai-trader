@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from kai_trader.broker import alpaca as broker
-from kai_trader.broker import market_data
+from kai_trader.broker import market_data, options_data
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -51,6 +51,7 @@ async def test_paper_account_and_positions_round_trip(
     config_module.reset_settings_cache()
     broker.reset_client()
     market_data.reset_client()
+    options_data.reset_client()
 
     settings = config_module.get_settings()
     assert settings.alpaca_paper is True, "Integration test must run against paper."
@@ -82,3 +83,12 @@ async def test_paper_account_and_positions_round_trip(
     trade = await market_data.get_latest_trade("SPY")
     assert trade.symbol == "SPY"
     assert trade.price > Decimal("0")
+
+    # Options chain: SPY always has listed contracts.
+    chain = await options_data.get_chain("SPY")
+    assert isinstance(chain, list)
+    if chain:
+        sample = chain[0]
+        assert sample.underlying == "SPY"
+        assert sample.option_type in ("call", "put")
+        assert sample.strike > Decimal("0")
