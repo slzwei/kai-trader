@@ -3,6 +3,76 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-27 . Phase 3.5: Drawdown breaker, roll logic, /close
+
+Phase 3 complete with this commit chain.
+
+Shipped:
+
+- `strategy/drawdown.py` with `compute_drawdown(snapshots, current)`
+  (pure) and `check_and_trip(current_equity, kill_switch_already_on)`
+  (writes flag and fires critical notification on fresh breach).
+  Threshold 7% from the prior 7-day high; idempotent when the kill
+  switch is already engaged.
+- `strategy/rolls.py` with `evaluate_rolls(positions, sleeves,
+  regime, chain_fetcher, today)` returning typed `RollIntent` per
+  challenged short put. Walks Alpaca positions, parses OCC symbols,
+  looks up the position's live delta in the chain, picks a further-
+  OTM same-or-later-expiration candidate, and only marks "rolled"
+  when the new bid minus the existing ask is strictly positive.
+  Otherwise reason is "no_net_credit_candidate" or "no_chain_match"
+  and the worker holds.
+- `broker/alpaca.py` adds `close_position(symbol)` gated only by
+  `kill_switch` (not by `trading_enabled`; closing reduces risk).
+  Returns the same typed `SubmitResult` shape as the submit path.
+- Strategy worker rewritten:
+  - Drawdown check runs after the account fetch and before any
+    strategy work. A fresh breach trips the kill switch and the rest
+    of the tick short-circuits to the kill_switch summary path.
+  - Roll evaluation runs after regime/sleeves and before new entries
+    so capital that gets rolled into is reflected in the cap math.
+  - When a roll fires under green flags, the worker submits a close
+    on the underlying followed by a sell-to-open at the new strike,
+    recording both as separate `orders` rows (`action='close'` and
+    `action='roll'`).
+  - Tick summary now reports rolled / held counts alongside
+    submitted / skipped / failed.
+- `/close SYMBOL` stages a pending close keyed by (user_id, symbol)
+  with a 30-second TTL in module-level state. `/close_confirm SYMBOL`
+  consumes the staged entry and submits via the gated broker.
+  Each confirm lands an `action='close'` audit row.
+- 9 drawdown tests (pure compute table + the trip + idempotency
+  paths), 7 rolls tests (untriggered skipped, rolled when net credit,
+  held when no net credit, long positions skipped, unparseable
+  symbols skipped, no matching sleeve skipped, no chain match
+  reported), 3 broker close_position tests (kill-switch refusal,
+  trading-disabled allowed, alpaca exception path), 6 close handler
+  tests (stage, usage, confirm executes, no-pending, ttl-expired,
+  kill-switch path), 3 worker tests (drawdown short-circuit, roll
+  execution under green flags, roll skipped under red flags), plus
+  bot-main updates. Total 272 passing, 2 skipped, 94% coverage.
+
+Phase 3 done. The full pipeline now: regime classifier drives
+sleeve activity; tick loop builds intents and submits gated by
+flags; orders table audits every decision; reconciliation writes
+back fills; drawdown breaker trips at 7% from the weekly high;
+rolls fire on challenged positions but only for net credit;
+manual /close exists for discretionary intervention. To start
+real paper trading: `/flag trading_enabled on`.
+
+Not shipped (later phases or future tuning):
+
+- Local positions table writes on fill. Alpaca's `list_positions`
+  is the source of truth for what we hold; the local positions
+  table from migration 004 stays unused until we want
+  wheel-lifecycle tracking (assignment / expired / rolled state
+  transitions persisted locally).
+- IV-rank entry filter, earnings-window blackout, multi-expiration
+  per symbol. Listed as future tuning levers in PHASE3.md.
+- Live (non-paper) trading. `ALPACA_PAPER=true` remains the default.
+  Switching to live needs a separate review.
+- Web dashboard, SMS notifications, Doppler.
+
 ## 2026-04-27 . Phase 3.4: Order placement gated by flags
 
 Shipped:

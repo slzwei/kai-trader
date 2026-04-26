@@ -183,7 +183,7 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3, 3.4 shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3, 3.4, 3.5 shipped (Phase 3 complete):
 
 - Repo scaffolding, typed config, structlog, pyproject.
 - Eight SQL migrations: system flags, bot commands, notifications, positions,
@@ -193,7 +193,7 @@ Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3, 3.4 shipped:
   `/account` (live Alpaca paper), `/positions` (live Alpaca paper),
   `/flags`, `/flag`, `/kill`, `/notify_test`, `/quote`, `/snapshot_now`,
   `/history`, `/chain`, `/sleeves`, `/regime`, `/strategy_status`,
-  `/trade_now`, `/recent_trades`.
+  `/trade_now`, `/recent_trades`, `/close`, `/close_confirm`.
 - Whitelist auth middleware with silent-ignore for non-owners.
 - Read-only Alpaca client at `src/kai_trader/broker/alpaca.py`. Wraps the
   sync `alpaca-py` SDK with `asyncio.to_thread`. Exposes `get_account`,
@@ -260,6 +260,28 @@ Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3, 3.4 shipped:
     before any HTTP call to Alpaca. Even if the worker code path
     races with someone toggling kill_switch from Telegram, the broker
     refuses cleanly and the row is marked `skipped_by_flag`.
+- Defensive layers (Phase 3.5):
+  - **Drawdown circuit breaker** at `src/kai_trader/strategy/drawdown.py`.
+    Each tick reads recent `account_snapshots`, computes the high-water
+    mark over a 7-day window, and if equity is down 7% or more from
+    that high it auto-engages `kill_switch` and fires a `critical`
+    notification. Idempotent: re-tripping on the same already-killed
+    state does not re-notify.
+  - **Roll logic** at `src/kai_trader/strategy/rolls.py`. Worker
+    fetches Alpaca positions, identifies short puts whose live delta
+    has crossed the sleeve's `roll_trigger_delta` (default 0.45), and
+    builds a roll candidate further OTM at the same or later
+    expiration. Only rolls for **net credit**: if the chain has no
+    candidate where the new put's bid exceeds the existing put's ask,
+    holds and surfaces a "no_net_credit_candidate" line in the tick
+    summary. Roll execution is gated by `trading_enabled` and
+    `kill_switch` (held rolls are reported even when execution is
+    blocked, so the operator can see the situation).
+  - **`/close <SYMBOL>` and `/close_confirm <SYMBOL>`** for manual
+    discretionary closes. Two-step confirmation with a 30-second TTL
+    keyed by (user_id, symbol). Closes are gated by `kill_switch`
+    only (not by `trading_enabled`, because closing reduces exposure).
+    Each successful close lands an `action='close'` row in `orders`.
 - Account snapshot history via migration 005 + `src/kai_trader/db/
   account_snapshots.py`. `record_snapshot` persists an `AccountSnapshot`,
   `recent_snapshots(limit)` reads them back newest first. The bot exposes
