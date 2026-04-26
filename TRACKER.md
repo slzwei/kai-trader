@@ -3,6 +3,31 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-26 . Phase 2.8: Market data read
+
+Shipped:
+
+- `src/kai_trader/broker/market_data.py` wrapping Alpaca's
+  StockHistoricalDataClient. Same async-via-to_thread pattern as the
+  trading client. Exposes `get_latest_quote(symbol)` and
+  `get_latest_trade(symbol)` returning narrow `QuoteSnapshot` and
+  `TradeSnapshot` dataclasses. `QuoteSnapshot` carries derived `spread`
+  and `mid` properties so handlers do not have to compute them inline.
+- New `/quote SYMBOL` command. Renders bid, ask, spread, mid, last
+  trade price, and timestamps. Unknown symbols return a clean
+  "No data for X" reply rather than a stack trace.
+- 6 wrapper unit tests, 3 handler tests, plus updates to /help and
+  the bot-main smoke test. Live integration now also exercises a SPY
+  quote and trade. 121 passing total, 2 skipped, 94% coverage.
+
+Notes:
+
+- Free IEX feed is the default for paper accounts. After-hours quotes
+  for thinly-traded names may be empty; that is a data condition, not
+  a wrapper bug.
+- No options data yet. The wheel needs option chains; that goes on
+  the Phase 3 spec.
+
 ## 2026-04-26 . Phase 2.7: Notification delivery worker
 
 Shipped:

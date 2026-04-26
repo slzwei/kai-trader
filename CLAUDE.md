@@ -183,18 +183,22 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7 shipped:
+Phases 1, 2, 2.5, 2.7, 2.8 shipped:
 
 - Repo scaffolding, typed config, structlog, pyproject.
 - Four SQL migrations: system flags, bot commands, notifications, positions.
 - Idempotent migration runner with checksum drift detection.
 - Telegram bot with `/start`, `/help`, `/health`, `/status` (mocked),
   `/account` (live Alpaca paper), `/positions` (live Alpaca paper),
-  `/flags`, `/flag`, `/kill`, `/notify_test`.
+  `/flags`, `/flag`, `/kill`, `/notify_test`, `/quote`.
 - Whitelist auth middleware with silent-ignore for non-owners.
 - Read-only Alpaca client at `src/kai_trader/broker/alpaca.py`. Wraps the
   sync `alpaca-py` SDK with `asyncio.to_thread`. Exposes `get_account`,
   `list_positions`, `ping`. No order placement methods exist anywhere.
+- Market data wrapper at `src/kai_trader/broker/market_data.py`. Same
+  async-via-to_thread pattern around Alpaca's StockHistoricalDataClient.
+  Exposes `get_latest_quote` and `get_latest_trade` returning
+  `QuoteSnapshot` / `TradeSnapshot` dataclasses. Free IEX feed by default.
 - System-flag helpers at `src/kai_trader/db/system_flags.py`. Reads and
   atomically updates `trading_enabled`, `new_entries_enabled`, and
   `kill_switch`. Records the actor's Telegram ID in `updated_by`.
