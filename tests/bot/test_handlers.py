@@ -19,6 +19,8 @@ from kai_trader.bot.handlers import kill as kill_mod
 from kai_trader.bot.handlers import notify_test as notify_test_mod
 from kai_trader.bot.handlers import positions as positions_mod
 from kai_trader.bot.handlers import quote as quote_mod
+from kai_trader.bot.handlers import regime as regime_mod
+from kai_trader.bot.handlers import sleeves as sleeves_mod
 from kai_trader.bot.handlers import snapshot_now as snapshot_now_mod
 from kai_trader.bot.handlers import start as start_mod
 from kai_trader.bot.handlers import status as status_mod
@@ -26,6 +28,8 @@ from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
 from kai_trader.broker.market_data import QuoteSnapshot, TradeSnapshot
 from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.account_snapshots import StoredSnapshot
+from kai_trader.db.sleeve_config import SleeveConfig
+from kai_trader.strategy.regime import RegimeSnapshot
 
 
 def _last_reply(update: Any) -> str:
@@ -72,6 +76,7 @@ async def test_help_lists_every_command(
         "/start", "/help", "/health", "/status", "/account",
         "/positions", "/flags", "/flag", "/kill", "/notify_test",
         "/quote", "/snapshot_now", "/history", "/chain",
+        "/sleeves", "/regime",
     )
     for cmd in expected:
         assert cmd in text
@@ -788,6 +793,128 @@ async def test_chain_truncates_long_chains(
     text = _last_reply(update)
     assert "50 contracts" in text
     assert "showing first 30 of 50" in text
+
+
+def _sleeve_row(name: str, **overrides: Any) -> SleeveConfig:
+    base: dict[str, Any] = {
+        "sleeve": name,
+        "target_pct": Decimal("0.40"),
+        "target_delta_put_risk_on": Decimal("-0.30"),
+        "target_delta_put_neutral": Decimal("-0.20"),
+        "target_delta_call": Decimal("0.20"),
+        "target_dte_min": 7,
+        "target_dte_max": 10,
+        "profit_take_pct": Decimal("0.50"),
+        "roll_trigger_delta": Decimal("0.45"),
+        "symbol_whitelist": ["SPY", "QQQ"],
+        "enabled": True,
+        "updated_at": datetime(2026, 4, 26, tzinfo=UTC),
+        "updated_by": None,
+    }
+    base.update(overrides)
+    return SleeveConfig(**base)
+
+
+async def test_sleeves_renders_three_rows(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        sleeves_mod,
+        "get_all_sleeves",
+        AsyncMock(return_value=[
+            _sleeve_row("index_core"),
+            _sleeve_row("stable_largecap", target_pct=Decimal("0.40")),
+            _sleeve_row("opportunistic", target_pct=Decimal("0.20"), enabled=False),
+        ]),
+    )
+
+    update = fake_update_factory(user_id=42, text="/sleeves")
+    await sleeves_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Sleeve config" in text
+    assert "index_core" in text
+    assert "stable_largecap" in text
+    assert "opportunistic (DISABLED)" in text
+    assert "target: 40.0% of equity" in text
+    assert "delta puts: -0.30 risk_on, -0.20 neutral" in text
+
+
+async def test_sleeves_empty_state(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(sleeves_mod, "get_all_sleeves", AsyncMock(return_value=[]))
+
+    update = fake_update_factory(user_id=42, text="/sleeves")
+    await sleeves_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "No sleeves found" in text
+    assert "migration 006" in text
+
+
+async def test_regime_renders_classifier_output(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    snap = RegimeSnapshot(
+        regime="risk_on",
+        vix=14.5,
+        vix_5d_change_pct=-1.2,
+        spy_price=505.0,
+        spy_20dma=495.0,
+        spy_50dma=480.0,
+        realized_vol_10d_pct=12.0,
+    )
+    monkeypatch.setattr(regime_mod, "evaluate", AsyncMock(return_value=snap))
+
+    update = fake_update_factory(user_id=42, text="/regime")
+    await regime_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Regime: risk_on" in text
+    assert "full target deltas" in text
+    assert "VIX:                14.50" in text
+    assert "VIX 5d change:      -1.20%" in text
+    assert "SPY price:          505.00" in text
+    assert "Realized vol 10d:   12.00%" in text
+
+
+async def test_regime_renders_risk_off_behaviour(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    snap = RegimeSnapshot(
+        regime="risk_off",
+        vix=28.0,
+        vix_5d_change_pct=15.0,
+        spy_price=470.0,
+        spy_20dma=480.0,
+        spy_50dma=485.0,
+        realized_vol_10d_pct=22.0,
+    )
+    monkeypatch.setattr(regime_mod, "evaluate", AsyncMock(return_value=snap))
+
+    update = fake_update_factory(user_id=42, text="/regime")
+    await regime_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Regime: risk_off" in text
+    assert "no new entries" in text
 
 
 async def test_kill_engages_both_flags(
