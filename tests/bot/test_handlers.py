@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 import pytest
 
+from kai_trader.bot.handlers import account as account_mod
 from kai_trader.bot.handlers import health as health_mod
 from kai_trader.bot.handlers import help as help_mod
 from kai_trader.bot.handlers import positions as positions_mod
 from kai_trader.bot.handlers import start as start_mod
 from kai_trader.bot.handlers import status as status_mod
+from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
 
 
 def _last_reply(update: Any) -> str:
@@ -53,12 +56,14 @@ async def test_help_lists_every_command(
     await help_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    for cmd in ("/start", "/help", "/health", "/status", "/positions"):
+    for cmd in ("/start", "/help", "/health", "/status", "/account", "/positions"):
         assert cmd in text
 
 
-async def test_health_reports_uptime_and_db(
-    fake_update_factory: Any, patched_db: dict[str, Any]
+async def test_health_reports_uptime_db_and_broker(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    patched_broker: dict[str, Any],
 ) -> None:
     health_mod.mark_boot_time()
     update = fake_update_factory(user_id=42, text="/health")
@@ -67,12 +72,17 @@ async def test_health_reports_uptime_and_db(
     text = _last_reply(update)
     assert "Bot uptime" in text
     assert "Postgres connection" in text
+    assert "Alpaca paper" in text
     assert "[ok]" in text
+    assert "[fail]" not in text
     patched_db["ping"].assert_awaited_once()
+    patched_broker["ping"].assert_awaited_once()
 
 
 async def test_health_flags_db_failure(
-    fake_update_factory: Any, patched_db: dict[str, Any]
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    patched_broker: dict[str, Any],
 ) -> None:
     patched_db["ping"].return_value = False
     health_mod.mark_boot_time()
@@ -80,7 +90,40 @@ async def test_health_flags_db_failure(
     await health_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "[fail]" in text
+    assert "[fail] Postgres connection" in text
+
+
+async def test_health_flags_broker_failure(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    patched_broker: dict[str, Any],
+) -> None:
+    patched_broker["ping"].return_value = False
+    health_mod.mark_boot_time()
+    update = fake_update_factory(user_id=42, text="/health")
+    await health_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "[fail] Alpaca paper" in text
+
+
+async def test_health_labels_live_when_paper_off(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    patched_broker: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ALPACA_PAPER", "false")
+    from kai_trader import config as config_module
+
+    config_module.reset_settings_cache()
+
+    health_mod.mark_boot_time()
+    update = fake_update_factory(user_id=42, text="/health")
+    await health_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Alpaca LIVE" in text
 
 
 async def test_status_labels_mock_data(
@@ -96,15 +139,99 @@ async def test_status_labels_mock_data(
     assert "Positions: 0 active" in text
 
 
-async def test_positions_returns_placeholder(
-    fake_update_factory: Any, patched_db: dict[str, Any]
+async def test_account_renders_paper_snapshot(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    patched_broker: dict[str, Any],
+) -> None:
+    update = fake_update_factory(user_id=42, text="/account")
+    await account_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Alpaca account (paper)" in text
+    assert "Status: ACTIVE" in text
+    assert "Equity: USD 100,000.00" in text
+    assert "Buying power: USD 400,000.00" in text
+    assert "Day P&L: +USD 500.00" in text
+    patched_broker["get_account"].assert_awaited_once()
+
+
+async def test_account_marks_live_explicitly(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    patched_broker: dict[str, Any],
+) -> None:
+    patched_broker["get_account"].return_value = AccountSnapshot(
+        equity=Decimal("250000"),
+        last_equity=Decimal("251000"),
+        cash=Decimal("10000"),
+        buying_power=Decimal("40000"),
+        portfolio_value=Decimal("250000"),
+        day_pl=Decimal("-1000"),
+        status="ACTIVE",
+        paper=False,
+    )
+    update = fake_update_factory(user_id=42, text="/account")
+    await account_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Alpaca account (LIVE)" in text
+    assert "Day P&L: -USD 1,000.00" in text
+
+
+async def test_positions_empty_state(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    patched_broker: dict[str, Any],
 ) -> None:
     update = fake_update_factory(user_id=42, text="/positions")
     await positions_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "No active positions" in text
-    assert "Trading engine not yet deployed" in text
+    assert "Alpaca positions" in text
+    assert "No open positions." in text
+    patched_broker["list_positions"].assert_awaited_once()
+
+
+async def test_positions_renders_each_holding(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    patched_broker: dict[str, Any],
+) -> None:
+    patched_broker["list_positions"].return_value = [
+        PositionSnapshot(
+            symbol="AAPL",
+            qty=Decimal("100"),
+            side="long",
+            avg_entry_price=Decimal("150.00"),
+            current_price=Decimal("152.50"),
+            market_value=Decimal("15250"),
+            unrealized_pl=Decimal("250"),
+            unrealized_intraday_pl=Decimal("100"),
+        ),
+        PositionSnapshot(
+            symbol="MSFT",
+            qty=Decimal("50"),
+            side="long",
+            avg_entry_price=Decimal("400"),
+            current_price=None,
+            market_value=None,
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        ),
+    ]
+    update = fake_update_factory(user_id=42, text="/positions")
+    await positions_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "AAPL 100 long" in text
+    assert "avg USD 150.00" in text
+    assert "mark USD 152.50" in text
+    assert "pl +USD 250.00" in text
+    # Missing price fields render as 'n/a' rather than crashing.
+    assert "MSFT 50 long" in text
+    assert "mark n/a" in text
+    assert "pl n/a" in text
 
 
 async def test_handler_records_error_on_failure(

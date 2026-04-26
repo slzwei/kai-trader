@@ -23,6 +23,8 @@ def test_env_completeness_reports_each_key() -> None:
         "SUPABASE_URL",
         "SUPABASE_DB_PASSWORD",
         "SUPABASE_KEY",
+        "ALPACA_API_KEY",
+        "ALPACA_SECRET_KEY",
     }
     assert all(status.values())
 

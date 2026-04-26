@@ -1,7 +1,7 @@
 """Smoke test for the bot application builder.
 
-We do not start the network loop; just confirm build_application wires up the
-five handlers and that handler modules expose the expected entry points.
+We do not start the network loop; just confirm build_application wires up
+every handler and that handler modules expose the expected entry points.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ def test_build_application_registers_commands() -> None:
         if isinstance(h, CommandHandler):
             command_names.update(h.commands)
 
-    assert {"start", "help", "health", "status", "positions"} <= command_names
+    assert {"start", "help", "health", "status", "account", "positions"} <= command_names
 
 
 @pytest.mark.parametrize(
@@ -37,6 +37,7 @@ def test_build_application_registers_commands() -> None:
         "kai_trader.bot.handlers.help",
         "kai_trader.bot.handlers.health",
         "kai_trader.bot.handlers.status",
+        "kai_trader.bot.handlers.account",
         "kai_trader.bot.handlers.positions",
     ],
 )

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 
 from kai_trader.bot.formatting import (
     checkmark,
+    format_money,
     format_sgt_timestamp,
+    format_signed_money,
     now_in,
     render_kv,
 )
@@ -42,3 +45,27 @@ def test_render_kv_preserves_order() -> None:
 
 def test_render_kv_empty() -> None:
     assert render_kv({}) == ""
+
+
+def test_format_money_positive_with_thousands() -> None:
+    assert format_money(Decimal("1234.567")) == "USD 1,234.57"
+
+
+def test_format_money_negative() -> None:
+    assert format_money(Decimal("-25.5")) == "USD -25.50"
+
+
+def test_format_money_currency_override() -> None:
+    assert format_money(Decimal("10"), currency="SGD") == "SGD 10.00"
+
+
+def test_format_signed_money_positive() -> None:
+    assert format_signed_money(Decimal("250")) == "+USD 250.00"
+
+
+def test_format_signed_money_negative() -> None:
+    assert format_signed_money(Decimal("-1000")) == "-USD 1,000.00"
+
+
+def test_format_signed_money_zero_shows_plus() -> None:
+    assert format_signed_money(Decimal("0")) == "+USD 0.00"

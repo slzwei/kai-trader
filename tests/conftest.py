@@ -9,12 +9,14 @@ python-telegram-bot network layer.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
 from kai_trader import config as config_module
+from kai_trader.broker.alpaca import AccountSnapshot
 from kai_trader.config import Settings
 
 
@@ -31,6 +33,9 @@ def _env(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     monkeypatch.setenv("SUPABASE_URL", "https://test-ref.supabase.co")
     monkeypatch.setenv("SUPABASE_KEY", "test-service-key")
     monkeypatch.setenv("SUPABASE_DB_PASSWORD", "test-db-password")
+    monkeypatch.setenv("ALPACA_API_KEY", "PKTEST00000000000000")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "test-alpaca-secret")
+    monkeypatch.setenv("ALPACA_PAPER", "true")
     monkeypatch.setenv("ENV", "dev")
     monkeypatch.setenv("LOG_LEVEL", "INFO")
     monkeypatch.setenv("TIMEZONE", "Asia/Singapore")
@@ -96,3 +101,35 @@ def patched_db(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
     monkeypatch.setattr(health_module, "db_ping", ping)
 
     return {"record": record, "mark": mark, "ping": ping}
+
+
+@pytest.fixture
+def patched_broker(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
+    """Patch Alpaca broker entry points used by handlers with AsyncMocks."""
+    sample_account = AccountSnapshot(
+        equity=Decimal("100000.00"),
+        last_equity=Decimal("99500.00"),
+        cash=Decimal("100000.00"),
+        buying_power=Decimal("400000.00"),
+        portfolio_value=Decimal("100000.00"),
+        day_pl=Decimal("500.00"),
+        status="ACTIVE",
+        paper=True,
+    )
+    ping = AsyncMock(return_value=True)
+    get_account = AsyncMock(return_value=sample_account)
+    list_positions = AsyncMock(return_value=[])
+
+    import kai_trader.bot.handlers.account as account_module
+    import kai_trader.bot.handlers.health as health_module
+    import kai_trader.bot.handlers.positions as positions_module
+
+    monkeypatch.setattr(health_module, "broker_ping", ping)
+    monkeypatch.setattr(account_module, "get_account", get_account)
+    monkeypatch.setattr(positions_module, "list_positions", list_positions)
+
+    return {
+        "ping": ping,
+        "get_account": get_account,
+        "list_positions": list_positions,
+    }
