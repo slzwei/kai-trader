@@ -29,7 +29,7 @@ def test_build_application_registers_commands() -> None:
 
     assert {
         "start", "help", "health", "status", "account",
-        "positions", "flags", "flag", "kill",
+        "positions", "flags", "flag", "kill", "notify_test",
     } <= command_names
 
 
@@ -45,6 +45,7 @@ def test_build_application_registers_commands() -> None:
         "kai_trader.bot.handlers.flags",
         "kai_trader.bot.handlers.flag",
         "kai_trader.bot.handlers.kill",
+        "kai_trader.bot.handlers.notify_test",
     ],
 )
 def test_each_handler_module_exports_handle(module_name: str) -> None:

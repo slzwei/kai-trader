@@ -13,6 +13,7 @@ from kai_trader.bot.handlers import flags as flags_mod
 from kai_trader.bot.handlers import health as health_mod
 from kai_trader.bot.handlers import help as help_mod
 from kai_trader.bot.handlers import kill as kill_mod
+from kai_trader.bot.handlers import notify_test as notify_test_mod
 from kai_trader.bot.handlers import positions as positions_mod
 from kai_trader.bot.handlers import start as start_mod
 from kai_trader.bot.handlers import status as status_mod
@@ -61,7 +62,7 @@ async def test_help_lists_every_command(
     text = _last_reply(update)
     expected = (
         "/start", "/help", "/health", "/status", "/account",
-        "/positions", "/flags", "/flag", "/kill",
+        "/positions", "/flags", "/flag", "/kill", "/notify_test",
     )
     for cmd in expected:
         assert cmd in text
@@ -388,6 +389,42 @@ async def test_flag_shows_usage_when_called_without_args(
     text = _last_reply(update)
     assert "Usage:" in text
     assert "trading_enabled" in text
+
+
+async def test_notify_test_enqueues_with_args(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    enqueue_mock = AsyncMock(return_value="00000000-0000-0000-0000-000000000abc")
+    monkeypatch.setattr(notify_test_mod, "enqueue", enqueue_mock)
+
+    update = fake_update_factory(user_id=42, text="/notify_test custom body")
+    await notify_test_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Queued notification 00000000-0000-0000-0000-000000000abc" in text
+    enqueue_mock.assert_awaited_once_with("custom body", "info", channel="telegram")
+
+
+async def test_notify_test_uses_default_body_when_no_args(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    enqueue_mock = AsyncMock(return_value="row-id")
+    monkeypatch.setattr(notify_test_mod, "enqueue", enqueue_mock)
+
+    update = fake_update_factory(user_id=42, text="/notify_test")
+    await notify_test_mod.handle(update, None)  # type: ignore[arg-type]
+
+    enqueue_mock.assert_awaited_once()
+    args, _ = enqueue_mock.await_args
+    assert args[0] == "Kai Trader notification test."
 
 
 async def test_kill_engages_both_flags(
