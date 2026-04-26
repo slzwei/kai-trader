@@ -21,12 +21,14 @@ from kai_trader.bot.handlers import (
     notify_test,
     positions,
     quote,
+    recent_trades,
     regime,
     sleeves,
     snapshot_now,
     start,
     status,
     strategy_status,
+    trade_now,
 )
 from kai_trader.bot.handlers import help as help_handler
 from kai_trader.config import Settings, get_settings
@@ -60,6 +62,8 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CommandHandler("sleeves", sleeves.handle))
     app.add_handler(CommandHandler("regime", regime.handle))
     app.add_handler(CommandHandler("strategy_status", strategy_status.handle))
+    app.add_handler(CommandHandler("trade_now", trade_now.handle))
+    app.add_handler(CommandHandler("recent_trades", recent_trades.handle))
 
     return app
 

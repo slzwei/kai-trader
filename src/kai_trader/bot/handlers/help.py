@@ -25,7 +25,9 @@ COMMANDS: list[tuple[str, str]] = [
     ("/chain", "option chain snapshot, /chain SPY or /chain AAPL 2026-05-15"),
     ("/sleeves", "per-sleeve trading config (allocation, deltas, symbols)"),
     ("/regime", "live regime classifier output and inputs (VIX, SPY MAs, RV)"),
-    ("/strategy_status", "dry-run intent list the strategy worker would build"),
+    ("/strategy_status", "intent list the strategy worker would consider this tick"),
+    ("/trade_now", "force a strategy tick immediately (audit-logged)"),
+    ("/recent_trades", "recent rows from the orders table, /recent_trades N for last N"),
 ]
 
 
