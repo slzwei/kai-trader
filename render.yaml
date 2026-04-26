@@ -1,0 +1,41 @@
+# Render Blueprint for Kai Trader.
+# Single background worker; no inbound HTTP because the bot uses
+# Telegram long-polling. To deploy: connect this repo to Render via
+# https://dashboard.render.com/blueprints, then paste the secret env
+# vars in the dashboard (everything marked sync: false).
+
+services:
+  - type: worker
+    name: kai-trader
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: singapore
+    autoDeploy: true
+    envVars:
+      # Non-secret defaults baked into the manifest.
+      - key: ENV
+        value: prod
+      - key: LOG_LEVEL
+        value: INFO
+      - key: TIMEZONE
+        value: Asia/Singapore
+      - key: ALPACA_PAPER
+        value: "true"
+      # Secrets: set in the Render dashboard, never committed.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_OWNER_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SUPABASE_DB_PASSWORD
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
