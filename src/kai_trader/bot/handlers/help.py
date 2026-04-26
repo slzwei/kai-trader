@@ -22,6 +22,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/quote", "latest bid/ask + last trade for a symbol, e.g. /quote AAPL"),
     ("/snapshot_now", "capture an Alpaca account snapshot into Postgres"),
     ("/history", "recent account snapshots, /history N for the last N (max 50)"),
+    ("/chain", "option chain snapshot, /chain SPY or /chain AAPL 2026-05-15"),
 ]
 
 

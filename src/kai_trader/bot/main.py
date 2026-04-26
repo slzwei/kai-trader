@@ -12,6 +12,7 @@ from telegram.ext import Application, CommandHandler
 
 from kai_trader.bot.handlers import (
     account,
+    chain,
     flag,
     flags,
     health,
@@ -50,6 +51,7 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CommandHandler("quote", quote.handle))
     app.add_handler(CommandHandler("snapshot_now", snapshot_now.handle))
     app.add_handler(CommandHandler("history", history.handle))
+    app.add_handler(CommandHandler("chain", chain.handle))
 
     return app
 
