@@ -15,6 +15,7 @@ dependencies = [
     "python-dotenv>=1.0,<2",
     "structlog>=24.1,<26",
     "tzdata>=2024.1",
+    "alpaca-py>=0.32,<1",
 ]
 
 [project.optional-dependencies]
@@ -100,4 +101,5 @@ asyncio_mode = "auto"
 pythonpath = ["src"]
 markers = [
     "integration: tests that hit live Supabase, skipped unless SUPABASE_INTEGRATION_TEST=1",
+    "alpaca_integration: tests that hit live Alpaca paper, skipped unless ALPACA_INTEGRATION_TEST=1",
 ]

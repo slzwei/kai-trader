@@ -10,7 +10,7 @@ import asyncio
 
 from telegram.ext import Application, CommandHandler
 
-from kai_trader.bot.handlers import health, positions, start, status
+from kai_trader.bot.handlers import account, health, positions, start, status
 from kai_trader.bot.handlers import help as help_handler
 from kai_trader.config import Settings, get_settings
 from kai_trader.db.client import close_pool, get_pool
@@ -25,6 +25,7 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CommandHandler("help", help_handler.handle))
     app.add_handler(CommandHandler("health", health.handle))
     app.add_handler(CommandHandler("status", status.handle))
+    app.add_handler(CommandHandler("account", account.handle))
     app.add_handler(CommandHandler("positions", positions.handle))
 
     return app

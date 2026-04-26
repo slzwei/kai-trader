@@ -10,6 +10,7 @@ from telegram.ext import ContextTypes
 from kai_trader.bot.auth import CommandContext
 from kai_trader.bot.formatting import checkmark, format_sgt_timestamp
 from kai_trader.bot.handlers._common import run_command
+from kai_trader.broker.alpaca import ping as broker_ping
 from kai_trader.config import get_settings
 from kai_trader.db.client import ping as db_ping
 
@@ -39,17 +40,20 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
     settings = get_settings()
 
     db_ok = await db_ping()
+    broker_ok = await broker_ping()
     env_status = settings.env_completeness()
     env_ok = all(env_status.values())
     uptime = _format_uptime()
     ts = format_sgt_timestamp(settings.timezone)
 
+    broker_label = "Alpaca paper" if settings.alpaca_paper else "Alpaca LIVE"
     env_lines = [f"  {checkmark(ok)} {name}" for name, ok in env_status.items()]
     return (
         f"Kai Trader health. {ts}\n"
         "\n"
         f"{checkmark(True)} Bot uptime: {uptime}\n"
         f"{checkmark(db_ok)} Postgres connection\n"
+        f"{checkmark(broker_ok)} {broker_label}\n"
         f"{checkmark(env_ok)} Env var completeness:\n"
         + "\n".join(env_lines)
     )

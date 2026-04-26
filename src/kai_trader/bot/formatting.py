@@ -8,6 +8,7 @@ status-line formatter, common footers).
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 from zoneinfo import ZoneInfo
 
 
@@ -31,3 +32,19 @@ def checkmark(ok: bool) -> str:
 def render_kv(items: dict[str, str]) -> str:
     """Render a dict as 'key: value' lines in insertion order."""
     return "\n".join(f"{k}: {v}" for k, v in items.items())
+
+
+def format_money(amount: Decimal, *, currency: str = "USD") -> str:
+    """Render a Decimal as money to two decimal places, e.g. 'USD 1,234.56'."""
+    quantised = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    sign = "-" if quantised < 0 else ""
+    body = f"{abs(quantised):,.2f}"
+    return f"{currency} {sign}{body}"
+
+
+def format_signed_money(amount: Decimal, *, currency: str = "USD") -> str:
+    """Money with an explicit + or - sign, useful for P&L lines."""
+    quantised = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    sign = "+" if quantised >= 0 else "-"
+    body = f"{abs(quantised):,.2f}"
+    return f"{sign}{currency} {body}"

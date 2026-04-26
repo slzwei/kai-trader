@@ -49,6 +49,17 @@ class Settings(BaseSettings):
         ),
     )
 
+    alpaca_api_key: SecretStr = Field(..., alias="ALPACA_API_KEY")
+    alpaca_secret_key: SecretStr = Field(..., alias="ALPACA_SECRET_KEY")
+    alpaca_paper: bool = Field(
+        default=True,
+        alias="ALPACA_PAPER",
+        description=(
+            "If true, route through Alpaca paper. Live trading requires this "
+            "flag plus the trading-enabled system flag flipped on."
+        ),
+    )
+
     env: Environment = Field(default="dev", alias="ENV")
     log_level: LogLevel = Field(default="INFO", alias="LOG_LEVEL")
     timezone: str = Field(default="Asia/Singapore", alias="TIMEZONE")
@@ -92,6 +103,8 @@ class Settings(BaseSettings):
             "SUPABASE_URL": bool(self.supabase_url),
             "SUPABASE_DB_PASSWORD": bool(self.supabase_db_password.get_secret_value()),
             "SUPABASE_KEY": self.supabase_key.get_secret_value() not in ("", "unset"),
+            "ALPACA_API_KEY": bool(self.alpaca_api_key.get_secret_value()),
+            "ALPACA_SECRET_KEY": bool(self.alpaca_secret_key.get_secret_value()),
         }
 
 

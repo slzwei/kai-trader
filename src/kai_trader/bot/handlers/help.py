@@ -11,9 +11,10 @@ from kai_trader.bot.handlers._common import run_command
 COMMANDS: list[tuple[str, str]] = [
     ("/start", "wake check, echoes your Telegram ID"),
     ("/help", "this list"),
-    ("/health", "bot uptime, DB connection, env completeness"),
+    ("/health", "bot uptime, DB connection, Alpaca connection, env completeness"),
     ("/status", "portfolio summary (mocked until trading engine ships)"),
-    ("/positions", "open positions (placeholder until trading engine ships)"),
+    ("/account", "live Alpaca account snapshot (paper by default)"),
+    ("/positions", "open positions from Alpaca, empty when none are held"),
 ]
 
 
@@ -21,7 +22,7 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
     lines = ["Available commands:", ""]
     lines.extend(f"{cmd}  {desc}" for cmd, desc in COMMANDS)
     lines.append("")
-    lines.append("Phase 1 ships the foundation. More commands arrive in later phases.")
+    lines.append("Phase 2 adds read-only Alpaca. Order placement arrives in later phases.")
     return "\n".join(lines)
 
 
