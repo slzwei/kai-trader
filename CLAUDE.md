@@ -183,7 +183,7 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9 shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1 shipped:
 
 - Repo scaffolding, typed config, structlog, pyproject.
 - Five SQL migrations: system flags, bot commands, notifications, positions,
@@ -192,7 +192,7 @@ Phases 1, 2, 2.5, 2.7, 2.8, 2.9 shipped:
 - Telegram bot with `/start`, `/help`, `/health`, `/status` (mocked),
   `/account` (live Alpaca paper), `/positions` (live Alpaca paper),
   `/flags`, `/flag`, `/kill`, `/notify_test`, `/quote`, `/snapshot_now`,
-  `/history`.
+  `/history`, `/chain`.
 - Whitelist auth middleware with silent-ignore for non-owners.
 - Read-only Alpaca client at `src/kai_trader/broker/alpaca.py`. Wraps the
   sync `alpaca-py` SDK with `asyncio.to_thread`. Exposes `get_account`,
@@ -201,6 +201,12 @@ Phases 1, 2, 2.5, 2.7, 2.8, 2.9 shipped:
   async-via-to_thread pattern around Alpaca's StockHistoricalDataClient.
   Exposes `get_latest_quote` and `get_latest_trade` returning
   `QuoteSnapshot` / `TradeSnapshot` dataclasses. Free IEX feed by default.
+- Options data wrapper at `src/kai_trader/broker/options_data.py` around
+  Alpaca's `OptionHistoricalDataClient`. Exposes `get_chain(symbol,
+  expiration=None)` returning `OptionContract` dataclasses (strike,
+  expiration, type, bid, ask, last, delta, gamma, theta, vega, IV).
+  Includes `parse_occ_symbol` utility for decoding OCC strings.
+  Read-only; the wheel strategy in 3.2+ will use this to walk strikes.
 - Account snapshot history via migration 005 + `src/kai_trader/db/
   account_snapshots.py`. `record_snapshot` persists an `AccountSnapshot`,
   `recent_snapshots(limit)` reads them back newest first. The bot exposes

@@ -3,6 +3,40 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-27 . Phase 3 spec + Phase 3.1: Options data wrapper
+
+Spec:
+
+- `PHASE3.md` captures the end-to-end wheel plan: strategy mechanics,
+  three sleeves with defaults, regime classifier, risk controls,
+  5-minute tick loop, three new migrations, broker extensions, bot
+  commands, sub-phases 3.1-3.5, acceptance criteria, and nine
+  load-bearing decisions awaiting owner sign-off.
+
+Phase 3.1 shipped:
+
+- `src/kai_trader/broker/options_data.py` wraps Alpaca's
+  `OptionHistoricalDataClient`. Same async-via-to_thread pattern.
+  `get_chain(underlying, expiration)` returns `OptionContract`
+  dataclasses with strike, expiration, type, bid, ask, last, delta,
+  gamma, theta, vega, IV. Sorts by (expiration, strike, type).
+  Skips contracts whose OCC symbols cannot be parsed rather than
+  failing the whole call.
+- `parse_occ_symbol` utility decodes OCC strings into (underlying,
+  expiration, option_type, strike). Strategy code in 3.4 will use the
+  inverse to construct symbols for order placement.
+- `/chain SYMBOL [YYYY-MM-DD]` command renders the chain, capped at
+  30 lines with a "showing first N of M" footer to keep Telegram
+  messages readable. Bad date or empty arg returns a clean usage hint.
+- 10 wrapper unit tests, 6 handler tests, /help and bot-main updates,
+  plus an SPY chain assertion in the live integration test.
+  149 passing total, 2 skipped, 95% coverage.
+
+Not shipped (waiting on Phase 3.2):
+
+- Anything that consumes the chain. Strike selection, target-delta
+  search, sleeve-aware filtering all live in 3.2 and 3.3.
+
 ## 2026-04-26 . Phase 2.9: Account snapshot history
 
 Shipped:
