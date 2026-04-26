@@ -183,7 +183,7 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2 shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3 shipped:
 
 - Repo scaffolding, typed config, structlog, pyproject.
 - Seven SQL migrations: system flags, bot commands, notifications, positions,
@@ -192,7 +192,7 @@ Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2 shipped:
 - Telegram bot with `/start`, `/help`, `/health`, `/status` (mocked),
   `/account` (live Alpaca paper), `/positions` (live Alpaca paper),
   `/flags`, `/flag`, `/kill`, `/notify_test`, `/quote`, `/snapshot_now`,
-  `/history`, `/chain`, `/sleeves`, `/regime`.
+  `/history`, `/chain`, `/sleeves`, `/regime`, `/strategy_status`.
 - Whitelist auth middleware with silent-ignore for non-owners.
 - Read-only Alpaca client at `src/kai_trader/broker/alpaca.py`. Wraps the
   sync `alpaca-py` SDK with `asyncio.to_thread`. Exposes `get_account`,
@@ -225,6 +225,22 @@ Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2 shipped:
   weekly-liquid symbol whitelists).
 - Regime history helpers at `src/kai_trader/db/regime_history.py`:
   `append_regime`, `most_recent_regime`, `recent_transitions(limit)`.
+- Strategy tick loop in dry-run mode (`src/kai_trader/strategy/`):
+  - `clock.py` wraps Alpaca `get_clock` so the worker respects market
+    hours and holidays without a local calendar.
+  - `candidates.py` is the pure intent builder. `select_put_strike`
+    picks the put closest to the regime-dependent target delta inside
+    the sleeve DTE band. `build_intents` walks active sleeves
+    (skipping opportunistic in neutral, all in risk_off), fetches
+    chains via an injected callable for testability, applies the
+    sleeve dollar cap, and returns a list of `TradeIntent`.
+  - `worker.py` runs `StrategyWorker` every 5 minutes; it skips
+    closed-market ticks, skips strategy when `kill_switch` is on
+    (still notifies a heartbeat), records regime transitions, and
+    enqueues one info-priority notification per tick summarising the
+    intents it would have submitted.
+  - `/strategy_status` runs the same flow on demand and replies inline.
+  - **No order placement yet.** That arrives in Phase 3.4.
 - Account snapshot history via migration 005 + `src/kai_trader/db/
   account_snapshots.py`. `record_snapshot` persists an `AccountSnapshot`,
   `recent_snapshots(limit)` reads them back newest first. The bot exposes

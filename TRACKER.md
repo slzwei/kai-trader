@@ -3,6 +3,50 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-27 . Phase 3.3: Strategy tick loop (dry-run)
+
+Shipped:
+
+- `strategy/clock.py` wraps Alpaca `get_clock` returning a narrow
+  `ClockSnapshot`. The worker uses it to skip ticks outside market
+  hours instead of maintaining a local calendar.
+- `strategy/candidates.py` builds dry-run trade intents:
+  - `select_put_strike(chain, target_delta, sleeve, today)` is a
+    pure function. Filters to puts inside the sleeve DTE band that
+    report a delta, picks the contract with delta closest to the
+    target.
+  - `build_intents(regime, sleeves, account, chain_fetcher, today)`
+    walks active sleeves (skipping opportunistic in neutral, all in
+    risk_off), fetches chains via an injected callable so unit tests
+    can stub them, picks the strike, builds a `TradeIntent`, and
+    enforces the per-sleeve dollar cap (`target_pct * equity`).
+  - `summarise_intents(list)` renders a one-line-per-intent block
+    plus a portfolio total line for notifications and replies.
+- `strategy/worker.py` defines `StrategyWorker`. Same start/stop
+  pattern as `NotificationWorker`. Polls every 5 min, no-ops when
+  market is closed, no-ops when kill_switch is on (but still emits a
+  heartbeat notification so the operator knows the loop is alive),
+  otherwise: regime evaluation (writes regime_history on transition),
+  account snapshot, sleeve config read, intent build, one
+  info-priority notification with the summary.
+- `/strategy_status` runs the same flow on demand and replies inline.
+  Useful for inspecting the would-be plan during weekends.
+- Worker wired into bot lifecycle alongside the notification worker;
+  cancelled cleanly on shutdown before pool close.
+- 3 clock tests, 12 candidate tests (pure strike selection edge
+  cases plus the build_intents gating, sleeve cap, missing-quote and
+  fetch-error tolerance), 5 worker tests (closed-market skip,
+  kill-switch path, full happy path, transition surfacing, lifecycle),
+  2 handler tests for /strategy_status. Total 217 passing, 2
+  skipped, 95% coverage.
+
+Not shipped (Phase 3.4):
+
+- submit_order, cancel_order, close_position. The TradingClient
+  wrapper is still strictly read-only.
+- `orders` table (migration 008) and the gating-decision audit row.
+- /trade_now, /close, /recent_trades.
+
 ## 2026-04-27 . Phase 3.2: Sleeve config + regime classifier
 
 Shipped:
