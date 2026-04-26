@@ -183,16 +183,16 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1 shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2 shipped:
 
 - Repo scaffolding, typed config, structlog, pyproject.
-- Five SQL migrations: system flags, bot commands, notifications, positions,
-  account snapshots.
+- Seven SQL migrations: system flags, bot commands, notifications, positions,
+  account snapshots, sleeve config, regime history.
 - Idempotent migration runner with checksum drift detection.
 - Telegram bot with `/start`, `/help`, `/health`, `/status` (mocked),
   `/account` (live Alpaca paper), `/positions` (live Alpaca paper),
   `/flags`, `/flag`, `/kill`, `/notify_test`, `/quote`, `/snapshot_now`,
-  `/history`, `/chain`.
+  `/history`, `/chain`, `/sleeves`, `/regime`.
 - Whitelist auth middleware with silent-ignore for non-owners.
 - Read-only Alpaca client at `src/kai_trader/broker/alpaca.py`. Wraps the
   sync `alpaca-py` SDK with `asyncio.to_thread`. Exposes `get_account`,
@@ -206,7 +206,25 @@ Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1 shipped:
   expiration=None)` returning `OptionContract` dataclasses (strike,
   expiration, type, bid, ask, last, delta, gamma, theta, vega, IV).
   Includes `parse_occ_symbol` utility for decoding OCC strings.
-  Read-only; the wheel strategy in 3.2+ will use this to walk strikes.
+- Daily-bar helper added to `market_data.py`: `get_daily_bars(symbol,
+  lookback_days)` returns `DailyBar` rows. Used by the regime classifier
+  for SPY moving averages and realized volatility.
+- Strategy package at `src/kai_trader/strategy/`:
+  - `indicators.py`: `get_vix_snapshot()` (yfinance ^VIX, level + 5d
+    change) and `get_spy_snapshot()` (Alpaca daily bars, price + 20dma
+    + 50dma + 10d realized vol).
+  - `regime.py`: pure `classify(vix, spy)` returning `risk_on` /
+    `neutral` / `risk_off` per the calibrated PHASE3.md thresholds,
+    plus `evaluate()` (live snapshot, no write) and
+    `compute_and_record(notes)` (writes a `regime_history` row only
+    on transition).
+- Sleeve config helpers at `src/kai_trader/db/sleeve_config.py`:
+  `get_all_sleeves`, `get_sleeve(name)`, `update_sleeve(name, *,
+  actor, **fields)` with column allow-list. Three rows seeded by
+  migration 006 (40/40/20 split, calibrated deltas, weekly DTE band,
+  weekly-liquid symbol whitelists).
+- Regime history helpers at `src/kai_trader/db/regime_history.py`:
+  `append_regime`, `most_recent_regime`, `recent_transitions(limit)`.
 - Account snapshot history via migration 005 + `src/kai_trader/db/
   account_snapshots.py`. `record_snapshot` persists an `AccountSnapshot`,
   `recent_snapshots(limit)` reads them back newest first. The bot exposes

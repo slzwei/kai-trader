@@ -3,6 +3,59 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-27 . Phase 3.2: Sleeve config + regime classifier
+
+Shipped:
+
+- `yfinance` added as a dep (Alpaca cannot serve the spot VIX index;
+  VIXY tracks futures and is not interchangeable with VIX for the
+  thresholds).
+- Daily-bar helper added to `broker/market_data.py`:
+  `get_daily_bars(symbol, lookback_days)` returns `DailyBar`. Pads
+  the calendar window to absorb weekends/holidays.
+- `strategy/indicators.py` exposes `get_vix_snapshot()` (yfinance
+  `^VIX`, level + 5d % change) and `get_spy_snapshot()` (Alpaca bars,
+  price + 20dma + 50dma + 10d annualised realized vol). All numbers
+  are floats; precision of Decimal does not buy anything for vol
+  percentages.
+- `strategy/regime.py`:
+  - `classify(vix, spy)` is the pure decision function applying the
+    calibrated thresholds: risk_off if VIX > 25 OR SPY < 50dma OR
+    VIX 5d > +30%; risk_on if VIX < 17 AND SPY > 20dma AND realized
+    vol < 15; neutral otherwise.
+  - `evaluate()` fetches live indicators and classifies (no write).
+  - `compute_and_record(notes)` evaluates and appends a transition
+    row to `regime_history` only when the regime changed.
+- Migration 006 creates `sleeve_config` keyed by sleeve, seeded with
+  the three calibrated rows (40/40/20 allocations; -0.30 risk_on /
+  -0.20 neutral put deltas; 0.20 call delta; 7-10 DTE band; 50%
+  profit take; 0.45 roll trigger; weekly-liquid symbol whitelists).
+- Migration 007 creates `regime_history` (regime, vix, vix_5d_change,
+  SPY price + MAs + RV, notes) with desc index on captured_at.
+- `db/sleeve_config.py` exposes `get_all_sleeves`, `get_sleeve`,
+  `update_sleeve(name, *, actor, **fields)` with column allow-list.
+  `db/regime_history.py` exposes `append_regime`, `most_recent_regime`,
+  `recent_transitions(limit)`.
+- New `/sleeves` and `/regime` commands. `/sleeves` renders all three
+  rows (target pct, deltas, DTE band, profit take, roll trigger,
+  symbols, enabled flag). `/regime` evaluates live indicators on
+  demand and prints the classification + inputs + threshold reminder.
+- 9 indicators tests (SMA, realized vol, VIX history validation, SPY
+  snapshot assembly), 11 regime tests (pure classifier table + the
+  evaluate / compute_and_record paths), 9 sleeve_config tests
+  (canonical order, JSON whitelist parsing, update column allow-list,
+  rejection paths), 5 regime_history tests, 4 handler tests.
+  194 passing total, 2 skipped, 96% coverage.
+
+Not shipped (Phase 3.3+):
+
+- Strategy tick loop. /regime evaluates on demand; nothing schedules
+  it yet. Periodic regime evaluation is a 3.3 concern alongside the
+  candidate-trade loop.
+- /flag-style updates to sleeve config from Telegram. update_sleeve
+  exists; a /sleeve_set or /sleeve_edit command can come later if
+  needed.
+
 ## 2026-04-27 . Phase 3 spec + Phase 3.1: Options data wrapper
 
 Spec:
