@@ -3,6 +3,34 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-26 . Phase 2.5: System-flag command surface
+
+Shipped:
+
+- `src/kai_trader/db/system_flags.py`: `get_all_flags()` returns the three
+  known flags as a dict, defaulting any missing row to `False` so the safe
+  state always wins. `set_flag(key, value, *, actor)` upserts inside a
+  transaction, fills `updated_at` and `updated_by`, and returns the prior
+  value. Unknown keys raise `ValueError`.
+- Three new bot commands:
+  - `/flags` reads all three flags and prints `[ok]` / `[fail]` per line.
+  - `/flag <name> <on|off>` sets a single flag and replies with the
+    "prior -> new" transition. Accepts `on/off`, `true/false`, `1/0`,
+    `yes/no` for the value token.
+  - `/kill` is the emergency composite. Sets `kill_switch=true` and
+    `trading_enabled=false` in two writes. Leaves `new_entries_enabled`
+    alone so the audit trail stays clean for whoever explicitly turned
+    entries off.
+- `/help` advertises all three.
+- 6 new system_flags unit tests, 6 new handler tests, plus updates to
+  /help and the bot-main smoke test. 95 passing total, 2 skipped, 93%
+  coverage.
+
+Not shipped (still out of scope):
+
+- Anything that reads the flags before acting. The wheel strategy is the
+  first caller; it lives in Phase 3.
+
 ## 2026-04-26 . Phase 2: Read-only Alpaca paper integration
 
 Shipped:

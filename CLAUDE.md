@@ -183,17 +183,21 @@ kai-trader/
 
 ## Current state
 
-Phase 1 plus Phase 2 read-only Alpaca:
+Phase 1 plus Phase 2 read-only Alpaca plus Phase 2.5 system-flag controls:
 
 - Repo scaffolding, typed config, structlog, pyproject.
 - Four SQL migrations: system flags, bot commands, notifications, positions.
 - Idempotent migration runner with checksum drift detection.
 - Telegram bot with `/start`, `/help`, `/health`, `/status` (mocked),
-  `/account` (live Alpaca paper), `/positions` (live Alpaca paper).
+  `/account` (live Alpaca paper), `/positions` (live Alpaca paper),
+  `/flags`, `/flag`, `/kill`.
 - Whitelist auth middleware with silent-ignore for non-owners.
 - Read-only Alpaca client at `src/kai_trader/broker/alpaca.py`. Wraps the
   sync `alpaca-py` SDK with `asyncio.to_thread`. Exposes `get_account`,
   `list_positions`, `ping`. No order placement methods exist anywhere.
+- System-flag helpers at `src/kai_trader/db/system_flags.py`. Reads and
+  atomically updates `trading_enabled`, `new_entries_enabled`, and
+  `kill_switch`. Records the actor's Telegram ID in `updated_by`.
 - `/health` reports DB and Alpaca up/down side by side.
 - Test suite at 90%+ coverage. Clean `ruff check`, clean `mypy --strict src/`.
 
@@ -202,8 +206,9 @@ Phase 1 plus Phase 2 read-only Alpaca:
 - Trading logic. The wheel strategy, regime detection, risk sleeves, and
   premium-capture rules all live in later phases.
 - Order placement. The Alpaca client deliberately exposes only fetch methods.
-  Submit, cancel, and close arrive when strategy lands and will be gated by
-  the `trading_enabled` system flag.
+  Submit, cancel, and close arrive when strategy lands. They will read the
+  three flags via `kai_trader.db.system_flags.get_all_flags` before sending
+  anything to the broker.
 - Live (non-paper) trading. `ALPACA_PAPER=true` is the default; flipping it
   to `false` only matters once orders exist.
 - Notification delivery worker. `notifications` rows are queued but nothing
