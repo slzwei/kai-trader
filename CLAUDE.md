@@ -156,6 +156,9 @@ kai-trader/
 | SUPABASE_DB_PASSWORD  | yes      | Postgres password from Supabase dashboard.         |
 | SUPABASE_KEY          | no       | Service role JWT. Reserved for later phases.       |
 | DATABASE_URL          | no       | Full Postgres URL. Set on IPv4-only networks, use the Session pooler string from the Supabase dashboard. Overrides the computed direct host. |
+| ALPACA_API_KEY        | yes      | From the Alpaca dashboard. Paper keys start with PK. |
+| ALPACA_SECRET_KEY     | yes      | Paired with the API key. Shown once on key creation. |
+| ALPACA_PAPER          | no       | `true` (default) routes to Alpaca paper. `false` switches to live, but live trades still require the trading-enabled flag. |
 | ENV                   | no       | `dev`, `staging`, or `prod`. Default `dev`.        |
 | LOG_LEVEL             | no       | `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default INFO. |
 | TIMEZONE              | no       | IANA name. Default `Asia/Singapore`.               |
@@ -180,23 +183,29 @@ kai-trader/
 
 ## Current state
 
-Phase 1 is complete:
+Phase 1 plus Phase 2 read-only Alpaca:
 
 - Repo scaffolding, typed config, structlog, pyproject.
 - Four SQL migrations: system flags, bot commands, notifications, positions.
 - Idempotent migration runner with checksum drift detection.
 - Telegram bot with `/start`, `/help`, `/health`, `/status` (mocked),
-  `/positions` (placeholder).
+  `/account` (live Alpaca paper), `/positions` (live Alpaca paper).
 - Whitelist auth middleware with silent-ignore for non-owners.
-- Test suite at 90%+ coverage.
-- Clean `ruff check`, clean `mypy --strict src/`.
+- Read-only Alpaca client at `src/kai_trader/broker/alpaca.py`. Wraps the
+  sync `alpaca-py` SDK with `asyncio.to_thread`. Exposes `get_account`,
+  `list_positions`, `ping`. No order placement methods exist anywhere.
+- `/health` reports DB and Alpaca up/down side by side.
+- Test suite at 90%+ coverage. Clean `ruff check`, clean `mypy --strict src/`.
 
 ## What is not built yet
 
-- Alpaca integration (Phase 2+). No broker API client, no market data pull,
-  no order routing.
 - Trading logic. The wheel strategy, regime detection, risk sleeves, and
   premium-capture rules all live in later phases.
+- Order placement. The Alpaca client deliberately exposes only fetch methods.
+  Submit, cancel, and close arrive when strategy lands and will be gated by
+  the `trading_enabled` system flag.
+- Live (non-paper) trading. `ALPACA_PAPER=true` is the default; flipping it
+  to `false` only matters once orders exist.
 - Notification delivery worker. `notifications` rows are queued but nothing
   drains them yet.
 - Dashboard / web UI. Not in scope until Phase 5+.
@@ -206,9 +215,9 @@ Phase 1 is complete:
 
 ## Known issues
 
-- The integration test against live Supabase is gated behind
-  `SUPABASE_INTEGRATION_TEST=1`. CI should leave it off until real
-  credentials are wired in.
+- Integration tests against live Supabase and live Alpaca are gated behind
+  `SUPABASE_INTEGRATION_TEST=1` and `ALPACA_INTEGRATION_TEST=1` respectively.
+  CI should leave both off until credentials are wired in.
 - `mypy --strict src/` prints a benign `unused section(s): module = ['tests.*']`
   note because the `tests.*` override is only used when mypy also scans the
   tests directory. The check itself succeeds.

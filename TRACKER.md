@@ -3,6 +3,56 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-26 . Phase 2: Read-only Alpaca paper integration
+
+Shipped:
+
+- `alpaca-py` 0.43 added as a runtime dep.
+- `src/kai_trader/broker/alpaca.py`. Async wrapper around the sync
+  `TradingClient` via `asyncio.to_thread`. Methods: `get_account`,
+  `list_positions`, `ping`. Returns narrow dataclasses (`AccountSnapshot`,
+  `PositionSnapshot`) so handlers do not depend on alpaca-py types.
+  Deliberately no submit, cancel, or close methods.
+- Three Alpaca env vars: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY` (both
+  required), `ALPACA_PAPER` (defaults to `true`).
+- New `/account` command. Renders status, equity, cash, buying power,
+  portfolio value, and day P&L. Header tags paper vs LIVE.
+- `/positions` swapped from placeholder to real Alpaca data. Empty state
+  returns "No open positions." Per-position lines fall back to "n/a" when
+  Alpaca returns null prices.
+- `/health` extended to ping Alpaca alongside Postgres. Both shown up/down
+  on separate lines.
+- `/help` updated to list `/account` and the now-real `/positions`.
+- Money formatters in `bot/formatting.py`: `format_money`,
+  `format_signed_money`. Decimal in, USD by default, two dp, comma-grouped.
+- Tests: 80 passing, 1 skipped, 93% line coverage. New unit tests for the
+  broker (with stub TradingClient), the new handlers, and the money
+  formatters. Live integration test at `tests/test_integration_alpaca.py`,
+  gated behind `ALPACA_INTEGRATION_TEST=1`.
+
+Verified:
+
+- `ruff check`, `mypy --strict src/`, `pytest` all clean.
+- Live integration test passes against the paper account.
+
+Not shipped (out of Phase 2 scope, intentional):
+
+- Order routing. No `submit_order`, `cancel_order`, or `close_position` is
+  exposed anywhere.
+- Wheel strategy, regime detection, sleeve allocation. Phase 3 work.
+- Notification worker. Still queueing into `notifications`, still nothing
+  draining.
+- Live trading wiring. `ALPACA_PAPER=false` is configurable but unused
+  until orders exist; `trading_enabled` flag is also still ungated.
+
+Open follow-ups:
+
+- Once strategy code arrives, every order path must read `system_flags`
+  (`trading_enabled`, `new_entries_enabled`, `kill_switch`) before sending.
+- The DB pool log line bug from 2026-04-25 is fixed in code but the
+  process running before the fix logged a stale host name. Restart the bot
+  to pick up the corrected log.
+
 ## 2026-04-24 . Phase 1: Foundation and Telegram bot skeleton
 
 Shipped:
