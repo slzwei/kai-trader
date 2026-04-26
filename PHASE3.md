@@ -235,37 +235,157 @@ Each is a session, each merges its own conventional-commit chain.
   one full cycle: put sold, expired or assigned, calls sold (if assigned),
   call expired or assigned, back to puts.
 
-## Load-bearing decisions awaiting owner sign-off
+## Targets
 
-These are the choices the spec depends on. If any are wrong, the spec
-needs an edit before 3.1 starts.
+- 3% per month return on equity (~36% annualised simple, ~42% compounded).
+- Maximum drawdown under 10%.
+- Weekly options as the trading vehicle (7 DTE).
 
-1. **Wheel parameters**: target delta -0.20 puts and 0.20-0.30 calls,
-   30-45 DTE, 50% profit take, 0.40 roll trigger. OK?
-2. **Sleeve allocation**: 50% `index_core`, 35% `stable_largecap`,
-   15% `opportunistic`. OK?
-3. **Sleeve symbol whitelists**: defaults above (SPY/QQQ/IWM,
-   AAPL/MSFT/GOOGL/JNJ/KO, NVDA/AMD). OK or want different names?
-4. **Regime thresholds**: VIX 18/25 boundaries, SPY vs 20dma/50dma,
-   realized vol 15. OK?
-5. **Risk controls**: 10% per-symbol cap, 25% total short-put collateral,
-   5% weekly drawdown circuit. OK?
-6. **Tick interval**: 5 minutes during US market hours. OK or want longer
-   (15 min) to reduce API load and avoid over-trading?
-7. **Opportunistic sleeve when paused**: capital sits in cash. OK?
-8. **Auto kill-switch on drawdown breach**: yes, the worker flips
-   `kill_switch=true` on its own when the 5% breach hits. OK or want
-   the worker to only notify and let the owner pull the lever?
-9. **Position sizing formula**: 1 contract per (sleeve_capital / 5)
-   dollars. So a 50% sleeve on $100k equity is $50k, sized at $10k per
-   contract. OK starting point or want a different unit divisor?
+These targets are stretch goals. Multiple sources are explicit that
+3% per month is at the edge of what the wheel produces sustainably and
+typically only happens in elevated-vol regimes (CBOE WPUT data shows
+~37% gross premium per year for weekly puts on SPX, but net of
+losses through drawdowns it lands much lower). Plan for 1.5-2.5%
+average across a full cycle, with the high months covering low ones.
+The parameter set below is the calibration that pushes toward 3% in
+friendly regimes while clamping risk hard enough to keep drawdowns
+inside the 10% floor.
 
-## What this spec deliberately does not decide
+## Calibrated decisions (research-backed)
 
-- IV rank entry filter (e.g. only sell when IVR > 30).
-- Pinning behaviour very near expiration.
-- Multiple concurrent expirations on the same symbol.
-- Earnings-window blackouts.
+The 30-45 DTE references in earlier sections of this document are
+superseded by 7 DTE. The numbers below are the active values for
+sub-phases 3.2 onward.
 
-These are noted as future tuning levers and will be picked up if the
-backtest or paper run shows we need them.
+### 1. Wheel parameters
+
+- **DTE**: 7-10 days. Sell Monday-Wednesday for the upcoming Friday
+  weekly expiration.
+- **Target delta puts**: -0.30 in `risk_on`, -0.20 in `neutral`, no
+  new entries in `risk_off`. Higher delta in friendly regimes is
+  what makes 3% per month plausible; lower delta in neutral keeps
+  drawdown bounded.
+- **Target delta calls**: 0.20 (defensive on the upside, never below
+  cost basis). Same in all regimes.
+- **Profit take**: 50% of credit received. 7 DTE means 50% of premium
+  often arrives within 2-3 days, freeing the collateral to redeploy
+  into the next cycle.
+- **Roll trigger**: option delta crosses 0.45 (in absolute terms). At
+  7 DTE deltas move fast; rolling at 0.40 like the textbook 30-45 DTE
+  number would over-roll.
+- **Hold-to-expiry rule**: if a position is untested at Thursday
+  close, hold through Friday rather than buy back for the last few
+  cents. The gamma risk is real but the leftover premium is
+  meaningful at this DTE.
+
+### 2. Sleeve allocation
+
+40% / 40% / 20% (revised from the original 50/35/15). The 3% target
+needs `stable_largecap` doing real work; weighting it equal to
+`index_core` increases the average premium yield while the
+`opportunistic` 20% provides the upside in friendly regimes.
+
+### 3. Sleeve symbol whitelists
+
+All names below have deep weekly options liquidity (tight spreads,
+high open interest), which matters more for weekly cycles than for
+monthlies.
+
+- `index_core`: SPY, QQQ, IWM
+- `stable_largecap`: AAPL, MSFT, GOOGL, AMZN, META, V, JPM
+- `opportunistic`: NVDA, AMD, TSLA, AVGO, COIN
+
+`stable_largecap` deliberately excludes traditional defensives
+(JNJ, KO, WMT) because their IV is too low to pull the average
+yield toward 3% per month. They can be added back later as a
+defensive tilt if drawdowns run hot.
+
+### 4. Regime thresholds
+
+- `risk_off`: VIX > 25 OR SPY < 50dma OR VIX 5-day change > +30%.
+  Tightened from the original spec to add the VIX-spike detector;
+  weekly put sellers get hurt fastest by sudden vol expansion.
+- `risk_on`: VIX < 17 AND SPY > 20dma AND realized vol < 15. VIX
+  cap lowered from 18 to 17 to be slightly more selective about
+  full-delta entries.
+- `neutral`: otherwise.
+
+### 5. Risk controls
+
+- **Per-symbol cap**: max 1 short put per symbol per weekly cycle.
+  This replaces the original 10% dollar cap because at $100k equity
+  with SPY at $500/share, even one SPY contract requires ~$50k of
+  collateral and a percentage cap would forbid all index trades.
+- **Per-sleeve dollar cap**: sleeve % times equity, hard ceiling.
+- **Total open premium cap**: 60% of equity in cash-secured put
+  collateral. Higher than the original 25% because the 3% target
+  requires most of the capital to be deployed at any given time.
+  Weekly cycling means turnover is high so this is not "always 60%
+  exposed", it is "up to 60% deployed at any moment".
+- **Per-cycle entry cap**: at most 7 new positions in any one weekly
+  cycle. Prevents the worker from filling 12 positions in a single
+  morning if the regime flips friendly.
+- **Drawdown circuit breaker**: if equity drops 7% from prior week's
+  high (read from `account_snapshots`), the worker auto-engages
+  `kill_switch` and fires a `critical` notification. 7% sits between
+  the comfortable operating band and the 10% hard limit; gives the
+  owner time to investigate before manual stop-out.
+
+### 6. Tick interval
+
+5 minutes during US regular market hours (09:30-16:00 ET, Mon-Fri).
+Faster than 15 min because at 7 DTE every hour matters for hitting
+the 50% profit-take target before the next move.
+
+### 7. Opportunistic sleeve when paused
+
+Capital sits in cash. Not redistributed to other sleeves; the
+sleeve lines stay clean and the cash is available the moment regime
+flips back to `risk_on`.
+
+### 8. Auto kill-switch on 7% drawdown breach
+
+Yes, auto. The strategy worker flips `kill_switch=true` and fires a
+`critical`-priority notification. Operator can review the situation
+and clear the kill switch via `/flag kill_switch off` once
+satisfied.
+
+### 9. Position sizing
+
+- One contract per qualifying symbol per weekly cycle (no doubling
+  up). The worker greedily ranks candidates by yield (premium per
+  dollar of collateral) within the target-delta band and submits
+  until the per-sleeve cap or the 60% total deployment cap is hit.
+- Skip a candidate if its single-contract collateral exceeds the
+  remaining sleeve headroom. The cash stays unused that week rather
+  than forcing into a smaller name and breaking the sleeve discipline.
+
+### What this set of choices implies
+
+- Friendly week (`risk_on`, ~7-10 positions filled at delta 0.30,
+  IV 18-22): expected weekly yield ~0.7-0.9% on deployed capital,
+  around 0.4-0.6% on total equity. Hits 3% monthly when full month
+  is `risk_on`.
+- Mixed week (`neutral`, fewer positions, delta 0.20): ~0.3-0.5%
+  weekly on equity. Months with two weeks neutral and two weeks
+  risk_on land near 2%.
+- Hostile week (`risk_off`, no new entries, manage existing only):
+  zero new premium; existing positions either profit-take or get
+  rolled. Months with multiple risk_off weeks land near 1% or less.
+
+The 7% drawdown circuit breaker plus weekly cycling means the worst
+plausible run is a couple of bad fills before the brake kicks in,
+which is what keeps the 10% drawdown ceiling realistic.
+
+## What this spec still does not decide
+
+- IV rank entry filter (e.g. only sell when IVR > 30). Worth
+  considering as a 3.5 enhancement once we have a few weeks of
+  paper data.
+- Earnings-window blackouts (skip names with earnings in the next
+  7 days). Recommended for `stable_largecap` and `opportunistic` in
+  3.5; safe to skip for `index_core`.
+- Multiple concurrent expirations on the same symbol. The
+  one-contract-per-symbol-per-cycle rule above implicitly forbids
+  this; if we want to change it later we will.
+- Pinning behaviour at expiration. Defer.
