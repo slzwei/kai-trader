@@ -15,6 +15,9 @@ COMMANDS: list[tuple[str, str]] = [
     ("/status", "portfolio summary (mocked until trading engine ships)"),
     ("/account", "live Alpaca account snapshot (paper by default)"),
     ("/positions", "open positions from Alpaca, empty when none are held"),
+    ("/flags", "current values of trading_enabled, new_entries_enabled, kill_switch"),
+    ("/flag", "set a single flag, e.g. /flag trading_enabled on"),
+    ("/kill", "emergency stop: kill_switch on and trading_enabled off"),
 ]
 
 
@@ -22,7 +25,7 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
     lines = ["Available commands:", ""]
     lines.extend(f"{cmd}  {desc}" for cmd, desc in COMMANDS)
     lines.append("")
-    lines.append("Phase 2 adds read-only Alpaca. Order placement arrives in later phases.")
+    lines.append("Order placement still gated. Strategy code arrives in Phase 3.")
     return "\n".join(lines)
 
 
