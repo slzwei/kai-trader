@@ -26,14 +26,17 @@ from kai_trader.bot.handlers import (
     snapshot_now,
     start,
     status,
+    strategy_status,
 )
 from kai_trader.bot.handlers import help as help_handler
 from kai_trader.config import Settings, get_settings
 from kai_trader.db.client import close_pool, get_pool
 from kai_trader.logging import configure_logging, get_logger
 from kai_trader.notifications.worker import NotificationWorker
+from kai_trader.strategy.worker import StrategyWorker
 
 _worker: NotificationWorker | None = None
+_strategy_worker: StrategyWorker | None = None
 
 
 def build_application(settings: Settings) -> Application:  # type: ignore[type-arg]
@@ -56,13 +59,14 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CommandHandler("chain", chain.handle))
     app.add_handler(CommandHandler("sleeves", sleeves.handle))
     app.add_handler(CommandHandler("regime", regime.handle))
+    app.add_handler(CommandHandler("strategy_status", strategy_status.handle))
 
     return app
 
 
 async def _startup(app: Application) -> None:  # type: ignore[type-arg]
-    """Prime DB pool, then spin up the notification delivery worker."""
-    global _worker
+    """Prime DB pool, then spin up the notification + strategy workers."""
+    global _worker, _strategy_worker
     await get_pool()
 
     settings = get_settings()
@@ -74,9 +78,15 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     _worker = NotificationWorker(_send_to_owner)
     await _worker.start()
 
+    _strategy_worker = StrategyWorker()
+    await _strategy_worker.start()
+
 
 async def _shutdown(_app: Application) -> None:  # type: ignore[type-arg]
-    global _worker
+    global _worker, _strategy_worker
+    if _strategy_worker is not None:
+        await _strategy_worker.stop()
+        _strategy_worker = None
     if _worker is not None:
         await _worker.stop()
         _worker = None

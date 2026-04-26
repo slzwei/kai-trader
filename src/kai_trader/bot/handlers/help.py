@@ -25,6 +25,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/chain", "option chain snapshot, /chain SPY or /chain AAPL 2026-05-15"),
     ("/sleeves", "per-sleeve trading config (allocation, deltas, symbols)"),
     ("/regime", "live regime classifier output and inputs (VIX, SPY MAs, RV)"),
+    ("/strategy_status", "dry-run intent list the strategy worker would build"),
 ]
 
 
