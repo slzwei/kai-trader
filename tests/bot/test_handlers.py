@@ -8,8 +8,11 @@ from typing import Any
 import pytest
 
 from kai_trader.bot.handlers import account as account_mod
+from kai_trader.bot.handlers import flag as flag_mod
+from kai_trader.bot.handlers import flags as flags_mod
 from kai_trader.bot.handlers import health as health_mod
 from kai_trader.bot.handlers import help as help_mod
+from kai_trader.bot.handlers import kill as kill_mod
 from kai_trader.bot.handlers import positions as positions_mod
 from kai_trader.bot.handlers import start as start_mod
 from kai_trader.bot.handlers import status as status_mod
@@ -56,7 +59,11 @@ async def test_help_lists_every_command(
     await help_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    for cmd in ("/start", "/help", "/health", "/status", "/account", "/positions"):
+    expected = (
+        "/start", "/help", "/health", "/status", "/account",
+        "/positions", "/flags", "/flag", "/kill",
+    )
+    for cmd in expected:
         assert cmd in text
 
 
@@ -252,3 +259,126 @@ async def test_handler_records_error_on_failure(
     assert kwargs["response_sent"] is False
     assert kwargs["error"] is not None
     assert "render failed" in kwargs["error"]
+
+
+async def test_flags_renders_all_three(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        flags_mod,
+        "get_all_flags",
+        AsyncMock(return_value={
+            "trading_enabled": False,
+            "new_entries_enabled": True,
+            "kill_switch": False,
+        }),
+    )
+
+    update = fake_update_factory(user_id=42, text="/flags")
+    await flags_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "System flags" in text
+    assert "trading_enabled: False" in text
+    assert "new_entries_enabled: True" in text
+    assert "kill_switch: False" in text
+    assert "[ok] new_entries_enabled" in text
+    assert "[fail] trading_enabled" in text
+
+
+async def test_flag_sets_value_and_reports_prior(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    set_flag_mock = AsyncMock(return_value=False)
+    monkeypatch.setattr(flag_mod, "set_flag", set_flag_mock)
+
+    update = fake_update_factory(user_id=42, text="/flag trading_enabled on")
+    await flag_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Flag trading_enabled: False -> True." in text
+    set_flag_mock.assert_awaited_once_with("trading_enabled", True, actor=42)
+
+
+async def test_flag_rejects_unknown_name(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    set_flag_mock = AsyncMock()
+    monkeypatch.setattr(flag_mod, "set_flag", set_flag_mock)
+
+    update = fake_update_factory(user_id=42, text="/flag does_not_exist on")
+    await flag_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Unknown flag" in text
+    set_flag_mock.assert_not_awaited()
+
+
+async def test_flag_rejects_bad_value(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    set_flag_mock = AsyncMock()
+    monkeypatch.setattr(flag_mod, "set_flag", set_flag_mock)
+
+    update = fake_update_factory(user_id=42, text="/flag trading_enabled maybe")
+    await flag_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Cannot parse 'maybe' as on/off" in text
+    set_flag_mock.assert_not_awaited()
+
+
+async def test_flag_shows_usage_when_called_without_args(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(flag_mod, "set_flag", AsyncMock())
+
+    update = fake_update_factory(user_id=42, text="/flag")
+    await flag_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Usage:" in text
+    assert "trading_enabled" in text
+
+
+async def test_kill_engages_both_flags(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    set_flag_mock = AsyncMock(side_effect=[False, False])  # prior values
+    monkeypatch.setattr(kill_mod, "set_flag", set_flag_mock)
+
+    update = fake_update_factory(user_id=42, text="/kill")
+    await kill_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Kill switch engaged" in text
+    assert "kill_switch: False -> True" in text
+    assert "trading_enabled: False -> False" in text
+    assert set_flag_mock.await_count == 2
+    calls = [c.args for c in set_flag_mock.await_args_list]
+    assert calls[0] == ("kill_switch", True)
+    assert calls[1] == ("trading_enabled", False)

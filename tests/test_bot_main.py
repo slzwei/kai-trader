@@ -27,7 +27,10 @@ def test_build_application_registers_commands() -> None:
         if isinstance(h, CommandHandler):
             command_names.update(h.commands)
 
-    assert {"start", "help", "health", "status", "account", "positions"} <= command_names
+    assert {
+        "start", "help", "health", "status", "account",
+        "positions", "flags", "flag", "kill",
+    } <= command_names
 
 
 @pytest.mark.parametrize(
@@ -39,6 +42,9 @@ def test_build_application_registers_commands() -> None:
         "kai_trader.bot.handlers.status",
         "kai_trader.bot.handlers.account",
         "kai_trader.bot.handlers.positions",
+        "kai_trader.bot.handlers.flags",
+        "kai_trader.bot.handlers.flag",
+        "kai_trader.bot.handlers.kill",
     ],
 )
 def test_each_handler_module_exports_handle(module_name: str) -> None:
