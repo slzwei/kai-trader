@@ -302,13 +302,14 @@ class StrategyWorker:
         limit_price = intent.bid if intent.bid > 0 else intent.mid
         gating_decision = {
             "trading_enabled": flags.get("trading_enabled", False),
+            "new_entries_enabled": flags.get("new_entries_enabled", False),
             "kill_switch": flags.get("kill_switch", False),
             "limit_price": str(limit_price),
         }
         intent_payload = {
             "strike": str(intent.strike),
             "expiration": intent.expiration.isoformat(),
-            "qty": 1,
+            "qty": intent.qty,
             "target_delta": str(intent.target_delta),
             "actual_delta": str(intent.actual_delta),
         }
@@ -323,7 +324,7 @@ class StrategyWorker:
 
         result: SubmitResult = await submit_short_put(
             option_symbol=intent.option_symbol,
-            qty=1,
+            qty=intent.qty,
             limit_price=limit_price,
             client_order_id=f"kai-{row_id[:8]}",
         )
@@ -336,7 +337,11 @@ class StrategyWorker:
             )
             return "submitted"
 
-        if result.reason in ("kill_switch_engaged", "trading_disabled"):
+        if result.reason in (
+            "kill_switch_engaged",
+            "trading_disabled",
+            "new_entries_disabled",
+        ):
             await mark_status(row_id, "skipped_by_flag", error_text=result.reason)
             return "skipped"
 

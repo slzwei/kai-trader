@@ -28,6 +28,11 @@ ChainFetcher = Callable[[str, date | None], Awaitable[list[OptionContract]]]
 _log = get_logger(__name__)
 
 
+PER_SYMBOL_CAP_PCT = Decimal("0.15")  # max 15% of equity per single underlying
+TOTAL_DEPLOYMENT_CAP_PCT = Decimal("0.70")  # max 70% of equity in CSP collateral
+MAX_CONTRACTS_PER_SYMBOL = 10  # hard ceiling regardless of sleeve headroom
+
+
 @dataclass(frozen=True)
 class TradeIntent:
     """A would-be cash-secured put trade for one symbol/expiration."""
@@ -42,17 +47,22 @@ class TradeIntent:
     bid: Decimal
     ask: Decimal
     mid: Decimal
+    qty: int
     collateral: Decimal
     expected_premium: Decimal
     yield_pct: Decimal
 
 
 def _is_sleeve_active(sleeve: SleeveConfig, regime: str) -> bool:
+    """Sleeve activity rule.
+
+    Phase 3.6: opportunistic stays active in neutral so we get the
+    high-IV juice across both friendly and middling weeks. Only
+    risk_off blocks new entries entirely (across all sleeves).
+    """
     if not sleeve.enabled:
         return False
     if regime == "risk_off":
-        return False
-    if regime == "neutral" and sleeve.sleeve == "opportunistic":
         return False
     return True
 
@@ -103,16 +113,19 @@ def _intent_from(
     sleeve: SleeveConfig,
     contract: OptionContract,
     target_delta: Decimal,
+    qty: int,
 ) -> TradeIntent | None:
-    """Build a TradeIntent from a chosen contract. Returns None on missing data."""
+    """Build a TradeIntent from a chosen contract + qty. Returns None on missing data."""
     if contract.bid is None or contract.ask is None or contract.delta is None:
+        return None
+    if qty < 1:
         return None
     bid = contract.bid
     ask = contract.ask
     mid = (bid + ask) / Decimal("2")
-    # 1 contract = 100 shares; cash-secured put collateral = strike * 100.
-    collateral = contract.strike * Decimal("100")
-    expected_premium = mid * Decimal("100")
+    # qty contracts; each = 100 shares; CSP collateral = strike * 100 * qty.
+    collateral = contract.strike * Decimal("100") * Decimal(qty)
+    expected_premium = mid * Decimal("100") * Decimal(qty)
     if collateral == 0:
         return None
     yield_pct = (expected_premium / collateral) * Decimal("100")
@@ -127,10 +140,30 @@ def _intent_from(
         bid=bid,
         ask=ask,
         mid=mid,
+        qty=qty,
         collateral=collateral,
         expected_premium=expected_premium,
         yield_pct=yield_pct,
     )
+
+
+def _max_qty_for(
+    contract: OptionContract,
+    *,
+    equity: Decimal,
+    sleeve_remaining: Decimal,
+    total_remaining: Decimal,
+) -> int:
+    """Compute the largest qty respecting sleeve cap, total cap, per-symbol cap."""
+    per_contract_collateral = contract.strike * Decimal("100")
+    if per_contract_collateral <= 0:
+        return 0
+    per_symbol_cap = equity * PER_SYMBOL_CAP_PCT
+    headroom = min(sleeve_remaining, total_remaining, per_symbol_cap)
+    if headroom < per_contract_collateral:
+        return 0
+    qty = int(headroom // per_contract_collateral)
+    return min(qty, MAX_CONTRACTS_PER_SYMBOL)
 
 
 async def build_intents(
@@ -141,13 +174,20 @@ async def build_intents(
     *,
     today: date | None = None,
 ) -> list[TradeIntent]:
-    """Walk active sleeves and produce a dry-run intent per qualifying symbol.
+    """Walk active sleeves and produce intent rows up to the cap matrix.
 
-    No submission. Sleeve gating: opportunistic paused in neutral, all sleeves
-    paused in risk_off. Skips a candidate when the chain contract is missing
-    bid/ask/delta (typical off-hours condition on the IEX feed).
+    Multi-contract per symbol allowed within the per-symbol concentration
+    cap (15% of equity by default) and the total deployment cap (70% of
+    equity). The total cap covers the whole portfolio, not per sleeve.
+
+    Greedy fill order is the symbol whitelist sequence. We do not re-rank
+    by yield because most symbols in a well-curated whitelist are within
+    a tight yield band and re-ranking adds complexity with little upside;
+    the caps do the heavy lifting.
     """
     today = today or datetime.now(UTC).date()
+    equity = Decimal(str(account.equity))
+    total_remaining = equity * TOTAL_DEPLOYMENT_CAP_PCT
     intents: list[TradeIntent] = []
 
     for sleeve in sleeves:
@@ -160,10 +200,11 @@ async def build_intents(
             continue
 
         target_delta = _target_delta_for(sleeve, regime.regime)
-        sleeve_cap = Decimal(str(account.equity)) * sleeve.target_pct
-        sleeve_used = Decimal("0")
+        sleeve_remaining = equity * sleeve.target_pct
 
         for symbol in sleeve.symbol_whitelist:
+            if sleeve_remaining <= 0 or total_remaining <= 0:
+                break
             try:
                 chain = await chain_fetcher(symbol, None)
             except Exception as exc:
@@ -176,21 +217,30 @@ async def build_intents(
                 continue
 
             contract = select_put_strike(chain, target_delta, sleeve, today)
-            if contract is None:
+            if contract is None or contract.bid is None or contract.ask is None:
                 continue
-            intent = _intent_from(sleeve, contract, target_delta)
-            if intent is None:
-                continue
-            if sleeve_used + intent.collateral > sleeve_cap:
+
+            qty = _max_qty_for(
+                contract,
+                equity=equity,
+                sleeve_remaining=sleeve_remaining,
+                total_remaining=total_remaining,
+            )
+            if qty < 1:
                 _log.info(
-                    "strategy.sleeve.capped",
+                    "strategy.sleeve.no_fit",
                     sleeve=sleeve.sleeve,
                     symbol=symbol,
-                    used=str(sleeve_used),
-                    cap=str(sleeve_cap),
+                    sleeve_remaining=str(sleeve_remaining),
+                    total_remaining=str(total_remaining),
                 )
                 continue
-            sleeve_used += intent.collateral
+
+            intent = _intent_from(sleeve, contract, target_delta, qty)
+            if intent is None:
+                continue
+            sleeve_remaining -= intent.collateral
+            total_remaining -= intent.collateral
             intents.append(intent)
 
     return intents
@@ -207,7 +257,7 @@ def summarise_intents(intents: list[TradeIntent]) -> str:
         total_collateral += i.collateral
         total_premium += i.expected_premium
         lines.append(
-            f"{i.sleeve}/{i.symbol} {i.expiration} P {i.strike} "
+            f"{i.sleeve}/{i.symbol} {i.expiration} {i.qty}xP {i.strike} "
             f"d={i.actual_delta:.2f} "
             f"prem={i.expected_premium:.2f} "
             f"col={i.collateral:.0f} "

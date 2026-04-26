@@ -243,7 +243,10 @@ async def test_submit_short_put_refuses_when_trading_disabled(
     monkeypatch.setattr(
         broker,
         "get_all_flags",
-        AsyncMock(return_value={"kill_switch": False, "trading_enabled": False}),
+        AsyncMock(return_value={
+            "kill_switch": False, "trading_enabled": False,
+            "new_entries_enabled": True,
+        }),
     )
 
     result = await broker.submit_short_put(
@@ -254,6 +257,35 @@ async def test_submit_short_put_refuses_when_trading_disabled(
 
     assert result.submitted is False
     assert result.reason == "trading_disabled"
+    fake.submit_order.assert_not_called()
+
+
+async def test_submit_short_put_refuses_when_new_entries_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.submit_order = MagicMock()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={
+            "kill_switch": False, "trading_enabled": True,
+            "new_entries_enabled": False,
+        }),
+    )
+
+    result = await broker.submit_short_put(
+        option_symbol="SPY260501P00500000",
+        qty=1,
+        limit_price=Decimal("1.10"),
+    )
+
+    assert result.submitted is False
+    assert result.reason == "new_entries_disabled"
     fake.submit_order.assert_not_called()
 
 
@@ -273,7 +305,10 @@ async def test_submit_short_put_submits_when_flags_green(
     monkeypatch.setattr(
         broker,
         "get_all_flags",
-        AsyncMock(return_value={"kill_switch": False, "trading_enabled": True}),
+        AsyncMock(return_value={
+            "kill_switch": False, "trading_enabled": True,
+            "new_entries_enabled": True,
+        }),
     )
 
     result = await broker.submit_short_put(
@@ -306,7 +341,10 @@ async def test_submit_short_put_handles_alpaca_exception(
     monkeypatch.setattr(
         broker,
         "get_all_flags",
-        AsyncMock(return_value={"kill_switch": False, "trading_enabled": True}),
+        AsyncMock(return_value={
+            "kill_switch": False, "trading_enabled": True,
+            "new_entries_enabled": True,
+        }),
     )
 
     result = await broker.submit_short_put(

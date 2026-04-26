@@ -245,6 +245,18 @@ async def submit_short_put(
             reason="trading_disabled",
             flags=flags,
         )
+    if not flags.get("new_entries_enabled", False):
+        _log.warning(
+            "alpaca.submit.refused_new_entries_disabled",
+            option_symbol=option_symbol,
+        )
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="new_entries_disabled",
+            flags=flags,
+        )
 
     request = LimitOrderRequest(
         symbol=option_symbol,

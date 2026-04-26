@@ -186,7 +186,8 @@ async def test_build_intents_skips_all_in_risk_off() -> None:
     chain_fetcher.assert_not_awaited()
 
 
-async def test_build_intents_skips_opportunistic_in_neutral() -> None:
+async def test_build_intents_keeps_opportunistic_active_in_neutral() -> None:
+    """Phase 3.6: opportunistic stays active in neutral for premium juice."""
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
@@ -205,7 +206,7 @@ async def test_build_intents_skips_opportunistic_in_neutral() -> None:
     )
     sleeves_used = {i.sleeve for i in intents}
     assert "index_core" in sleeves_used
-    assert "opportunistic" not in sleeves_used
+    assert "opportunistic" in sleeves_used
 
 
 async def test_build_intents_uses_neutral_target_delta() -> None:
@@ -290,6 +291,97 @@ async def test_build_intents_skips_contracts_missing_quotes() -> None:
 
 # ------------- summarise_intents -------------
 
+async def test_build_intents_multi_contract_within_per_symbol_cap() -> None:
+    """Cheap names should fill multiple contracts up to the per-symbol cap."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    # SOFI-style: $15 strike contract = $1500 collateral.
+    # Per-symbol cap = 15% of $100k = $15k. Max contracts = 10.
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=15, delta=-0.30, expiration=expiry)]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("opportunistic", whitelist=["SOFI"], target_pct=Decimal("0.45"))],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert len(intents) == 1
+    intent = intents[0]
+    # Per-symbol cap of $15k / $1500 collateral = 10 contracts (also hits MAX cap).
+    assert intent.qty == 10
+    assert intent.collateral == Decimal("15000")
+
+
+async def test_build_intents_per_symbol_cap_overrides_sleeve_headroom() -> None:
+    """Single symbol cannot exceed 15% concentration even if sleeve cap is bigger."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=10, delta=-0.30, expiration=expiry)]
+
+    # Sleeve cap = 50% of $100k = $50k. Per-symbol cap = 15% = $15k.
+    # Max qty = $15k / $1k collateral = 15 → capped at MAX_CONTRACTS_PER_SYMBOL = 10.
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("opportunistic", whitelist=["F"], target_pct=Decimal("0.50"))],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert intents[0].qty == 10  # MAX_CONTRACTS_PER_SYMBOL
+
+
+async def test_build_intents_respects_total_deployment_cap() -> None:
+    """Total CSP collateral cannot exceed 70% of equity across all sleeves."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    # Each contract = $10k collateral. Per-symbol cap = $15k → 1 contract.
+    # Sleeve cap is huge so it does not bind. Total cap = 70% of $100k = $70k.
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=100, delta=-0.30, expiration=expiry)]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "opportunistic",
+            whitelist=[f"SYM{i}" for i in range(10)],  # 10 symbols
+            target_pct=Decimal("1.0"),
+        )],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    # Each symbol = 1 contract = $10k. Total cap = $70k → 7 symbols fit.
+    assert len(intents) == 7
+    total_collateral = sum(i.collateral for i in intents)
+    assert total_collateral == Decimal("70000")
+
+
+async def test_build_intents_max_contracts_per_symbol_ceiling() -> None:
+    """A very cheap stock cannot exceed MAX_CONTRACTS_PER_SYMBOL even with big cap."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    # Penny-cheap: $5 strike → $500 per contract. 15% of $100k = $15k → 30 contracts theoretical.
+    # But MAX_CONTRACTS_PER_SYMBOL = 10 caps it.
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=5, delta=-0.30, expiration=expiry)]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("opportunistic", whitelist=["VERYCHEAP"], target_pct=Decimal("1.0"))],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert intents[0].qty == 10
+
+
 def test_summarise_intents_empty() -> None:
     assert summarise_intents([]) == "No candidate trades for this tick."
 
@@ -299,9 +391,10 @@ def test_summarise_intents_includes_total_line() -> None:
     expiry = today + timedelta(days=8)
     contract = _put(strike=490, delta=-0.30, expiration=expiry)
     from kai_trader.strategy.candidates import _intent_from
-    intent = _intent_from(_sleeve(), contract, Decimal("-0.30"))
+    intent = _intent_from(_sleeve(), contract, Decimal("-0.30"), qty=1)
     assert intent is not None
     out = summarise_intents([intent])
     assert "index_core/SPY" in out
+    assert "1xP" in out
     assert "Total: 1 intents" in out
     assert "weighted yield" in out
