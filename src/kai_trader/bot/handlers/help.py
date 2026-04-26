@@ -20,6 +20,8 @@ COMMANDS: list[tuple[str, str]] = [
     ("/kill", "emergency stop: kill_switch on and trading_enabled off"),
     ("/notify_test", "queue a notification to verify the delivery worker"),
     ("/quote", "latest bid/ask + last trade for a symbol, e.g. /quote AAPL"),
+    ("/snapshot_now", "capture an Alpaca account snapshot into Postgres"),
+    ("/history", "recent account snapshots, /history N for the last N (max 50)"),
 ]
 
 

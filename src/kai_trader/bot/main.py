@@ -15,10 +15,12 @@ from kai_trader.bot.handlers import (
     flag,
     flags,
     health,
+    history,
     kill,
     notify_test,
     positions,
     quote,
+    snapshot_now,
     start,
     status,
 )
@@ -46,6 +48,8 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CommandHandler("kill", kill.handle))
     app.add_handler(CommandHandler("notify_test", notify_test.handle))
     app.add_handler(CommandHandler("quote", quote.handle))
+    app.add_handler(CommandHandler("snapshot_now", snapshot_now.handle))
+    app.add_handler(CommandHandler("history", history.handle))
 
     return app
 
