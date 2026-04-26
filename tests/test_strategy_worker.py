@@ -127,6 +127,8 @@ def _filled_status() -> OrderStatusSnapshot:
 @pytest.fixture(autouse=True)
 def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
     """Stub every external coro the worker reaches for. Defaults: empty world."""
+    from kai_trader.strategy.drawdown import DrawdownCheck
+
     enqueue = AsyncMock(return_value="row-uuid")
     get_account = AsyncMock(return_value=_account())
     get_chain = AsyncMock(return_value=[])
@@ -143,6 +145,18 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     record_intent = AsyncMock(return_value="intent-uuid")
     mark_submitted = AsyncMock()
     mark_status = AsyncMock()
+    list_positions = AsyncMock(return_value=[])
+    close_position = AsyncMock(return_value=SubmitResult(
+        submitted=True, alpaca_order_id="close-uuid", order_status="accepted",
+        reason=None, flags={},
+    ))
+    check_drawdown = AsyncMock(return_value=DrawdownCheck(
+        high_water_mark=Decimal("100000"),
+        current_equity=Decimal("100000"),
+        drawdown_pct=Decimal("0"),
+        breached=False,
+    ))
+    evaluate_rolls = AsyncMock(return_value=[])
 
     monkeypatch.setattr(worker_module, "enqueue", enqueue)
     monkeypatch.setattr(worker_module, "get_account", get_account)
@@ -156,6 +170,10 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     monkeypatch.setattr(worker_module, "record_intent", record_intent)
     monkeypatch.setattr(worker_module, "mark_submitted", mark_submitted)
     monkeypatch.setattr(worker_module, "mark_status", mark_status)
+    monkeypatch.setattr(worker_module, "list_positions", list_positions)
+    monkeypatch.setattr(worker_module, "close_position", close_position)
+    monkeypatch.setattr(worker_module, "check_drawdown", check_drawdown)
+    monkeypatch.setattr(worker_module, "evaluate_rolls", evaluate_rolls)
     return locals()
 
 
@@ -348,3 +366,148 @@ def test_map_alpaca_status_translation() -> None:
     assert worker_module._map_alpaca_status("expired") == "cancelled"
     assert worker_module._map_alpaca_status("rejected") == "cancelled"
     assert worker_module._map_alpaca_status("garbage") == "failed"
+
+
+# ------------- drawdown integration -------------
+
+async def test_tick_drawdown_breach_short_circuits(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    from kai_trader.strategy.drawdown import DrawdownCheck
+
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    # Simulate the breaker tripping: first flags read says kill off, then
+    # check_drawdown engages it, then a re-read says kill on.
+    _patch_dependencies["get_flags"].side_effect = [
+        {"trading_enabled": True, "kill_switch": False},
+        {"trading_enabled": True, "kill_switch": True},
+    ]
+    _patch_dependencies["check_drawdown"].return_value = DrawdownCheck(
+        high_water_mark=Decimal("100000"),
+        current_equity=Decimal("90000"),
+        drawdown_pct=Decimal("10"),
+        breached=True,
+    )
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "Kill switch engaged" in summary
+    assert "Drawdown 10.00%" in summary
+    _patch_dependencies["compute_and_record"].assert_not_awaited()
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+
+
+# ------------- roll execution -------------
+
+async def test_tick_executes_rolls_when_flags_green(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    from kai_trader.strategy.rolls import RollIntent
+
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False,
+    }
+    _patch_dependencies["evaluate_rolls"].return_value = [RollIntent(
+        sleeve="index_core",
+        underlying="SPY",
+        current_option_symbol="SPY260504P00050000",
+        current_strike=Decimal("50"),
+        current_expiration=date(2026, 5, 4),
+        current_delta=Decimal("-0.55"),
+        close_price=Decimal("2.60"),
+        new_option_symbol="SPY260504P00048000",
+        new_strike=Decimal("48"),
+        new_expiration=date(2026, 5, 4),
+        new_delta=Decimal("-0.30"),
+        new_credit=Decimal("3.00"),
+        net_credit=Decimal("0.40"),
+        reason="rolled",
+    )]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "1 rolled, 0 held" in summary
+    # Two record_intent calls: one for the close, one for the new short put.
+    assert _patch_dependencies["record_intent"].await_count == 2
+    _patch_dependencies["close_position"].assert_awaited_once_with("SPY")
+    _patch_dependencies["submit_short_put"].assert_awaited_once()
+
+
+async def test_tick_skips_roll_execution_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    from kai_trader.strategy.rolls import RollIntent
+
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": False, "kill_switch": False,
+    }
+    _patch_dependencies["evaluate_rolls"].return_value = [RollIntent(
+        sleeve="index_core",
+        underlying="SPY",
+        current_option_symbol="SPY260504P00050000",
+        current_strike=Decimal("50"),
+        current_expiration=date(2026, 5, 4),
+        current_delta=Decimal("-0.55"),
+        close_price=Decimal("2.60"),
+        new_option_symbol="SPY260504P00048000",
+        new_strike=Decimal("48"),
+        new_expiration=date(2026, 5, 4),
+        new_delta=Decimal("-0.30"),
+        new_credit=Decimal("3.00"),
+        net_credit=Decimal("0.40"),
+        reason="rolled",
+    )]
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["close_position"].assert_not_awaited()
+
+
+async def test_tick_logs_held_rolls_without_executing(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    from kai_trader.strategy.rolls import RollIntent
+
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False,
+    }
+    _patch_dependencies["evaluate_rolls"].return_value = [RollIntent(
+        sleeve="index_core",
+        underlying="SPY",
+        current_option_symbol="SPY260504P00050000",
+        current_strike=Decimal("50"),
+        current_expiration=date(2026, 5, 4),
+        current_delta=Decimal("-0.55"),
+        close_price=Decimal("2.60"),
+        new_option_symbol=None,
+        new_strike=None,
+        new_expiration=None,
+        new_delta=None,
+        new_credit=None,
+        net_credit=None,
+        reason="no_net_credit_candidate",
+    )]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "0 rolled, 1 held" in summary
+    _patch_dependencies["close_position"].assert_not_awaited()

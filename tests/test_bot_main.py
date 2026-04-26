@@ -32,6 +32,7 @@ def test_build_application_registers_commands() -> None:
         "positions", "flags", "flag", "kill", "notify_test", "quote",
         "snapshot_now", "history", "chain", "sleeves", "regime",
         "strategy_status", "trade_now", "recent_trades",
+        "close", "close_confirm",
     } <= command_names
 
 
@@ -64,3 +65,11 @@ def test_each_handler_module_exports_handle(module_name: str) -> None:
 
     module = importlib.import_module(module_name)
     assert callable(module.handle)
+
+
+def test_close_module_exports_paired_handlers() -> None:
+    """The close module ships two handlers because it implements a confirm flow."""
+    from kai_trader.bot.handlers import close as close_module
+
+    assert callable(close_module.handle_close)
+    assert callable(close_module.handle_confirm)

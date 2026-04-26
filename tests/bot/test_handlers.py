@@ -10,6 +10,7 @@ import pytest
 
 from kai_trader.bot.handlers import account as account_mod
 from kai_trader.bot.handlers import chain as chain_mod
+from kai_trader.bot.handlers import close as close_mod
 from kai_trader.bot.handlers import flag as flag_mod
 from kai_trader.bot.handlers import flags as flags_mod
 from kai_trader.bot.handlers import health as health_mod
@@ -27,7 +28,7 @@ from kai_trader.bot.handlers import start as start_mod
 from kai_trader.bot.handlers import status as status_mod
 from kai_trader.bot.handlers import strategy_status as strategy_status_mod
 from kai_trader.bot.handlers import trade_now as trade_now_mod
-from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
+from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot, SubmitResult
 from kai_trader.broker.market_data import QuoteSnapshot, TradeSnapshot
 from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.account_snapshots import StoredSnapshot
@@ -82,7 +83,7 @@ async def test_help_lists_every_command(
         "/positions", "/flags", "/flag", "/kill", "/notify_test",
         "/quote", "/snapshot_now", "/history", "/chain",
         "/sleeves", "/regime", "/strategy_status",
-        "/trade_now", "/recent_trades",
+        "/trade_now", "/recent_trades", "/close", "/close_confirm",
     )
     for cmd in expected:
         assert cmd in text
@@ -1158,6 +1159,132 @@ async def test_recent_trades_rejects_out_of_range(
     text = _last_reply(update)
     assert "between 1 and 50" in text
     fetch.assert_not_awaited()
+
+
+async def test_close_stages_pending(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+) -> None:
+    close_mod._reset_pending()
+    update = fake_update_factory(user_id=42, text="/close SPY")
+    await close_mod.handle_close(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Close staged for SPY" in text
+    assert (42, "SPY") in close_mod._pending
+
+
+async def test_close_usage_when_no_args(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+) -> None:
+    close_mod._reset_pending()
+    update = fake_update_factory(user_id=42, text="/close")
+    await close_mod.handle_close(update, None)  # type: ignore[arg-type]
+    assert "Usage:" in _last_reply(update)
+
+
+async def test_close_confirm_executes_when_staged(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    close_mod._reset_pending()
+    close_mod._stage(42, "SPY")
+    monkeypatch.setattr(
+        close_mod,
+        "close_position",
+        AsyncMock(return_value=SubmitResult(
+            submitted=True,
+            alpaca_order_id="alpaca-uuid",
+            order_status="accepted",
+            reason=None,
+            flags={"kill_switch": False, "trading_enabled": True},
+        )),
+    )
+    record = AsyncMock(return_value="audit-row")
+    monkeypatch.setattr(close_mod, "record_intent", record)
+
+    update = fake_update_factory(user_id=42, text="/close_confirm SPY")
+    await close_mod.handle_confirm(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Close submitted for SPY" in text
+    assert "alpaca-uuid" in text
+    record.assert_awaited_once()
+
+
+async def test_close_confirm_rejects_when_no_pending(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    close_mod._reset_pending()
+    monkeypatch.setattr(close_mod, "close_position", AsyncMock())
+    monkeypatch.setattr(close_mod, "record_intent", AsyncMock())
+
+    update = fake_update_factory(user_id=42, text="/close_confirm SPY")
+    await close_mod.handle_confirm(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "No fresh /close staged for SPY" in text
+
+
+async def test_close_confirm_expires_after_ttl(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+    from unittest.mock import AsyncMock
+
+    close_mod._reset_pending()
+    # Stage with a stale timestamp.
+    close_mod._pending[(42, "SPY")] = close_mod._PendingClose(
+        user_id=42, symbol="SPY",
+        staged_at=time.monotonic() - close_mod.CONFIRM_TTL_SECONDS - 1,
+    )
+    monkeypatch.setattr(close_mod, "close_position", AsyncMock())
+    monkeypatch.setattr(close_mod, "record_intent", AsyncMock())
+
+    update = fake_update_factory(user_id=42, text="/close_confirm SPY")
+    await close_mod.handle_confirm(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "No fresh /close staged for SPY" in text
+
+
+async def test_close_confirm_kill_switch_path(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    close_mod._reset_pending()
+    close_mod._stage(42, "SPY")
+    monkeypatch.setattr(
+        close_mod,
+        "close_position",
+        AsyncMock(return_value=SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="kill_switch_engaged",
+            flags={"kill_switch": True, "trading_enabled": False},
+        )),
+    )
+    monkeypatch.setattr(close_mod, "record_intent", AsyncMock(return_value="audit"))
+
+    update = fake_update_factory(user_id=42, text="/close_confirm SPY")
+    await close_mod.handle_confirm(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "kill_switch engaged" in text
 
 
 async def test_kill_engages_both_flags(

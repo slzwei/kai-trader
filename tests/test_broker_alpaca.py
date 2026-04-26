@@ -320,6 +320,71 @@ async def test_submit_short_put_handles_alpaca_exception(
     assert result.error == "alpaca down"
 
 
+async def test_close_position_refused_when_kill_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.close_position = MagicMock()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": True, "trading_enabled": True}),
+    )
+
+    result = await broker.close_position("SPY")
+    assert result.submitted is False
+    assert result.reason == "kill_switch_engaged"
+    fake.close_position.assert_not_called()
+
+
+async def test_close_position_submits_when_kill_switch_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    class _FakeOrder:
+        id = "alpaca-uuid"
+        status = "accepted"
+
+    fake = MagicMock()
+    fake.close_position.return_value = _FakeOrder()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": False, "trading_enabled": False}),
+    )
+
+    # Closes are allowed even when trading_enabled is off.
+    result = await broker.close_position("SPY")
+    assert result.submitted is True
+    assert result.alpaca_order_id == "alpaca-uuid"
+    fake.close_position.assert_called_once_with("SPY")
+
+
+async def test_close_position_handles_alpaca_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.close_position.side_effect = RuntimeError("alpaca down")
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": False, "trading_enabled": True}),
+    )
+
+    result = await broker.close_position("SPY")
+    assert result.submitted is False
+    assert result.reason == "close_exception"
+    assert result.error == "alpaca down"
+
+
 async def test_get_order_status_maps_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     from datetime import UTC, datetime
 
