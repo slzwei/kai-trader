@@ -201,3 +201,144 @@ def test_reset_client_forces_rebuild(monkeypatch: pytest.MonkeyPatch) -> None:
     broker.reset_client()
     broker._get_client()
     assert len(builds) == 2
+
+
+# ------------- submit_short_put gating -------------
+
+async def test_submit_short_put_refuses_when_kill_switch_engaged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.submit_order = MagicMock()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": True, "trading_enabled": True}),
+    )
+
+    result = await broker.submit_short_put(
+        option_symbol="SPY260501P00500000",
+        qty=1,
+        limit_price=Decimal("1.10"),
+    )
+
+    assert result.submitted is False
+    assert result.reason == "kill_switch_engaged"
+    fake.submit_order.assert_not_called()
+
+
+async def test_submit_short_put_refuses_when_trading_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.submit_order = MagicMock()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": False, "trading_enabled": False}),
+    )
+
+    result = await broker.submit_short_put(
+        option_symbol="SPY260501P00500000",
+        qty=1,
+        limit_price=Decimal("1.10"),
+    )
+
+    assert result.submitted is False
+    assert result.reason == "trading_disabled"
+    fake.submit_order.assert_not_called()
+
+
+async def test_submit_short_put_submits_when_flags_green(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    class _FakeOrder:
+        id = "alpaca-uuid"
+        status = "accepted"
+
+    fake = MagicMock()
+    fake.submit_order.return_value = _FakeOrder()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": False, "trading_enabled": True}),
+    )
+
+    result = await broker.submit_short_put(
+        option_symbol="SPY260501P00500000",
+        qty=1,
+        limit_price=Decimal("1.10"),
+        client_order_id="kai-12345678",
+    )
+
+    assert result.submitted is True
+    assert result.alpaca_order_id == "alpaca-uuid"
+    assert result.order_status == "accepted"
+    fake.submit_order.assert_called_once()
+    request = fake.submit_order.call_args.args[0]
+    assert request.symbol == "SPY260501P00500000"
+    assert request.qty == 1
+    assert request.limit_price == 1.10
+    assert request.client_order_id == "kai-12345678"
+
+
+async def test_submit_short_put_handles_alpaca_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.submit_order.side_effect = RuntimeError("alpaca down")
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": False, "trading_enabled": True}),
+    )
+
+    result = await broker.submit_short_put(
+        option_symbol="SPY260501P00500000",
+        qty=1,
+        limit_price=Decimal("1.10"),
+    )
+
+    assert result.submitted is False
+    assert result.reason == "submit_exception"
+    assert result.error == "alpaca down"
+
+
+async def test_get_order_status_maps_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC, datetime
+
+    class _FakeOrder:
+        id = "alpaca-uuid"
+        status = "filled"
+        filled_qty = "1"
+        filled_avg_price = "1.25"
+        filled_at = datetime(2026, 4, 27, tzinfo=UTC)
+        submitted_at = datetime(2026, 4, 27, tzinfo=UTC)
+        canceled_at = None
+        failed_at = None
+
+    fake = MagicMock()
+    fake.get_order_by_id.return_value = _FakeOrder()
+    _install_fake_client(monkeypatch, fake)
+
+    snap = await broker.get_order_status("alpaca-uuid")
+    from decimal import Decimal as Dec
+    assert snap.status == "filled"
+    assert snap.filled_qty == Dec("1")
+    assert snap.filled_avg_price == Dec("1.25")

@@ -31,7 +31,7 @@ def test_build_application_registers_commands() -> None:
         "start", "help", "health", "status", "account",
         "positions", "flags", "flag", "kill", "notify_test", "quote",
         "snapshot_now", "history", "chain", "sleeves", "regime",
-        "strategy_status",
+        "strategy_status", "trade_now", "recent_trades",
     } <= command_names
 
 
@@ -55,6 +55,8 @@ def test_build_application_registers_commands() -> None:
         "kai_trader.bot.handlers.sleeves",
         "kai_trader.bot.handlers.regime",
         "kai_trader.bot.handlers.strategy_status",
+        "kai_trader.bot.handlers.trade_now",
+        "kai_trader.bot.handlers.recent_trades",
     ],
 )
 def test_each_handler_module_exports_handle(module_name: str) -> None:

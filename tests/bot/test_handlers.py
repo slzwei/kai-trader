@@ -19,16 +19,19 @@ from kai_trader.bot.handlers import kill as kill_mod
 from kai_trader.bot.handlers import notify_test as notify_test_mod
 from kai_trader.bot.handlers import positions as positions_mod
 from kai_trader.bot.handlers import quote as quote_mod
+from kai_trader.bot.handlers import recent_trades as recent_trades_mod
 from kai_trader.bot.handlers import regime as regime_mod
 from kai_trader.bot.handlers import sleeves as sleeves_mod
 from kai_trader.bot.handlers import snapshot_now as snapshot_now_mod
 from kai_trader.bot.handlers import start as start_mod
 from kai_trader.bot.handlers import status as status_mod
 from kai_trader.bot.handlers import strategy_status as strategy_status_mod
+from kai_trader.bot.handlers import trade_now as trade_now_mod
 from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
 from kai_trader.broker.market_data import QuoteSnapshot, TradeSnapshot
 from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.account_snapshots import StoredSnapshot
+from kai_trader.db.orders import OrderRow
 from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.strategy.clock import ClockSnapshot
 from kai_trader.strategy.regime import RegimeSnapshot
@@ -79,6 +82,7 @@ async def test_help_lists_every_command(
         "/positions", "/flags", "/flag", "/kill", "/notify_test",
         "/quote", "/snapshot_now", "/history", "/chain",
         "/sleeves", "/regime", "/strategy_status",
+        "/trade_now", "/recent_trades",
     )
     for cmd in expected:
         assert cmd in text
@@ -1032,6 +1036,128 @@ async def test_strategy_status_marks_kill_switch_engaged(
     text = _last_reply(update)
     assert "Market: closed" in text
     assert "Kill switch: ENGAGED" in text
+
+
+async def test_trade_now_runs_a_tick(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    fake_worker = MagicMock()
+    fake_worker.tick = AsyncMock(return_value="forced tick summary")
+    monkeypatch.setattr(trade_now_mod, "StrategyWorker", lambda: fake_worker)
+
+    update = fake_update_factory(user_id=42, text="/trade_now")
+    await trade_now_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert text == "forced tick summary"
+    fake_worker.tick.assert_awaited_once()
+
+
+def _order_row(**overrides: Any) -> OrderRow:
+    base: dict[str, Any] = {
+        "id": "row-1",
+        "created_at": datetime(2026, 4, 27, 14, 0, tzinfo=UTC),
+        "sleeve": "index_core",
+        "symbol": "SPY",
+        "option_symbol": "SPY260505P00500000",
+        "action": "open_short_put",
+        "intent_payload": {"strike": "500"},
+        "alpaca_order_id": "alpaca-uuid-12345",
+        "status": "filled",
+        "gating_decision": None,
+        "submitted_at": datetime(2026, 4, 27, 14, 0, tzinfo=UTC),
+        "filled_at": datetime(2026, 4, 27, 14, 1, tzinfo=UTC),
+        "filled_avg_price": Decimal("1.25"),
+        "error_text": None,
+    }
+    base.update(overrides)
+    return OrderRow(**base)
+
+
+async def test_recent_trades_renders_orders(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        recent_trades_mod,
+        "recent_orders",
+        AsyncMock(return_value=[
+            _order_row(),
+            _order_row(
+                id="row-2",
+                status="skipped_by_flag",
+                alpaca_order_id=None,
+                filled_avg_price=None,
+            ),
+        ]),
+    )
+
+    update = fake_update_factory(user_id=42, text="/recent_trades")
+    await recent_trades_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Recent trades, last 2" in text
+    assert "index_core/SPY" in text
+    assert "status=filled" in text
+    assert "fill 1.25" in text
+    assert "alpaca=alpaca-u" in text
+    assert "status=skipped_by_flag" in text
+
+
+async def test_recent_trades_empty_state(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(recent_trades_mod, "recent_orders", AsyncMock(return_value=[]))
+    update = fake_update_factory(user_id=42, text="/recent_trades")
+    await recent_trades_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "No orders recorded yet" in text
+
+
+async def test_recent_trades_rejects_bad_limit(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    fetch = AsyncMock(return_value=[])
+    monkeypatch.setattr(recent_trades_mod, "recent_orders", fetch)
+    update = fake_update_factory(user_id=42, text="/recent_trades banana")
+    await recent_trades_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Cannot parse 'banana'" in text
+    fetch.assert_not_awaited()
+
+
+async def test_recent_trades_rejects_out_of_range(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    fetch = AsyncMock(return_value=[])
+    monkeypatch.setattr(recent_trades_mod, "recent_orders", fetch)
+    update = fake_update_factory(user_id=42, text="/recent_trades 999")
+    await recent_trades_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "between 1 and 50" in text
+    fetch.assert_not_awaited()
 
 
 async def test_kill_engages_both_flags(
