@@ -286,8 +286,37 @@ async def test_flags_renders_all_three(
     assert "trading_enabled: False" in text
     assert "new_entries_enabled: True" in text
     assert "kill_switch: False" in text
+    # [ok] = safe state. True is safe for the two enable flags; False is safe
+    # for kill_switch (engaged kill switch is the alarm state).
     assert "[ok] new_entries_enabled" in text
     assert "[fail] trading_enabled" in text
+    assert "[ok] kill_switch" in text
+
+
+async def test_flags_marks_engaged_kill_switch_as_failure(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        flags_mod,
+        "get_all_flags",
+        AsyncMock(return_value={
+            "trading_enabled": True,
+            "new_entries_enabled": True,
+            "kill_switch": True,
+        }),
+    )
+
+    update = fake_update_factory(user_id=42, text="/flags")
+    await flags_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "[ok] trading_enabled" in text
+    assert "[ok] new_entries_enabled" in text
+    assert "[fail] kill_switch" in text
 
 
 async def test_flag_sets_value_and_reports_prior(
