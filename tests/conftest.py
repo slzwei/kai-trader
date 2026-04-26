@@ -123,10 +123,12 @@ def patched_broker(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
     import kai_trader.bot.handlers.account as account_module
     import kai_trader.bot.handlers.health as health_module
     import kai_trader.bot.handlers.positions as positions_module
+    import kai_trader.bot.handlers.snapshot_now as snapshot_now_module
 
     monkeypatch.setattr(health_module, "broker_ping", ping)
     monkeypatch.setattr(account_module, "get_account", get_account)
     monkeypatch.setattr(positions_module, "list_positions", list_positions)
+    monkeypatch.setattr(snapshot_now_module, "get_account", get_account)
 
     return {
         "ping": ping,

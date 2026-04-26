@@ -13,14 +13,17 @@ from kai_trader.bot.handlers import flag as flag_mod
 from kai_trader.bot.handlers import flags as flags_mod
 from kai_trader.bot.handlers import health as health_mod
 from kai_trader.bot.handlers import help as help_mod
+from kai_trader.bot.handlers import history as history_mod
 from kai_trader.bot.handlers import kill as kill_mod
 from kai_trader.bot.handlers import notify_test as notify_test_mod
 from kai_trader.bot.handlers import positions as positions_mod
 from kai_trader.bot.handlers import quote as quote_mod
+from kai_trader.bot.handlers import snapshot_now as snapshot_now_mod
 from kai_trader.bot.handlers import start as start_mod
 from kai_trader.bot.handlers import status as status_mod
 from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
 from kai_trader.broker.market_data import QuoteSnapshot, TradeSnapshot
+from kai_trader.db.account_snapshots import StoredSnapshot
 
 
 def _last_reply(update: Any) -> str:
@@ -66,7 +69,7 @@ async def test_help_lists_every_command(
     expected = (
         "/start", "/help", "/health", "/status", "/account",
         "/positions", "/flags", "/flag", "/kill", "/notify_test",
-        "/quote",
+        "/quote", "/snapshot_now", "/history",
     )
     for cmd in expected:
         assert cmd in text
@@ -503,6 +506,125 @@ async def test_quote_handles_unknown_symbol(
 
     text = _last_reply(update)
     assert "No data for ZZZZ" in text
+
+
+async def test_snapshot_now_records_and_replies(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    patched_broker: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    record_mock = AsyncMock(return_value="snap-uuid")
+    monkeypatch.setattr(snapshot_now_mod, "record_snapshot", record_mock)
+
+    update = fake_update_factory(user_id=42, text="/snapshot_now")
+    await snapshot_now_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Snapshot captured" in text
+    assert "Row id:    snap-uuid" in text
+    assert "Equity:    USD 100,000.00" in text
+    record_mock.assert_awaited_once()
+
+
+async def test_history_renders_recent_snapshots(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    snaps = [
+        StoredSnapshot(
+            id="row-1",
+            captured_at=datetime(2026, 4, 26, 14, 0, tzinfo=UTC),
+            equity=Decimal("100000.00"),
+            last_equity=Decimal("99500.00"),
+            cash=Decimal("100000.00"),
+            buying_power=Decimal("400000.00"),
+            portfolio_value=Decimal("100000.00"),
+            day_pl=Decimal("500.00"),
+            status="ACTIVE",
+            paper=True,
+        ),
+        StoredSnapshot(
+            id="row-2",
+            captured_at=datetime(2026, 4, 25, 14, 0, tzinfo=UTC),
+            equity=Decimal("99500.00"),
+            last_equity=Decimal("99500.00"),
+            cash=Decimal("99500.00"),
+            buying_power=Decimal("199000.00"),
+            portfolio_value=Decimal("99500.00"),
+            day_pl=Decimal("0.00"),
+            status="ACTIVE",
+            paper=True,
+        ),
+    ]
+    monkeypatch.setattr(history_mod, "recent_snapshots", AsyncMock(return_value=snaps))
+
+    update = fake_update_factory(user_id=42, text="/history 5")
+    await history_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Account snapshots, last 2" in text
+    assert "equity USD 100,000.00" in text
+    assert "day_pl USD 500.00" in text
+    assert "2026-04-25 14:00 UTC" in text
+
+
+async def test_history_empty_state(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(history_mod, "recent_snapshots", AsyncMock(return_value=[]))
+
+    update = fake_update_factory(user_id=42, text="/history")
+    await history_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "None recorded yet" in text
+    assert "/snapshot_now" in text
+
+
+async def test_history_rejects_bad_limit(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    fetch_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(history_mod, "recent_snapshots", fetch_mock)
+
+    update = fake_update_factory(user_id=42, text="/history banana")
+    await history_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Cannot parse 'banana'" in text
+    fetch_mock.assert_not_awaited()
+
+
+async def test_history_rejects_out_of_range_limit(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    fetch_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(history_mod, "recent_snapshots", fetch_mock)
+
+    update = fake_update_factory(user_id=42, text="/history 999")
+    await history_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "between 1 and 50" in text
+    fetch_mock.assert_not_awaited()
 
 
 async def test_kill_engages_both_flags(
