@@ -18,6 +18,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/flags", "current values of trading_enabled, new_entries_enabled, kill_switch"),
     ("/flag", "set a single flag, e.g. /flag trading_enabled on"),
     ("/kill", "emergency stop: kill_switch on and trading_enabled off"),
+    ("/notify_test", "queue a notification to verify the delivery worker"),
 ]
 
 
