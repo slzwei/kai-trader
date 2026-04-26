@@ -3,6 +3,67 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-27 . Phase 3.4: Order placement gated by flags
+
+Shipped:
+
+- Migration 008 creates the orders table: id, sleeve, symbol,
+  option_symbol, action (open_short_put / close / roll),
+  intent_payload jsonb, alpaca_order_id (nullable), status (pending /
+  submitted / filled / cancelled / skipped_by_flag / failed),
+  gating_decision jsonb (the flag snapshot at decision time),
+  submitted_at, filled_at, filled_avg_price, error_text. Indexes on
+  status, created_at, and partial on alpaca_order_id where not null.
+- `db/orders.py` typed helpers: `record_intent` (returns row uuid),
+  `mark_submitted` (writes alpaca_order_id + status), `mark_status`
+  (terminal updates with optional fill price + error), `recent_orders`,
+  `pending_orders` (rows with an alpaca_order_id whose status is not
+  yet terminal, used by reconciliation).
+- `broker/alpaca.py` extended:
+  - `submit_short_put(option_symbol, qty, limit_price, client_order_id)`
+    sells to open a single-leg short put. Reads `system_flags` BEFORE
+    touching Alpaca; if `kill_switch` is on or `trading_enabled` is off,
+    returns a typed `SubmitResult(submitted=False, reason=...)` and
+    never sends. On Alpaca exception returns `reason="submit_exception"`
+    with the error string.
+  - `get_order_status(alpaca_order_id)` returns a narrow
+    `OrderStatusSnapshot` for reconciliation.
+- Strategy worker rewritten:
+  - Each tick first reconciles non-terminal orders (mark_status with
+    fill price when Alpaca reports filled / canceled / expired /
+    rejected). Reconciliation runs even when the market is closed
+    so an overnight fill is reflected on Monday morning.
+  - For each candidate intent: record the intent row, call the gated
+    `submit_short_put` with limit_price = bid (or mid if bid is zero),
+    and write back the outcome. The flag gate inside the broker is
+    the last check; race conditions resolve cleanly.
+  - Notification text now reports submitted / skipped / failed counts
+    with symbol+strike per item.
+- New `/trade_now` command forces an immediate tick (audit-logged via
+  the standard run_command flow). New `/recent_trades [N]` renders
+  the most recent N rows from the orders table (default 10, max 50).
+- 9 orders helper unit tests, 5 broker submit_short_put tests
+  covering all gate states plus the exception path, 8 worker tests
+  (closed-market, kill-switch, full submit flow, skip-by-flag race,
+  fail path, reconcile fill, reconcile non-terminal skip, reconcile
+  fetch-error tolerance), 5 handler tests, plus help and bot-main
+  updates. Total 242 passing, 2 skipped, 95% coverage.
+
+To enable real paper submissions:
+
+  /flag trading_enabled on
+
+The bot will submit on the next tick (every 5 minutes during US
+market hours, or call `/trade_now` to force one).
+
+Not shipped (Phase 3.5):
+
+- Roll logic when delta crosses 0.45.
+- Drawdown circuit breaker that auto-engages kill_switch on a 7%
+  weekly equity drop.
+- /close <symbol> + /close_confirm. The orders table supports
+  action='close' but no command writes those rows yet.
+
 ## 2026-04-27 . Phase 3.3: Strategy tick loop (dry-run)
 
 Shipped:

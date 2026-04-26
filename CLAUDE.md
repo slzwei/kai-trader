@@ -183,16 +183,17 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3 shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3, 3.4 shipped:
 
 - Repo scaffolding, typed config, structlog, pyproject.
-- Seven SQL migrations: system flags, bot commands, notifications, positions,
-  account snapshots, sleeve config, regime history.
+- Eight SQL migrations: system flags, bot commands, notifications, positions,
+  account snapshots, sleeve config, regime history, orders.
 - Idempotent migration runner with checksum drift detection.
 - Telegram bot with `/start`, `/help`, `/health`, `/status` (mocked),
   `/account` (live Alpaca paper), `/positions` (live Alpaca paper),
   `/flags`, `/flag`, `/kill`, `/notify_test`, `/quote`, `/snapshot_now`,
-  `/history`, `/chain`, `/sleeves`, `/regime`, `/strategy_status`.
+  `/history`, `/chain`, `/sleeves`, `/regime`, `/strategy_status`,
+  `/trade_now`, `/recent_trades`.
 - Whitelist auth middleware with silent-ignore for non-owners.
 - Read-only Alpaca client at `src/kai_trader/broker/alpaca.py`. Wraps the
   sync `alpaca-py` SDK with `asyncio.to_thread`. Exposes `get_account`,
@@ -240,7 +241,25 @@ Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3 shipped:
     enqueues one info-priority notification per tick summarising the
     intents it would have submitted.
   - `/strategy_status` runs the same flow on demand and replies inline.
-  - **No order placement yet.** That arrives in Phase 3.4.
+- Order placement (Phase 3.4) is wired:
+  - Migration 008 creates the `orders` table (intent + alpaca_order_id +
+    status + gating_decision + fill data).
+  - `db/orders.py` exposes `record_intent`, `mark_submitted`,
+    `mark_status`, `recent_orders`, `pending_orders`.
+  - `broker/alpaca.py` adds `submit_short_put` (sell-to-open limit
+    order, gated by `kill_switch` and `trading_enabled`) returning a
+    typed `SubmitResult` that distinguishes "not sent" from "broker
+    error", plus `get_order_status` for reconciliation.
+  - The strategy worker now: reconciles pending Alpaca orders at the
+    top of each tick (writes back fill price and status), then for each
+    candidate intent records a row, calls the gated submitter, and
+    updates the row to `submitted` / `skipped_by_flag` / `failed`.
+  - `/trade_now` forces an immediate tick. `/recent_trades [N]` reads
+    the orders table newest-first.
+  - The flag gate inside `submit_short_put` is the **last** check
+    before any HTTP call to Alpaca. Even if the worker code path
+    races with someone toggling kill_switch from Telegram, the broker
+    refuses cleanly and the row is marked `skipped_by_flag`.
 - Account snapshot history via migration 005 + `src/kai_trader/db/
   account_snapshots.py`. `record_snapshot` persists an `AccountSnapshot`,
   `recent_snapshots(limit)` reads them back newest first. The bot exposes
