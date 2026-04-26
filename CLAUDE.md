@@ -183,11 +183,12 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3, 3.4, 3.5 shipped (Phase 3 complete):
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6 shipped (Phase 3 complete + recalibrated):
 
 - Repo scaffolding, typed config, structlog, pyproject.
-- Eight SQL migrations: system flags, bot commands, notifications, positions,
-  account snapshots, sleeve config, regime history, orders.
+- Ten SQL migrations: system flags, bot commands, notifications, positions,
+  account snapshots, sleeve config, regime history, orders, sleeve
+  recalibration (3.6), enable new entries (3.6).
 - Idempotent migration runner with checksum drift detection.
 - Telegram bot with `/start`, `/help`, `/health`, `/status` (mocked),
   `/account` (live Alpaca paper), `/positions` (live Alpaca paper),

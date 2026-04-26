@@ -251,11 +251,63 @@ The parameter set below is the calibration that pushes toward 3% in
 friendly regimes while clamping risk hard enough to keep drawdowns
 inside the 10% floor.
 
-## Calibrated decisions (research-backed)
+## Calibrated decisions (research-backed, recalibrated 3.6)
 
 The 30-45 DTE references in earlier sections of this document are
 superseded by 7 DTE. The numbers below are the active values for
-sub-phases 3.2 onward.
+sub-phases 3.2 onward, with Phase 3.6 changes marked.
+
+### Phase 3.6 recalibration (active set)
+
+The original 3.2 calibration was too conservative for a $100k account
+at current SPY prices: SPY/QQQ/META each require ~$50-70k of
+collateral per contract, and a 40% sleeve cap on $100k allowed at most
+1 contract from those names — leaving the strategy under-deployed.
+The recalibration loosens the cap matrix and broadens the whitelists
+so the strategy can actually push toward 3% per month.
+
+**What changed**:
+
+- **Allocations**: 25 / 30 / 45 (was 40 / 40 / 20). Opportunistic gets
+  the largest share because that is where the IV juice lives.
+- **Target deltas**: -0.40 risk_on, -0.30 neutral (was -0.30 / -0.20).
+  Higher deltas trade larger assignment probability for materially
+  more premium per dollar of collateral.
+- **Multi-contract per symbol** allowed up to a per-symbol
+  concentration cap of **15% of equity** and a hard ceiling of
+  **10 contracts per symbol per cycle**. Cheap names (F, SOFI, PLTR)
+  now contribute multiple contracts of premium instead of one each.
+- **Total deployment cap**: 70% of equity in CSP collateral (was 60%).
+- **Opportunistic stays active in neutral** (was paused). Lower delta
+  in neutral keeps it bounded; pausing the highest-IV sleeve was a
+  major drag on average yield.
+- **Roll trigger**: 0.50 absolute delta (was 0.45). Let trades work
+  harder before paying to close.
+- **`new_entries_enabled` flag is now wired** as the third gate inside
+  `submit_short_put`. Migration 010 set the existing seeded value to
+  true so the bot can submit; operator can flip it off to pause new
+  entries while keeping rolls/closes alive.
+- **Symbol whitelists expanded**:
+  - `index_core`: SPY, QQQ, IWM, DIA
+  - `stable_largecap`: AAPL, MSFT, GOOGL, AMZN, META, V, JPM, BAC,
+    DIS, KO, F, T, PFE, C
+  - `opportunistic`: NVDA, AMD, TSLA, AVGO, COIN, PLTR, SOFI, MARA,
+    MU, BABA, SMCI, MSTR, RIOT, SNAP
+
+**Honest math on the new calibration**:
+
+For a 5-contract weekly portfolio at -0.30 to -0.40 delta on
+$100k equity at ~60-70% deployment, expected weekly premium ranges
+~0.6-1.0% on equity, which compounds to ~2.5-4% per month in
+friendly regimes. Hostile regimes (risk_off) produce zero new
+premium and the open positions decay or get rolled. Average over a
+full cycle: ~2-2.5%, with friendly months hitting 3% and hostile
+months landing closer to 0-1%.
+
+The 7% drawdown circuit breaker is unchanged. The expanded delta
+exposure is offset by the per-symbol concentration cap (15% of
+equity max in any single underlying) and the breaker's ability to
+auto-engage `kill_switch` on a fast-moving drawdown.
 
 ### 1. Wheel parameters
 

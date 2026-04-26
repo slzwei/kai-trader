@@ -3,6 +3,77 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-27 . Phase 3.6: Recalibrate for 3% monthly target
+
+After verifying 3.5, the original 3.2 calibration looked too tight on
+$100k equity at current SPY prices. SPY/QQQ contracts at ~$50-70k
+collateral never fit a 40% sleeve cap, leaving the strategy under
+deployed and well below the 3% per month target. Recalibrated:
+
+Shipped:
+
+- Migration 009 updates the three sleeve_config rows: allocations
+  25 / 30 / 45 (was 40 / 40 / 20), target_delta_put_risk_on -0.40
+  (was -0.30), target_delta_put_neutral -0.30 (was -0.20),
+  roll_trigger_delta 0.50 (was 0.45). Symbol whitelists greatly
+  expanded with a mix of price points (cheap names like F, SOFI,
+  PLTR enable multi-contract deployment within concentration cap).
+- candidates.py rewritten to allow multi-contract per symbol up to
+  PER_SYMBOL_CAP_PCT = 15% of equity AND a global
+  TOTAL_DEPLOYMENT_CAP_PCT = 70% AND a hard
+  MAX_CONTRACTS_PER_SYMBOL = 10 ceiling. Greedy fill walks the
+  whitelist in order. The 1-contract-per-symbol rule is gone.
+- _is_sleeve_active simplified: only risk_off blocks new entries.
+  The opportunistic-paused-in-neutral rule was removed because
+  pausing the highest-IV sleeve was a major drag on average yield.
+- TradeIntent grew a qty field; collateral and expected_premium are
+  now per-intent totals (qty * 100 * strike or mid).
+- Migration 010 flips system_flags.new_entries_enabled to true so
+  the Phase 3.4 broker gate (which had been silently rejecting
+  every submission since the field defaulted to false) lets
+  entries through. Operator can flip it back off via /flag for an
+  asymmetric brake (rolls and closes still fire).
+- broker/alpaca.py submit_short_put gains the new_entries_enabled
+  check as the third gate before any HTTP call to Alpaca, in
+  addition to kill_switch and trading_enabled. Refusal returns
+  reason="new_entries_disabled" and the worker records the row as
+  skipped_by_flag.
+- Worker passes intent.qty through to submit_short_put and records
+  it in the orders.intent_payload. Gating decision now includes
+  new_entries_enabled.
+
+Tests:
+
+- 4 new candidate tests: multi-contract within per-symbol cap,
+  per-symbol cap as the binding constraint when sleeve is huge,
+  total deployment cap across multiple symbols, max contracts per
+  symbol ceiling on a penny-cheap stock.
+- 1 new broker test for new_entries_disabled refusal path; 3
+  existing broker tests updated to include new_entries_enabled in
+  the flag dict so the green-light tests stay green.
+- The opportunistic-paused-in-neutral test inverted to assert
+  opportunistic stays active under the new rule.
+- Worker submit-when-flags-green test updated to expect qty=3 on
+  the test fixture (sleeve cap of $40k and $5k per contract → 3
+  contracts within the 15% per-symbol cap of $15k).
+
+Coverage 94% across 283 passing tests.
+
+Honest math after the changes:
+
+- Friendly week at risk_on (deltas -0.40, ~5-7 contracts, IV
+  18-22): expected weekly yield ~0.7-1.0% on equity. Hits 3% in a
+  full risk_on month.
+- Mixed week at neutral (deltas -0.30, ~3-5 contracts):
+  ~0.4-0.7% weekly. Around 2% in a full neutral month.
+- Hostile week (risk_off, no new entries): existing positions
+  decay/roll, no new premium.
+- Average over a full cycle: ~2-2.5% per month with the right
+  regime distribution. 3% is reachable in friendly months.
+
+The 7% drawdown circuit breaker and per-symbol concentration cap
+keep the 10% drawdown ceiling intact even with the larger delta.
+
 ## 2026-04-27 . Phase 3.5: Drawdown breaker, roll logic, /close
 
 Phase 3 complete with this commit chain.
