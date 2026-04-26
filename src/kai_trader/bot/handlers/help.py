@@ -28,6 +28,8 @@ COMMANDS: list[tuple[str, str]] = [
     ("/strategy_status", "intent list the strategy worker would consider this tick"),
     ("/trade_now", "force a strategy tick immediately (audit-logged)"),
     ("/recent_trades", "recent rows from the orders table, /recent_trades N for last N"),
+    ("/close", "stage a close on a held position; confirm with /close_confirm"),
+    ("/close_confirm", "confirm a staged /close within 30 seconds"),
 ]
 
 

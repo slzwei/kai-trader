@@ -13,6 +13,7 @@ from telegram.ext import Application, CommandHandler
 from kai_trader.bot.handlers import (
     account,
     chain,
+    close,
     flag,
     flags,
     health,
@@ -64,6 +65,8 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CommandHandler("strategy_status", strategy_status.handle))
     app.add_handler(CommandHandler("trade_now", trade_now.handle))
     app.add_handler(CommandHandler("recent_trades", recent_trades.handle))
+    app.add_handler(CommandHandler("close", close.handle_close))
+    app.add_handler(CommandHandler("close_confirm", close.handle_confirm))
 
     return app
 

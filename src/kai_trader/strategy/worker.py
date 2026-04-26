@@ -23,12 +23,14 @@ sizing logic lives in ``build_intents`` via the per-sleeve dollar cap.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from kai_trader.broker.alpaca import (
     SubmitResult,
+    close_position,
     get_account,
     get_order_status,
+    list_positions,
     submit_short_put,
 )
 from kai_trader.broker.options_data import get_chain
@@ -40,13 +42,15 @@ from kai_trader.db.orders import (
     pending_orders,
     record_intent,
 )
-from kai_trader.db.sleeve_config import get_all_sleeves
+from kai_trader.db.sleeve_config import SleeveConfig, get_all_sleeves
 from kai_trader.db.system_flags import get_all_flags
 from kai_trader.logging import get_logger
 from kai_trader.notifications.producer import enqueue
 from kai_trader.strategy.candidates import TradeIntent, build_intents
 from kai_trader.strategy.clock import get_clock_snapshot
-from kai_trader.strategy.regime import compute_and_record
+from kai_trader.strategy.drawdown import check_and_trip as check_drawdown
+from kai_trader.strategy.regime import RegimeSnapshot, compute_and_record
+from kai_trader.strategy.rolls import RollIntent, evaluate_rolls
 
 _log = get_logger(__name__)
 
@@ -110,24 +114,47 @@ class StrategyWorker:
             return summary
 
         flags = await get_all_flags()
+
+        # Drawdown circuit breaker runs before strategy logic so a fresh
+        # breach trips the kill switch and short-circuits this tick.
+        account = await get_account()
+        dd_check = await check_drawdown(
+            current_equity=account.equity,
+            kill_switch_already_on=flags.get("kill_switch", False),
+        )
+        if dd_check.breached and not flags.get("kill_switch", False):
+            # We just tripped the breaker. Re-read flags so the rest of
+            # the tick sees kill_switch=true.
+            flags = await get_all_flags()
+
         if flags.get("kill_switch", False):
             summary = (
                 f"Kill switch engaged. Reconciled {reconciled} open orders. "
                 "No new candidates evaluated."
             )
+            if dd_check.breached:
+                summary += (
+                    f" Drawdown {dd_check.drawdown_pct:.2f}% from "
+                    f"{dd_check.high_water_mark}."
+                )
             await enqueue(summary, "alert", channel="telegram")
             _log.info("strategy.tick.kill_switch_engaged", reconciled=reconciled)
             return summary
 
         regime, transitioned = await compute_and_record(notes="strategy tick")
-        account = await get_account()
         sleeves = await get_all_sleeves()
+        today = datetime.now(UTC).date()
+
+        # Roll evaluation runs before new entries so any rolled-into
+        # capital is reflected in the sleeve cap math below.
+        rolls = await self._handle_rolls(sleeves, regime, flags, today)
+
         intents = await build_intents(
             regime=regime,
             sleeves=sleeves,
             account=account,
             chain_fetcher=get_chain,
-            today=datetime.now(UTC).date(),
+            today=today,
         )
 
         submitted: list[str] = []
@@ -149,8 +176,11 @@ class StrategyWorker:
         )
         if transitioned:
             header += " (regime changed since last tick)"
+        rolled = sum(1 for r in rolls if r.reason == "rolled")
+        held = len(rolls) - rolled
         body_lines = [
             f"Reconciled: {reconciled} open orders.",
+            f"Rolls:     {rolled} rolled, {held} held",
             f"Submitted: {len(submitted)}" + (f" ({', '.join(submitted)})" if submitted else ""),
             f"Skipped:   {len(skipped)}" + (f" ({', '.join(skipped)})" if skipped else ""),
             f"Failed:    {len(failed)}" + (f" ({', '.join(failed)})" if failed else ""),
@@ -165,6 +195,102 @@ class StrategyWorker:
             failed=len(failed),
         )
         return summary
+
+    async def _handle_rolls(
+        self,
+        sleeves: list[SleeveConfig],
+        regime: RegimeSnapshot,
+        flags: dict[str, bool],
+        today: date,
+    ) -> list[RollIntent]:
+        """Evaluate roll candidates and execute when net-credit is available."""
+        try:
+            positions = await list_positions()
+        except Exception as exc:
+            _log.warning("strategy.rolls.positions_fetch_failed", error=str(exc))
+            return []
+
+        rolls = await evaluate_rolls(
+            positions=positions,
+            sleeves=sleeves,
+            regime=regime,
+            chain_fetcher=get_chain,
+            today=today,
+        )
+
+        for roll in rolls:
+            if roll.reason != "rolled":
+                _log.info(
+                    "strategy.roll.held",
+                    underlying=roll.underlying,
+                    reason=roll.reason,
+                    current_delta=str(roll.current_delta),
+                )
+                continue
+            if not flags.get("trading_enabled", False) or flags.get("kill_switch", False):
+                _log.info(
+                    "strategy.roll.skipped_by_flag",
+                    underlying=roll.underlying,
+                    flags=dict(flags),
+                )
+                continue
+            await self._execute_roll(roll)
+        return rolls
+
+    async def _execute_roll(self, roll: RollIntent) -> None:
+        """Submit close + new-open pair, recording both as orders rows."""
+        assert roll.new_option_symbol is not None
+        assert roll.new_credit is not None
+
+        close_row_id = await record_intent(
+            sleeve=roll.sleeve,
+            symbol=roll.underlying,
+            option_symbol=roll.current_option_symbol,
+            action="close",
+            intent_payload={
+                "trigger": "roll",
+                "current_delta": str(roll.current_delta),
+                "close_price": str(roll.close_price),
+            },
+            gating_decision={"trading_enabled": True, "kill_switch": False},
+        )
+        close_result = await close_position(roll.underlying)
+        if close_result.submitted and close_result.alpaca_order_id:
+            await mark_submitted(
+                close_row_id,
+                alpaca_order_id=close_result.alpaca_order_id,
+                submitted_at=datetime.now(UTC),
+            )
+        else:
+            await mark_status(close_row_id, "failed", error_text=close_result.reason)
+            return
+
+        new_row_id = await record_intent(
+            sleeve=roll.sleeve,
+            symbol=roll.underlying,
+            option_symbol=roll.new_option_symbol,
+            action="roll",
+            intent_payload={
+                "from_strike": str(roll.current_strike),
+                "to_strike": str(roll.new_strike),
+                "net_credit": str(roll.net_credit),
+            },
+            gating_decision={"trading_enabled": True, "kill_switch": False},
+        )
+        new_result = await submit_short_put(
+            option_symbol=roll.new_option_symbol,
+            qty=1,
+            limit_price=roll.new_credit,
+            client_order_id=f"kai-roll-{new_row_id[:8]}",
+        )
+        if new_result.submitted and new_result.alpaca_order_id:
+            await mark_submitted(
+                new_row_id,
+                alpaca_order_id=new_result.alpaca_order_id,
+                submitted_at=datetime.now(UTC),
+            )
+        else:
+            await mark_status(new_row_id, "failed", error_text=new_result.reason)
 
     async def _submit_intent(
         self,

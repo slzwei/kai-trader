@@ -277,6 +277,61 @@ class OrderStatusSnapshot:
     failed_at: Any
 
 
+async def close_position(symbol: str) -> SubmitResult:
+    """Submit a market close on a held position. Gated by kill_switch only.
+
+    Closes are allowed when ``kill_switch`` is engaged and even when
+    ``trading_enabled`` is off, because closing reduces exposure rather
+    than adding to it. The kill switch check stays as a manual brake on
+    everything including discretionary closes; clear it first if the
+    operator really wants to close while the breaker is tripped.
+    """
+    flags = await get_all_flags()
+    if flags.get("kill_switch", False):
+        _log.warning("alpaca.close.refused_kill_switch", symbol=symbol)
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="kill_switch_engaged",
+            flags=flags,
+        )
+    try:
+        client = _get_client()
+        order = await asyncio.to_thread(client.close_position, symbol)
+    except Exception as exc:
+        _log.error("alpaca.close.failed", symbol=symbol, error=str(exc))
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="close_exception",
+            flags=flags,
+            error=str(exc),
+        )
+    if isinstance(order, dict):
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="raw_dict_payload",
+            flags=flags,
+        )
+    _log.info(
+        "alpaca.close.ok",
+        symbol=symbol,
+        alpaca_order_id=str(order.id),
+        order_status=str(order.status),
+    )
+    return SubmitResult(
+        submitted=True,
+        alpaca_order_id=str(order.id),
+        order_status=_enum_value(order.status),
+        reason=None,
+        flags=flags,
+    )
+
+
 async def get_order_status(alpaca_order_id: str) -> OrderStatusSnapshot:
     """Fetch the latest status for an order we previously submitted."""
     client = _get_client()
