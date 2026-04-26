@@ -13,6 +13,7 @@ htmlcov
 !.env.example
 tests
 *.md
+!README.md
 PHASE3.md
 TRACKER.md
 .claude

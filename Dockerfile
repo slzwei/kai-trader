@@ -22,6 +22,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # Now copy the source and install the project itself.
+# README.md is required by hatchling because pyproject.toml declares it.
+COPY README.md ./
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 RUN uv sync --frozen --no-dev
