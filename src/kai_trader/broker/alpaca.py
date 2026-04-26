@@ -79,6 +79,38 @@ def reset_client() -> None:
     _client = None
 
 
+_STALE_CONNECTION_HINTS = (
+    "RemoteDisconnected",
+    "Connection aborted",
+    "Connection reset",
+    "BadStatusLine",
+)
+
+
+def _is_stale_connection(error_str: str) -> bool:
+    return any(hint in error_str for hint in _STALE_CONNECTION_HINTS)
+
+
+async def _call_alpaca_with_retry(method_name: str, *args: Any, **kwargs: Any) -> Any:
+    """Run a sync TradingClient method via to_thread, retry once on stale conn.
+
+    Idle keep-alive connections to Alpaca occasionally get closed by the
+    server. The next call sees ``RemoteDisconnected`` from urllib3 inside
+    a ConnectionError. When we detect that, we drop the cached client,
+    rebuild, and retry once. Any other exception bubbles up unchanged.
+    """
+    client = _get_client()
+    try:
+        return await asyncio.to_thread(getattr(client, method_name), *args, **kwargs)
+    except Exception as exc:
+        if not _is_stale_connection(str(exc)):
+            raise
+        _log.warning("alpaca.connection.stale_retry", method=method_name, error=str(exc))
+        reset_client()
+        client = _get_client()
+        return await asyncio.to_thread(getattr(client, method_name), *args, **kwargs)
+
+
 def _to_decimal(value: Any) -> Decimal:
     if value is None:
         # Fields are Optional[str] in alpaca-py; treat missing numerics as zero
@@ -105,8 +137,7 @@ def _enum_value(value: Any) -> str:
 
 async def get_account() -> AccountSnapshot:
     """Fetch the current account state from Alpaca."""
-    client = _get_client()
-    account = await asyncio.to_thread(client.get_account)
+    account = await _call_alpaca_with_retry("get_account")
     if isinstance(account, dict):  # raw_data path; not used here but defensive.
         raise RuntimeError("Alpaca client returned raw dict, expected TradeAccount.")
     equity = _to_decimal(account.equity)
@@ -125,8 +156,7 @@ async def get_account() -> AccountSnapshot:
 
 async def list_positions() -> list[PositionSnapshot]:
     """Return all open positions on the account; possibly empty."""
-    client = _get_client()
-    positions = await asyncio.to_thread(client.get_all_positions)
+    positions = await _call_alpaca_with_retry("get_all_positions")
     if isinstance(positions, dict):  # raw_data path; defensive.
         raise RuntimeError("Alpaca client returned raw dict, expected list[Position].")
     snapshots: list[PositionSnapshot] = []
@@ -153,8 +183,7 @@ async def ping() -> bool:
     and network. ``get_account`` would also work but pulls a heavier payload.
     """
     try:
-        client = _get_client()
-        await asyncio.to_thread(client.get_clock)
+        await _call_alpaca_with_retry("get_clock")
         return True
     except Exception as exc:
         _log.warning("alpaca.ping.failed", error=str(exc))
@@ -226,8 +255,7 @@ async def submit_short_put(
         client_order_id=client_order_id,
     )
     try:
-        client = _get_client()
-        order = await asyncio.to_thread(client.submit_order, request)
+        order = await _call_alpaca_with_retry("submit_order", request)
     except Exception as exc:
         _log.error("alpaca.submit.failed", option_symbol=option_symbol, error=str(exc))
         return SubmitResult(
@@ -277,6 +305,11 @@ class OrderStatusSnapshot:
     failed_at: Any
 
 
+def _is_position_not_found(error_str: str) -> bool:
+    """Detect Alpaca's 40410000 'position not found' code in an error string."""
+    return "40410000" in error_str or "position not found" in error_str.lower()
+
+
 async def close_position(symbol: str) -> SubmitResult:
     """Submit a market close on a held position. Gated by kill_switch only.
 
@@ -297,9 +330,17 @@ async def close_position(symbol: str) -> SubmitResult:
             flags=flags,
         )
     try:
-        client = _get_client()
-        order = await asyncio.to_thread(client.close_position, symbol)
+        order = await _call_alpaca_with_retry("close_position", symbol)
     except Exception as exc:
+        if _is_position_not_found(str(exc)):
+            _log.info("alpaca.close.no_position", symbol=symbol)
+            return SubmitResult(
+                submitted=False,
+                alpaca_order_id=None,
+                order_status=None,
+                reason="position_not_found",
+                flags=flags,
+            )
         _log.error("alpaca.close.failed", symbol=symbol, error=str(exc))
         return SubmitResult(
             submitted=False,
@@ -334,8 +375,7 @@ async def close_position(symbol: str) -> SubmitResult:
 
 async def get_order_status(alpaca_order_id: str) -> OrderStatusSnapshot:
     """Fetch the latest status for an order we previously submitted."""
-    client = _get_client()
-    order = await asyncio.to_thread(client.get_order_by_id, alpaca_order_id)
+    order = await _call_alpaca_with_retry("get_order_by_id", alpaca_order_id)
     if isinstance(order, dict):
         raise RuntimeError("Alpaca client returned raw dict, expected Order.")
     return OrderStatusSnapshot(

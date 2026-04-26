@@ -8,11 +8,10 @@ respected for free.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 
-from kai_trader.broker.alpaca import _get_client
+from kai_trader.broker.alpaca import _call_alpaca_with_retry
 
 
 @dataclass(frozen=True)
@@ -27,8 +26,7 @@ class ClockSnapshot:
 
 async def get_clock_snapshot() -> ClockSnapshot:
     """Fetch the current market-clock snapshot."""
-    client = _get_client()
-    clock = await asyncio.to_thread(client.get_clock)
+    clock = await _call_alpaca_with_retry("get_clock")
     if isinstance(clock, dict):
         raise RuntimeError("Alpaca client returned raw dict, expected Clock.")
     return ClockSnapshot(

@@ -385,6 +385,100 @@ async def test_close_position_handles_alpaca_exception(
     assert result.error == "alpaca down"
 
 
+async def test_close_position_detects_position_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.close_position.side_effect = RuntimeError(
+        '{"code":40410000,"message":"position not found: SPY"}'
+    )
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": False, "trading_enabled": True}),
+    )
+
+    result = await broker.close_position("SPY")
+    assert result.submitted is False
+    assert result.reason == "position_not_found"
+    assert result.error is None
+
+
+def test_is_position_not_found_table() -> None:
+    assert broker._is_position_not_found('{"code":40410000,"message":"oops"}')
+    assert broker._is_position_not_found("APIError: position not found: SPY")
+    assert not broker._is_position_not_found("403 forbidden")
+    assert not broker._is_position_not_found("network down")
+
+
+def test_is_stale_connection_table() -> None:
+    assert broker._is_stale_connection("RemoteDisconnected('...')")
+    assert broker._is_stale_connection("Connection aborted.")
+    assert broker._is_stale_connection("Connection reset by peer")
+    assert broker._is_stale_connection("BadStatusLine")
+    assert not broker._is_stale_connection("403 forbidden")
+
+
+async def test_call_alpaca_retries_once_on_stale_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first-call ConnectionError triggers a client reset and a single retry."""
+    builds: list[int] = []
+
+    class _FlakyClient:
+        def __init__(self, fail_first: bool) -> None:
+            self.fail_first = fail_first
+            self.calls = 0
+
+        def get_account(self) -> str:
+            self.calls += 1
+            if self.fail_first and self.calls == 1:
+                raise ConnectionError(
+                    "('Connection aborted.', RemoteDisconnected('eof'))"
+                )
+            return "ok"
+
+    instances: list[_FlakyClient] = []
+
+    def fake_build(_cfg: Any) -> _FlakyClient:
+        builds.append(1)
+        # First instance fails on call; replacement after reset succeeds.
+        client = _FlakyClient(fail_first=len(instances) == 0)
+        instances.append(client)
+        return client
+
+    monkeypatch.setattr(broker, "_build_client", fake_build)
+
+    result = await broker._call_alpaca_with_retry("get_account")
+    assert result == "ok"
+    assert len(builds) == 2  # first build, retry built a fresh one
+    assert instances[0].calls == 1  # first instance called once and failed
+    assert instances[1].calls == 1  # retry instance called once and succeeded
+
+
+async def test_call_alpaca_does_not_retry_on_unrelated_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builds: list[int] = []
+
+    class _AlwaysFails:
+        def get_account(self) -> str:
+            raise RuntimeError("403 forbidden")
+
+    def fake_build(_cfg: Any) -> _AlwaysFails:
+        builds.append(1)
+        return _AlwaysFails()
+
+    monkeypatch.setattr(broker, "_build_client", fake_build)
+
+    with pytest.raises(RuntimeError, match="403 forbidden"):
+        await broker._call_alpaca_with_retry("get_account")
+    assert len(builds) == 1  # no retry, no rebuild
+
+
 async def test_get_order_status_maps_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     from datetime import UTC, datetime
 

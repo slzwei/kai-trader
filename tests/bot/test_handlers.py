@@ -275,7 +275,10 @@ async def test_handler_records_error_on_failure(
 
     await status_mod.handle(update, None)  # type: ignore[arg-type]
 
-    update.effective_message.reply_text.assert_not_awaited()
+    # Fallback reply IS sent so the operator sees a failure rather than silence.
+    update.effective_message.reply_text.assert_awaited_once()
+    fallback_text = update.effective_message.reply_text.await_args.args[0]
+    assert "/status failed: RuntimeError" in fallback_text
     patched_db["mark"].assert_awaited_once()
     kwargs = patched_db["mark"].await_args.kwargs
     assert kwargs["response_sent"] is False
@@ -1256,6 +1259,35 @@ async def test_close_confirm_expires_after_ttl(
 
     text = _last_reply(update)
     assert "No fresh /close staged for SPY" in text
+
+
+async def test_close_confirm_position_not_found(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    close_mod._reset_pending()
+    close_mod._stage(42, "SPY")
+    monkeypatch.setattr(
+        close_mod,
+        "close_position",
+        AsyncMock(return_value=SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="position_not_found",
+            flags={"kill_switch": False, "trading_enabled": True},
+        )),
+    )
+    monkeypatch.setattr(close_mod, "record_intent", AsyncMock(return_value="audit"))
+
+    update = fake_update_factory(user_id=42, text="/close_confirm SPY")
+    await close_mod.handle_confirm(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert text == "No open SPY position to close."
 
 
 async def test_close_confirm_kill_switch_path(

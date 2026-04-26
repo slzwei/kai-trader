@@ -123,6 +123,8 @@ async def _build_confirm(_update: Update, ctx: CommandContext) -> str:
             "Close refused: kill_switch engaged. Clear it with "
             "/flag kill_switch off, then try again."
         )
+    if result.reason == "position_not_found":
+        return f"No open {symbol} position to close."
     return f"Close failed for {symbol}: {result.reason or 'unknown'} ({result.error or 'no detail'})."
 
 

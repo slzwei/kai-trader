@@ -57,6 +57,21 @@ async def run_command(
             telegram_user_id=ctx.telegram_user_id,
             error=error,
         )
+        # Surface the failure so the operator sees something rather than
+        # silence. Best-effort: if even the fallback reply fails (e.g.
+        # Telegram itself is the failure mode), swallow that too so we
+        # do not stack two errors and lose the audit row.
+        try:
+            await message.reply_text(
+                f"Command /{ctx.command.lstrip('/')} failed: {type(exc).__name__}. "
+                "Try again; if it persists, check the bot logs."
+            )
+        except Exception as reply_exc:
+            _log.error(
+                "bot.handler.fallback_reply_failed",
+                command=ctx.command,
+                error=str(reply_exc),
+            )
     finally:
         _log.info(
             "bot.response.sent",

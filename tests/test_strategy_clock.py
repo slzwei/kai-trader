@@ -20,8 +20,12 @@ def _reset_broker_client() -> Any:
 
 
 def _patch_client(monkeypatch: pytest.MonkeyPatch, fake: MagicMock) -> None:
-    """Patch the trading-client getter at the clock module's import site."""
-    monkeypatch.setattr(clock_module, "_get_client", lambda settings=None: fake)
+    """Patch the broker retry helper to dispatch to the fake client."""
+
+    async def fake_call(method_name: str, *args: Any, **kwargs: Any) -> Any:
+        return getattr(fake, method_name)(*args, **kwargs)
+
+    monkeypatch.setattr(clock_module, "_call_alpaca_with_retry", fake_call)
 
 
 class _FakeClock:
