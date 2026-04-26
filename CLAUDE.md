@@ -183,14 +183,14 @@ kai-trader/
 
 ## Current state
 
-Phase 1 plus Phase 2 read-only Alpaca plus Phase 2.5 system-flag controls:
+Phases 1, 2, 2.5, 2.7 shipped:
 
 - Repo scaffolding, typed config, structlog, pyproject.
 - Four SQL migrations: system flags, bot commands, notifications, positions.
 - Idempotent migration runner with checksum drift detection.
 - Telegram bot with `/start`, `/help`, `/health`, `/status` (mocked),
   `/account` (live Alpaca paper), `/positions` (live Alpaca paper),
-  `/flags`, `/flag`, `/kill`.
+  `/flags`, `/flag`, `/kill`, `/notify_test`.
 - Whitelist auth middleware with silent-ignore for non-owners.
 - Read-only Alpaca client at `src/kai_trader/broker/alpaca.py`. Wraps the
   sync `alpaca-py` SDK with `asyncio.to_thread`. Exposes `get_account`,
@@ -198,6 +198,12 @@ Phase 1 plus Phase 2 read-only Alpaca plus Phase 2.5 system-flag controls:
 - System-flag helpers at `src/kai_trader/db/system_flags.py`. Reads and
   atomically updates `trading_enabled`, `new_entries_enabled`, and
   `kill_switch`. Records the actor's Telegram ID in `updated_by`.
+- Notification queue producer + worker at `src/kai_trader/notifications/`.
+  Producer enqueues into the `notifications` table. Worker runs as an
+  async task inside the bot, polls every 5s, claims undelivered telegram
+  rows via `select for update skip locked`, sends through the bot's
+  Telegram client, and marks `sent_at`. Failures bump `retry_count`;
+  exhausted rows stay queued for inspection.
 - `/health` reports DB and Alpaca up/down side by side.
 - Test suite at 90%+ coverage. Clean `ruff check`, clean `mypy --strict src/`.
 
@@ -211,12 +217,11 @@ Phase 1 plus Phase 2 read-only Alpaca plus Phase 2.5 system-flag controls:
   anything to the broker.
 - Live (non-paper) trading. `ALPACA_PAPER=true` is the default; flipping it
   to `false` only matters once orders exist.
-- Notification delivery worker. `notifications` rows are queued but nothing
-  drains them yet.
 - Dashboard / web UI. Not in scope until Phase 5+.
 - Doppler secret management. `.env` is the only store for now.
-- SMS channel. `notifications.channel` accepts `sms` and `both` but no
-  deliverer exists.
+- SMS channel. The producer accepts `channel='sms'` and `channel='both'`
+  rows, but the Phase 2.7 worker only delivers `telegram`. SMS-bound rows
+  sit in the queue until an SMS deliverer ships.
 
 ## Known issues
 

@@ -3,6 +3,40 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-26 . Phase 2.7: Notification delivery worker
+
+Shipped:
+
+- `src/kai_trader/notifications/producer.py` with `enqueue(message,
+  priority, *, channel='telegram', metadata, max_retries)`. Validates
+  priority and channel against the migration 003 check constraints so a
+  typo fails in Python rather than mid-INSERT.
+- `src/kai_trader/notifications/worker.py` with `NotificationWorker`. An
+  asyncio task that polls every 5s, claims a batch via
+  `select for update skip locked`, sends each message through a
+  caller-provided coroutine, and marks `sent_at`. On failure it bumps
+  `retry_count`. When `retry_count >= max_retries` the row is skipped by
+  the claim query, so it stays in the table as evidence rather than
+  spinning forever.
+- Bot wiring: post_init builds a closure that sends to
+  `TELEGRAM_OWNER_ID` and starts the worker. post_shutdown cancels and
+  awaits the worker before closing the DB pool.
+- New `/notify_test [body]` command. Enqueues an info-priority telegram
+  row so the round-trip can be verified without waiting for any future
+  fill or regime event.
+- 4 producer unit tests, 8 worker unit tests, 2 handler tests, plus
+  /help and bot-main updates. 111 passing total, 2 skipped, 93%
+  coverage.
+
+Not shipped (deliberate):
+
+- SMS delivery and the `channel='both'` coordination story. Producer
+  accepts both, worker leaves them queued.
+- Webhook or HTTP producers. Phase 2.7 only adds the in-process helper;
+  external producers can come later.
+- Failure-reason audit column. If we want it, add a migration that
+  introduces `last_error text` and have the worker write to it.
+
 ## 2026-04-26 . Phase 2.5: System-flag command surface
 
 Shipped:
