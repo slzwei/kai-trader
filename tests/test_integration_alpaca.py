@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from kai_trader.broker import alpaca as broker
+from kai_trader.broker import market_data
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -49,6 +50,7 @@ async def test_paper_account_and_positions_round_trip(
 
     config_module.reset_settings_cache()
     broker.reset_client()
+    market_data.reset_client()
 
     settings = config_module.get_settings()
     assert settings.alpaca_paper is True, "Integration test must run against paper."
@@ -70,3 +72,13 @@ async def test_paper_account_and_positions_round_trip(
     for p in positions:
         assert p.symbol
         assert p.qty != Decimal("0")
+
+    # Market data: latest quote and trade for SPY should always come back.
+    quote = await market_data.get_latest_quote("SPY")
+    assert quote.symbol == "SPY"
+    assert quote.bid_price >= Decimal("0")
+    assert quote.ask_price >= quote.bid_price
+
+    trade = await market_data.get_latest_trade("SPY")
+    assert trade.symbol == "SPY"
+    assert trade.price > Decimal("0")

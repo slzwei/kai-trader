@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -15,9 +16,11 @@ from kai_trader.bot.handlers import help as help_mod
 from kai_trader.bot.handlers import kill as kill_mod
 from kai_trader.bot.handlers import notify_test as notify_test_mod
 from kai_trader.bot.handlers import positions as positions_mod
+from kai_trader.bot.handlers import quote as quote_mod
 from kai_trader.bot.handlers import start as start_mod
 from kai_trader.bot.handlers import status as status_mod
 from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
+from kai_trader.broker.market_data import QuoteSnapshot, TradeSnapshot
 
 
 def _last_reply(update: Any) -> str:
@@ -63,6 +66,7 @@ async def test_help_lists_every_command(
     expected = (
         "/start", "/help", "/health", "/status", "/account",
         "/positions", "/flags", "/flag", "/kill", "/notify_test",
+        "/quote",
     )
     for cmd in expected:
         assert cmd in text
@@ -425,6 +429,80 @@ async def test_notify_test_uses_default_body_when_no_args(
     enqueue_mock.assert_awaited_once()
     args, _ = enqueue_mock.await_args
     assert args[0] == "Kai Trader notification test."
+
+
+async def test_quote_renders_bid_ask_and_last(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    quote_snap = QuoteSnapshot(
+        symbol="AAPL",
+        bid_price=Decimal("150.10"),
+        ask_price=Decimal("150.20"),
+        bid_size=Decimal("100"),
+        ask_size=Decimal("200"),
+        timestamp=datetime(2026, 4, 26, 14, 30, tzinfo=UTC),
+    )
+    trade_snap = TradeSnapshot(
+        symbol="AAPL",
+        price=Decimal("150.15"),
+        size=Decimal("50"),
+        timestamp=datetime(2026, 4, 26, 14, 30, 5, tzinfo=UTC),
+    )
+    monkeypatch.setattr(quote_mod, "get_latest_quote", AsyncMock(return_value=quote_snap))
+    monkeypatch.setattr(quote_mod, "get_latest_trade", AsyncMock(return_value=trade_snap))
+
+    update = fake_update_factory(user_id=42, text="/quote aapl")
+    await quote_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "AAPL" in text
+    assert "Bid:    USD 150.10" in text
+    assert "Ask:    USD 150.20" in text
+    assert "Spread: USD 0.10" in text
+    assert "Mid:    USD 150.15" in text
+    assert "Last:   USD 150.15" in text
+
+
+async def test_quote_shows_usage_when_called_without_args(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(quote_mod, "get_latest_quote", AsyncMock())
+    monkeypatch.setattr(quote_mod, "get_latest_trade", AsyncMock())
+
+    update = fake_update_factory(user_id=42, text="/quote")
+    await quote_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Usage:" in text
+
+
+async def test_quote_handles_unknown_symbol(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        quote_mod,
+        "get_latest_quote",
+        AsyncMock(side_effect=LookupError("No quote returned for 'ZZZZ'.")),
+    )
+    monkeypatch.setattr(quote_mod, "get_latest_trade", AsyncMock())
+
+    update = fake_update_factory(user_id=42, text="/quote ZZZZ")
+    await quote_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "No data for ZZZZ" in text
 
 
 async def test_kill_engages_both_flags(
