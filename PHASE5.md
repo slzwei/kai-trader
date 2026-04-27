@@ -42,11 +42,11 @@ Four shippable units, each leaves the bot working on its own.
 
 **Acceptance**: When an open short put's current ask reaches ≤ (1 - profit_take_pct) × original_credit, the bot submits a buy-to-close limit order at the ask, logged with `action='profit_take_close'`.
 
-- [ ] 5b.1 Broker primitive: `submit_buy_to_close` (gated by `kill_switch` only)
-- [ ] 5b.2 Profit-take evaluator module + tests
-- [ ] 5b.3 Worker integration
-- [ ] 5b.4 Order linking (intent_payload.original_order_id)
-- [ ] 5b.5 Quality gates + docs + deploy
+- [x] 5b.1 Broker primitive: `submit_buy_to_close` + `list_short_option_positions`
+- [x] 5b.2 Profit-take evaluator module + tests
+- [x] 5b.3 Worker integration (`_handle_profit_takes`, `_submit_close_intent`)
+- [x] 5b.4 Order linking (intent_payload.original_order_id, captured_pct, current_ask)
+- [x] 5b.5 Quality gates (442 passing, 91% coverage), migration 016 applied, docs updated
 
 ## Phase 5c — TradingStream + Real-Time Notifications
 

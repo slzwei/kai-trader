@@ -176,6 +176,27 @@ async def list_positions() -> list[PositionSnapshot]:
     return snapshots
 
 
+async def list_short_option_positions() -> list[PositionSnapshot]:
+    """Return short option positions only (negative qty + OCC symbol).
+
+    Used by Phase 5 profit-take logic to find open short puts whose
+    current price has decayed enough to close at a captured-premium
+    threshold. The qty in the returned snapshot is preserved as Alpaca
+    returns it (negative for short positions).
+    """
+    from kai_trader.broker.options_data import parse_occ_symbol  # local import to avoid cycle
+
+    out: list[PositionSnapshot] = []
+    for p in await list_positions():
+        try:
+            parse_occ_symbol(p.symbol)
+        except ValueError:
+            continue
+        if p.side.lower() == "short" or p.qty < 0:
+            out.append(p)
+    return out
+
+
 async def list_long_equity_positions() -> list[PositionSnapshot]:
     """Return long stock positions only, excluding options.
 
@@ -492,6 +513,82 @@ async def close_position(symbol: str) -> SubmitResult:
     _log.info(
         "alpaca.close.ok",
         symbol=symbol,
+        alpaca_order_id=str(order.id),
+        order_status=str(order.status),
+    )
+    return SubmitResult(
+        submitted=True,
+        alpaca_order_id=str(order.id),
+        order_status=_enum_value(order.status),
+        reason=None,
+        flags=flags,
+    )
+
+
+async def submit_buy_to_close(
+    *,
+    option_symbol: str,
+    qty: int,
+    limit_price: Decimal,
+    client_order_id: str | None = None,
+) -> SubmitResult:
+    """Submit a buy-to-close limit order on a short option position.
+
+    Used for profit-take execution: closing a short put when its current
+    ask has decayed to (1 - profit_take_pct) of the original credit.
+
+    Gated by ``kill_switch`` only, mirroring ``close_position`` and
+    ``/close``: closing reduces exposure rather than adding to it, so
+    ``trading_enabled`` and ``new_entries_enabled`` do not block. The
+    kill switch remains a manual brake on every outbound order.
+    """
+    flags = await get_all_flags()
+    if flags.get("kill_switch", False):
+        _log.warning(
+            "alpaca.btc.refused_kill_switch",
+            option_symbol=option_symbol,
+        )
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="kill_switch_engaged",
+            flags=flags,
+        )
+
+    request = LimitOrderRequest(
+        symbol=option_symbol,
+        qty=qty,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        limit_price=float(limit_price),
+        client_order_id=client_order_id,
+    )
+    try:
+        order = await _call_alpaca_with_retry("submit_order", request)
+    except Exception as exc:
+        _log.error("alpaca.btc.failed", option_symbol=option_symbol, error=str(exc))
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="submit_exception",
+            flags=flags,
+            error=str(exc),
+        )
+
+    if isinstance(order, dict):
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="raw_dict_payload",
+            flags=flags,
+        )
+
+    _log.info(
+        "alpaca.btc.ok",
+        option_symbol=option_symbol,
         alpaca_order_id=str(order.id),
         order_status=str(order.status),
     )

@@ -199,8 +199,21 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, **and 5a** shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, **and 5b** shipped:
 
+- Phase 5b adds profit-take execution. Migration
+  `016_profit_take_close_action.sql` extends `orders.action` to admit
+  `profit_take_close`. `broker/alpaca.py` adds `submit_buy_to_close`
+  (gated by `kill_switch` only, mirroring `close_position`) and
+  `list_short_option_positions`. The new
+  `kai_trader/strategy/profit_take.py` walks open short puts, looks up
+  the originating CSP via `recent_orders` to read `filled_avg_price`
+  as the original credit, fetches the live chain, and emits a
+  `CloseIntent` when current ask <= original_credit * (1 -
+  profit_take_pct). The worker tick runs `_handle_profit_takes`
+  between rolls and CSP build so any freed capital is reusable on the
+  same tick. Tick summary surfaces "Profit-take: N closed at
+  threshold".
 - Phase 5a closes the wheel loop: covered calls + assignment detection.
   Migration `015_extended_order_actions.sql` widens `orders.action` to
   accept `open_covered_call`, `close_covered_call`, and `assignment`.

@@ -704,3 +704,119 @@ async def test_list_long_equity_positions_filters_options_out(
     assert "AVGO" in symbols
     assert "AMZN260506P00250000" not in symbols
     assert "MSFT" not in symbols  # qty=0 excluded
+
+
+class _FakeShortSide(Enum):
+    SHORT = "short"
+
+
+async def test_list_short_option_positions_filters_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = MagicMock()
+    fake.get_all_positions.return_value = [
+        # Short put: should be included.
+        _FakePosition(
+            symbol="AMZN260506P00250000",
+            qty="-1",
+            side=_FakeShortSide.SHORT,
+        ),
+        # Long stock: excluded.
+        _FakePosition(symbol="AMZN", qty="100"),
+        # Long option: excluded.
+        _FakePosition(
+            symbol="AVGO260506C00400000",
+            qty="1",
+        ),
+    ]
+    _install_fake_client(monkeypatch, fake)
+    out = await broker.list_short_option_positions()
+    symbols = [p.symbol for p in out]
+    assert symbols == ["AMZN260506P00250000"]
+
+
+# ------------- submit_buy_to_close (Phase 5b) -------------
+
+
+async def test_submit_buy_to_close_refused_when_kill_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.submit_order = MagicMock()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": True, "trading_enabled": True}),
+    )
+    result = await broker.submit_buy_to_close(
+        option_symbol="AMZN260506P00250000",
+        qty=1,
+        limit_price=Decimal("0.50"),
+    )
+    assert result.submitted is False
+    assert result.reason == "kill_switch_engaged"
+    fake.submit_order.assert_not_called()
+
+
+async def test_submit_buy_to_close_allowed_when_trading_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closes are allowed even when new entries are off - they reduce exposure."""
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    class _FakeOrder:
+        id = "alpaca-btc-uuid"
+        status = "accepted"
+
+    fake = MagicMock()
+    fake.submit_order.return_value = _FakeOrder()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={
+            "kill_switch": False,
+            "trading_enabled": False,  # off
+            "new_entries_enabled": False,  # off
+        }),
+    )
+    result = await broker.submit_buy_to_close(
+        option_symbol="AMZN260506P00250000",
+        qty=1,
+        limit_price=Decimal("0.50"),
+    )
+    assert result.submitted is True
+    assert result.alpaca_order_id == "alpaca-btc-uuid"
+    request = fake.submit_order.call_args.args[0]
+    from alpaca.trading.enums import OrderSide as _OrderSide
+    assert request.side == _OrderSide.BUY
+    assert request.symbol == "AMZN260506P00250000"
+
+
+async def test_submit_buy_to_close_handles_alpaca_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.submit_order.side_effect = RuntimeError("boom")
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": False, "trading_enabled": True}),
+    )
+    result = await broker.submit_buy_to_close(
+        option_symbol="AMZN260506P00250000",
+        qty=1,
+        limit_price=Decimal("0.50"),
+    )
+    assert result.submitted is False
+    assert result.reason == "submit_exception"
+    assert result.error == "boom"

@@ -152,6 +152,11 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     mark_status = AsyncMock()
     list_positions = AsyncMock(return_value=[])
     list_long_equity_positions = AsyncMock(return_value=[])
+    list_short_option_positions = AsyncMock(return_value=[])
+    submit_buy_to_close = AsyncMock(return_value=SubmitResult(
+        submitted=True, alpaca_order_id="alpaca-btc-1", order_status="accepted",
+        reason=None, flags={"trading_enabled": True, "kill_switch": False},
+    ))
     close_position = AsyncMock(return_value=SubmitResult(
         submitted=True, alpaca_order_id="close-uuid", order_status="accepted",
         reason=None, flags={},
@@ -181,6 +186,10 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     monkeypatch.setattr(
         worker_module, "list_long_equity_positions", list_long_equity_positions
     )
+    monkeypatch.setattr(
+        worker_module, "list_short_option_positions", list_short_option_positions
+    )
+    monkeypatch.setattr(worker_module, "submit_buy_to_close", submit_buy_to_close)
     monkeypatch.setattr(worker_module, "close_position", close_position)
     monkeypatch.setattr(worker_module, "check_drawdown", check_drawdown)
     monkeypatch.setattr(worker_module, "evaluate_rolls", evaluate_rolls)
@@ -673,3 +682,132 @@ async def test_tick_skips_cc_when_no_shares_held(
     assert "CCs:" not in summary
     _patch_dependencies["submit_short_call"].assert_not_awaited()
     _patch_dependencies["record_assignment"].assert_not_awaited()
+
+
+# ------------- Phase 5b: profit-take execution -------------
+
+
+def _short_put_position_for_amzn() -> object:
+    from kai_trader.broker.alpaca import PositionSnapshot
+    return PositionSnapshot(
+        symbol="AMZN260506P00250000",
+        qty=Decimal("-1"),
+        side="short",
+        avg_entry_price=Decimal("1.10"),
+        current_price=Decimal("0.40"),
+        market_value=None,
+        unrealized_pl=None,
+        unrealized_intraday_pl=None,
+    )
+
+
+def _put_chain_at_threshold() -> OptionContract:
+    """Returns an AMZN P250 contract with ask 0.50 - the threshold for 50% capture
+    against an original credit of $1.10."""
+    return OptionContract(
+        symbol="AMZN260506P00250000",
+        underlying="AMZN",
+        option_type="put",
+        strike=Decimal("250"),
+        expiration=date(2026, 5, 6),
+        bid=Decimal("0.45"),
+        ask=Decimal("0.50"),
+        last=None,
+        delta=Decimal("-0.10"),
+        gamma=Decimal("0.01"),
+        theta=Decimal("-0.05"),
+        vega=Decimal("0.10"),
+        implied_volatility=Decimal("0.30"),
+    )
+
+
+async def test_tick_submits_profit_take_when_threshold_hit(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False, "new_entries_enabled": True,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
+    _patch_dependencies["list_short_option_positions"].return_value = [
+        _short_put_position_for_amzn()
+    ]
+    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    _patch_dependencies["get_chain"].return_value = [_put_chain_at_threshold()]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "Profit-take: 1 closed" in summary
+    _patch_dependencies["submit_buy_to_close"].assert_awaited_once()
+    submit_args = _patch_dependencies["submit_buy_to_close"].await_args
+    assert submit_args.kwargs["option_symbol"] == "AMZN260506P00250000"
+    assert submit_args.kwargs["qty"] == 1
+    assert submit_args.kwargs["limit_price"] == Decimal("0.50")
+
+
+async def test_tick_skips_profit_take_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False, "new_entries_enabled": True,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
+    _patch_dependencies["list_short_option_positions"].return_value = [
+        _short_put_position_for_amzn()
+    ]
+    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    # Ask of 0.80 is well above the 0.55 threshold (50% of 1.10).
+    above_threshold = OptionContract(
+        symbol="AMZN260506P00250000",
+        underlying="AMZN",
+        option_type="put",
+        strike=Decimal("250"),
+        expiration=date(2026, 5, 6),
+        bid=Decimal("0.78"),
+        ask=Decimal("0.80"),
+        last=None,
+        delta=Decimal("-0.20"),
+        gamma=Decimal("0.01"),
+        theta=Decimal("-0.05"),
+        vega=Decimal("0.10"),
+        implied_volatility=Decimal("0.30"),
+    )
+    _patch_dependencies["get_chain"].return_value = [above_threshold]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "Profit-take" not in summary
+    _patch_dependencies["submit_buy_to_close"].assert_not_awaited()
+
+
+async def test_tick_skips_profit_take_when_kill_switch_engaged(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Kill switch already aborts the tick before this code path; this guards the
+    inner gate inside _handle_profit_takes if anyone wires it differently later."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": True,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
+    _patch_dependencies["list_short_option_positions"].return_value = [
+        _short_put_position_for_amzn()
+    ]
+    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    _patch_dependencies["get_chain"].return_value = [_put_chain_at_threshold()]
+
+    await worker_module.StrategyWorker().tick()
+    _patch_dependencies["submit_buy_to_close"].assert_not_awaited()

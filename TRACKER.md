@@ -3,6 +3,32 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-28 . Phase 5b: Profit-take execution
+
+Captures the defensive wheel's premium-decay edge: close CSPs when
+~50% of max profit has already been earned, instead of riding the
+gamma-heavy final week of expiration risk for the last few percent.
+
+- Migration `016_profit_take_close_action.sql` adds
+  `profit_take_close` to the `orders.action` enum.
+- `broker/alpaca.py` adds `submit_buy_to_close` (kill-switch-only
+  gating, like manual closes) and `list_short_option_positions`.
+- `strategy/profit_take.py` walks open short puts, finds the
+  originating CSP in the recent-orders window, reads
+  `filled_avg_price` as the original credit, fetches the live
+  chain, and emits a `CloseIntent` when
+  `current_ask <= original_credit * (1 - profit_take_pct)`.
+  Skips when sleeve doesn't own the underlying, when the source
+  CSP is missing, when the chain doesn't return the contract,
+  or when the chain fetch errors.
+- Worker tick runs `_handle_profit_takes` between rolls and CSP
+  build so freed capital can fund a new entry on the same tick.
+  Tick summary now shows "Profit-take: N closed at threshold".
+
+Tests: 15 new (broker submit_buy_to_close + list_short_option_positions,
+profit_take evaluator with seven scenarios, three worker integration
+tests). Suite total 442 passing, 91% coverage. ruff + mypy clean.
+
 ## 2026-04-28 . Phase 5a: Covered calls + assignment detection
 
 Closes the wheel loop. Without this, an assigned CSP left the bot holding

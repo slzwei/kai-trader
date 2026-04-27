@@ -32,6 +32,7 @@ OrderAction = Literal[
     "open_covered_call",
     "close_covered_call",
     "assignment",
+    "profit_take_close",
 ]
 
 

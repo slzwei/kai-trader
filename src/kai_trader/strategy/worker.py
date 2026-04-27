@@ -33,6 +33,8 @@ from kai_trader.broker.alpaca import (
     get_order_status,
     list_long_equity_positions,
     list_positions,
+    list_short_option_positions,
+    submit_buy_to_close,
     submit_short_call,
     submit_short_put,
 )
@@ -62,6 +64,7 @@ from kai_trader.strategy.covered_calls import (
     build_call_intents,
 )
 from kai_trader.strategy.drawdown import check_and_trip as check_drawdown
+from kai_trader.strategy.profit_take import CloseIntent, evaluate_profit_takes
 from kai_trader.strategy.regime import RegimeSnapshot, compute_and_record
 from kai_trader.strategy.rolls import RollIntent, evaluate_rolls
 
@@ -163,6 +166,11 @@ class StrategyWorker:
         # capital is reflected in the sleeve cap math below.
         rolls = await self._handle_rolls(sleeves, regime, flags, today)
 
+        # Profit-take execution runs before new CSP build so the capital
+        # released by closing in-the-money-decay positions is available
+        # for fresh entries on the same tick.
+        profit_take_closes = await self._handle_profit_takes(sleeves, flags)
+
         intents, diagnostics = await build_intents_with_diagnostics(
             regime=regime,
             sleeves=sleeves,
@@ -227,6 +235,10 @@ class StrategyWorker:
             skip_line,
             fail_line,
         ]
+        if profit_take_closes:
+            body_lines.append(
+                f"Profit-take: {profit_take_closes} closed at threshold"
+            )
         if assignments_recorded:
             body_lines.append(
                 f"Assigned:  {assignments_recorded} new (shares now held)"
@@ -415,6 +427,90 @@ class StrategyWorker:
             await mark_status(row_id, "skipped_by_flag", error_text=result.reason)
             return "skipped"
 
+        await mark_status(row_id, "failed", error_text=result.reason or result.error)
+        return "failed"
+
+    async def _handle_profit_takes(
+        self,
+        sleeves: list[SleeveConfig],
+        flags: dict[str, bool],
+    ) -> int:
+        """Evaluate profit-take thresholds and submit BTC orders.
+
+        Returns the count of successfully submitted close orders.
+        Closing reduces exposure, so submission is gated by kill_switch
+        only (mirrors ``submit_buy_to_close`` and ``close_position``).
+        """
+        if flags.get("kill_switch", False):
+            return 0
+        try:
+            shorts = await list_short_option_positions()
+        except Exception as exc:
+            _log.warning("strategy.profit_take.positions_fetch_failed", error=str(exc))
+            return 0
+        if not shorts:
+            return 0
+        try:
+            window = await recent_orders(limit=200)
+        except Exception as exc:
+            _log.warning("strategy.profit_take.orders_fetch_failed", error=str(exc))
+            return 0
+        intents = await evaluate_profit_takes(
+            short_option_positions=shorts,
+            orders=window,
+            sleeves=sleeves,
+            chain_fetcher=get_chain,
+        )
+        submitted = 0
+        for intent in intents:
+            outcome = await self._submit_close_intent(intent, flags)
+            if outcome == "submitted":
+                submitted += 1
+        return submitted
+
+    async def _submit_close_intent(
+        self,
+        intent: CloseIntent,
+        flags: dict[str, bool],
+    ) -> str:
+        """Record + submit one profit-take close. Returns 'submitted', 'skipped', 'failed'."""
+        gating_decision = {
+            "trading_enabled": flags.get("trading_enabled", False),
+            "kill_switch": flags.get("kill_switch", False),
+            "limit_price": str(intent.limit_price),
+            "captured_pct": str(intent.captured_pct),
+        }
+        intent_payload = {
+            "qty": intent.qty,
+            "original_credit": str(intent.original_credit),
+            "current_ask": str(intent.limit_price),
+            "captured_pct": str(intent.captured_pct),
+            "source_order_id": intent.source_order_id,
+        }
+        row_id = await record_intent(
+            sleeve=intent.sleeve,
+            symbol=intent.underlying,
+            option_symbol=intent.option_symbol,
+            action="profit_take_close",
+            intent_payload=intent_payload,
+            gating_decision=gating_decision,
+        )
+        result: SubmitResult = await submit_buy_to_close(
+            option_symbol=intent.option_symbol,
+            qty=intent.qty,
+            limit_price=intent.limit_price,
+            client_order_id=f"kai-pt-{row_id[:8]}",
+        )
+        if result.submitted and result.alpaca_order_id is not None:
+            await mark_submitted(
+                row_id,
+                alpaca_order_id=result.alpaca_order_id,
+                submitted_at=datetime.now(UTC),
+            )
+            return "submitted"
+        if result.reason == "kill_switch_engaged":
+            await mark_status(row_id, "skipped_by_flag", error_text=result.reason)
+            return "skipped"
         await mark_status(row_id, "failed", error_text=result.reason or result.error)
         return "failed"
 
