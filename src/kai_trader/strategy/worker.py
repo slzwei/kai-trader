@@ -172,6 +172,15 @@ class StrategyWorker:
         # for fresh entries on the same tick.
         profit_take_closes = await self._handle_profit_takes(sleeves, flags)
 
+        # Open short puts hold cash collateral; subtract them from sleeve,
+        # total, and per-symbol caps so the strategy does not re-attempt
+        # to open the same contracts every tick.
+        try:
+            existing_shorts = await list_short_option_positions()
+        except Exception as exc:
+            _log.warning("strategy.existing_shorts.fetch_failed", error=str(exc))
+            existing_shorts = []
+
         intents, diagnostics = await build_intents_with_diagnostics(
             regime=regime,
             sleeves=sleeves,
@@ -179,6 +188,7 @@ class StrategyWorker:
             chain_fetcher=get_chain,
             today=today,
             earnings_filter=is_earnings_in_window,
+            existing_short_puts=existing_shorts,
         )
 
         submitted: list[str] = []

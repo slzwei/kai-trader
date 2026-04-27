@@ -69,6 +69,19 @@ Four shippable units, each leaves the bot working on its own.
 - [x] 5d.3 Configuration (`earnings_blackout_enabled` column on `sleeve_config`, default true via migration 017)
 - [x] 5d.4 Quality gates (471 passing, ruff + mypy clean), docs updated
 
+## Phase 5e — Collateral accounting (open positions reduce caps)
+
+**Bug**: `build_intents_with_diagnostics` uses `equity * target_pct` and `equity * TOTAL_DEPLOYMENT_CAP_PCT` without subtracting the collateral already locked in open short put positions. Strategy keeps trying to open the same strikes every tick; Alpaca rejects with insufficient buying power.
+
+**Acceptance**: cap math reflects reality. After 5e, opening positions are added to a "committed" total and subtracted from sleeve / total / per-symbol headroom before new candidates are sized. The persistent "Failed: 2 (AMZN P250, AVGO P400)" pattern stops; strategy either finds different names with remaining headroom or correctly reports zero candidates.
+
+- [x] 5e.1 Helper: `_committed_collateral(short_puts, sleeves)` returns per-sleeve, per-symbol, total
+- [x] 5e.2 `build_intents_with_diagnostics` accepts `existing_short_puts` and subtracts from sleeve / total / per-symbol caps
+- [x] 5e.3 `_max_qty_for` accepts `per_symbol_remaining` (not just cap)
+- [x] 5e.4 Worker fetches existing short puts and passes through
+- [x] 5e.5 Tests: 7 new (committed reduces sleeve / total / per-symbol cap, unrelated underlying not blocked, default empty list, helper map correctness, ignores non-puts)
+- [x] 5e.6 Quality gates (478 passing, ruff + mypy clean), docs updated, pushed
+
 ## What is explicitly NOT in Phase 5
 
 - Postgres LISTEN/NOTIFY for dispatchers

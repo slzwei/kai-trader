@@ -787,3 +787,204 @@ async def test_earnings_warning_surfaces_in_diagnostics() -> None:
     assert intents == []
     warnings = diag.warning_lines()
     assert any("earnings blackout" in w for w in warnings)
+
+
+# ------------- collateral accounting (Phase 5e) -------------
+
+
+def _short_put_position(
+    symbol: str = "AMZN260506P00250000", qty: str = "-1"
+) -> Any:
+    from kai_trader.broker.alpaca import PositionSnapshot
+    return PositionSnapshot(
+        symbol=symbol,
+        qty=Decimal(qty),
+        side="short",
+        avg_entry_price=Decimal("4.55"),
+        current_price=Decimal("5.05"),
+        market_value=None,
+        unrealized_pl=None,
+        unrealized_intraday_pl=None,
+    )
+
+
+async def test_committed_collateral_reduces_sleeve_remaining() -> None:
+    """An existing -1 AMZN P$250 should consume $25k of the sleeve's headroom."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    # AMZN at $200 strike → $20k collateral; sleeve cap = 30% x $99k = $29,910.
+    # Without 5e: sleeve_remaining = $29,910, fits 1 contract.
+    # With existing -1 AMZN P$250 = $25k committed:
+    #   sleeve_remaining = $29,910 - $25,000 = $4,910 → does not fit $20k contract.
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=200, delta=-0.30, expiration=expiry, underlying="AMZN")]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "stable_largecap", whitelist=["AMZN"], target_pct=Decimal("0.30")
+        )],
+        account=_account(equity=99_700),
+        chain_fetcher=fetcher,
+        today=today,
+        existing_short_puts=[_short_put_position()],
+    )
+    assert intents == []
+
+
+async def test_committed_collateral_reduces_total_remaining() -> None:
+    """Existing positions across sleeves should subtract from the total cap."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    # $99k equity, 70% total cap = $69,300. Two existing positions:
+    #   AMZN P$250 x 2 = $50k, AVGO P$400 x 1 = $40k → $90k committed.
+    # total_remaining clamps to $0; nothing new fits.
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=50, delta=-0.30, expiration=expiry, underlying="OK")]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "stable_largecap", whitelist=["OK"], target_pct=Decimal("1.0")
+        )],
+        account=_account(equity=99_700),
+        chain_fetcher=fetcher,
+        today=today,
+        existing_short_puts=[
+            _short_put_position("AMZN260506P00250000", "-2"),
+            _short_put_position("AVGO260506P00400000", "-1"),
+        ],
+    )
+    assert intents == []
+
+
+async def test_committed_collateral_reduces_per_symbol_cap() -> None:
+    """Existing AMZN exposure should reduce the available AMZN headroom."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    # $99k → 60% per-symbol cap = $59,940. Existing AMZN P$250 x 2 = $50k.
+    # Per-symbol remaining for AMZN = $9,940. New AMZN P$200 contract = $20k → no fit.
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=200, delta=-0.30, expiration=expiry, underlying="AMZN")]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "stable_largecap", whitelist=["AMZN"], target_pct=Decimal("1.0")
+        )],
+        account=_account(equity=99_700),
+        chain_fetcher=fetcher,
+        today=today,
+        existing_short_puts=[_short_put_position("AMZN260506P00250000", "-2")],
+    )
+    assert intents == []
+
+
+async def test_committed_collateral_does_not_block_unrelated_underlying() -> None:
+    """AMZN already held shouldn't block opening AVGO (different underlying)."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    chain_calls: list[str] = []
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        chain_calls.append(symbol)
+        return [_put(strike=100, delta=-0.30, expiration=expiry, underlying=symbol)]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "stable_largecap",
+            whitelist=["AMZN", "AVGO"],
+            target_pct=Decimal("1.0"),
+        )],
+        account=_account(equity=200_000),  # generous so caps don't bind
+        chain_fetcher=fetcher,
+        today=today,
+        existing_short_puts=[
+            _short_put_position("AMZN260506P00250000", "-1"),  # $25k AMZN committed
+        ],
+    )
+    # AVGO contract = $10k, fits under all caps. AMZN contract also $10k but per-symbol
+    # cap reduces so it may or may not fit; key assertion is AVGO went through.
+    symbols_in_intents = {i.symbol for i in intents}
+    assert "AVGO" in symbols_in_intents
+
+
+async def test_no_existing_positions_matches_legacy_behavior() -> None:
+    """Default empty list of existing positions = same outcome as before 5e."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=50, delta=-0.30, expiration=expiry)]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("opportunistic", whitelist=["SOFI"], target_pct=Decimal("0.45"))],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    # Sleeve cap binds at 45% x $100k = $45k; / $5k = 9 contracts.
+    assert len(intents) == 1
+    assert intents[0].qty == 9
+
+
+async def test_committed_collateral_helper_returns_correct_maps() -> None:
+    """Direct test of the internal helper for accounting correctness."""
+    from kai_trader.strategy.candidates import _committed_collateral
+
+    sleeves = [
+        _sleeve("stable_largecap", whitelist=["AMZN", "AVGO"]),
+    ]
+    positions = [
+        _short_put_position("AMZN260506P00250000", "-2"),  # $50k
+        _short_put_position("AVGO260506P00400000", "-1"),  # $40k
+        _short_put_position("ORPHAN260506P00100000", "-1"),  # $10k, no sleeve
+    ]
+    per_sleeve, per_symbol, total = _committed_collateral(positions, sleeves)
+    assert per_sleeve["stable_largecap"] == Decimal("90000")  # AMZN + AVGO
+    assert per_symbol["AMZN"] == Decimal("50000")
+    assert per_symbol["AVGO"] == Decimal("40000")
+    assert per_symbol["ORPHAN"] == Decimal("10000")
+    assert total == Decimal("100000")  # everything counts toward total
+
+
+async def test_committed_helper_ignores_non_put_options() -> None:
+    """Short calls and stock are not counted as CSP collateral."""
+    from kai_trader.broker.alpaca import PositionSnapshot
+    from kai_trader.strategy.candidates import _committed_collateral
+
+    sleeves = [_sleeve("stable_largecap", whitelist=["AMZN"])]
+    positions = [
+        # Short call — ignored by put-only collateral accounting
+        PositionSnapshot(
+            symbol="AMZN260506C00260000",
+            qty=Decimal("-1"),
+            side="short",
+            avg_entry_price=Decimal("1.0"),
+            current_price=None,
+            market_value=None,
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        ),
+        # Long stock — not OCC
+        PositionSnapshot(
+            symbol="AMZN",
+            qty=Decimal("100"),
+            side="long",
+            avg_entry_price=Decimal("250"),
+            current_price=None,
+            market_value=None,
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        ),
+    ]
+    per_sleeve, per_symbol, total = _committed_collateral(positions, sleeves)
+    assert total == Decimal("0")
+    assert per_symbol == {}
+    assert per_sleeve["stable_largecap"] == Decimal("0")

@@ -199,8 +199,20 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, 5c, **and 5d** shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, 5c, 5d, **and 5e** shipped:
 
+- Phase 5e fixes a real bug: the cap math in
+  `build_intents_with_diagnostics` used `equity * pct` without
+  subtracting cash already locked in open short put positions, so
+  the strategy kept re-attempting the same strikes every tick and
+  Alpaca rejected each new submission with insufficient buying
+  power. The fix: a new `_committed_collateral(short_puts,
+  sleeves)` helper returns per-sleeve, per-symbol, and total
+  locked dollars; the build function accepts `existing_short_puts`
+  and clamps `sleeve_remaining`, `total_remaining`, and per-symbol
+  headroom to zero after subtraction. The worker fetches via
+  `list_short_option_positions` and passes through. CSPs now stop
+  re-attempting positions you already hold.
 - Phase 5d adds the earnings blackout filter. Migration
   `017_sleeve_earnings_blackout.sql` adds an
   `earnings_blackout_enabled` column to `sleeve_config` (default

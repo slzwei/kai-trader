@@ -17,8 +17,8 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
-from kai_trader.broker.alpaca import AccountSnapshot
-from kai_trader.broker.options_data import OptionContract
+from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
+from kai_trader.broker.options_data import OptionContract, parse_occ_symbol
 from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.logging import get_logger
 from kai_trader.strategy.regime import RegimeSnapshot
@@ -263,19 +263,73 @@ def _intent_from(
     )
 
 
+def _committed_collateral(
+    short_puts: list[PositionSnapshot],
+    sleeves: list[SleeveConfig],
+) -> tuple[dict[str, Decimal], dict[str, Decimal], Decimal]:
+    """Aggregate locked CSP collateral by sleeve and by underlying.
+
+    Cash-secured puts lock ``strike * 100 * abs(qty)`` per contract;
+    that capital cannot be reused for new entries until the position
+    closes. The strategy must subtract these amounts from sleeve and
+    total deployment caps so we do not re-attempt to open the same
+    contracts every tick (the broker would reject with insufficient
+    buying power).
+
+    Returns ``(per_sleeve, per_symbol, total)`` where per_sleeve is
+    keyed by sleeve name, per_symbol is keyed by underlying ticker,
+    and total is the sum across all positions. A position whose
+    underlying is not whitelisted by any sleeve is included in the
+    total and per_symbol map but not in any sleeve bucket (because
+    no sleeve owns it).
+    """
+    per_sleeve: dict[str, Decimal] = {s.sleeve: Decimal("0") for s in sleeves}
+    per_symbol: dict[str, Decimal] = {}
+    total = Decimal("0")
+
+    underlying_to_sleeve: dict[str, str] = {}
+    for sleeve in sleeves:
+        if not sleeve.enabled:
+            continue
+        for symbol in sleeve.symbol_whitelist:
+            underlying_to_sleeve.setdefault(symbol.upper(), sleeve.sleeve)
+
+    for position in short_puts:
+        try:
+            underlying, _exp, opt_type, strike = parse_occ_symbol(position.symbol)
+        except ValueError:
+            continue
+        if opt_type != "put":
+            continue
+        qty = abs(position.qty)
+        if qty <= 0:
+            continue
+        collateral = strike * Decimal("100") * qty
+        per_symbol[underlying] = per_symbol.get(underlying, Decimal("0")) + collateral
+        total += collateral
+        sleeve_name = underlying_to_sleeve.get(underlying)
+        if sleeve_name is not None:
+            per_sleeve[sleeve_name] = per_sleeve.get(sleeve_name, Decimal("0")) + collateral
+
+    return per_sleeve, per_symbol, total
+
+
 def _max_qty_for(
     contract: OptionContract,
     *,
-    equity: Decimal,
     sleeve_remaining: Decimal,
     total_remaining: Decimal,
+    per_symbol_remaining: Decimal,
 ) -> int:
-    """Compute the largest qty respecting sleeve cap, total cap, per-symbol cap."""
+    """Compute the largest qty respecting sleeve cap, total cap, per-symbol cap.
+
+    All three remaining values are post-subtraction of any collateral
+    already committed to open positions.
+    """
     per_contract_collateral = contract.strike * Decimal("100")
     if per_contract_collateral <= 0:
         return 0
-    per_symbol_cap = equity * per_symbol_cap_pct(equity)
-    headroom = min(sleeve_remaining, total_remaining, per_symbol_cap)
+    headroom = min(sleeve_remaining, total_remaining, per_symbol_remaining)
     if headroom < per_contract_collateral:
         return 0
     qty = int(headroom // per_contract_collateral)
@@ -300,6 +354,7 @@ async def build_intents(
     *,
     today: date | None = None,
     earnings_filter: EarningsFilter | None = None,
+    existing_short_puts: list[PositionSnapshot] | None = None,
 ) -> list[TradeIntent]:
     """Walk active sleeves and produce intent rows up to the cap matrix.
 
@@ -313,6 +368,7 @@ async def build_intents(
         chain_fetcher=chain_fetcher,
         today=today,
         earnings_filter=earnings_filter,
+        existing_short_puts=existing_short_puts,
     )
     return intents
 
@@ -325,6 +381,7 @@ async def build_intents_with_diagnostics(
     *,
     today: date | None = None,
     earnings_filter: EarningsFilter | None = None,
+    existing_short_puts: list[PositionSnapshot] | None = None,
 ) -> tuple[list[TradeIntent], BuildDiagnostics]:
     """Build intents and return the per-sleeve diagnostic counters alongside.
 
@@ -339,7 +396,13 @@ async def build_intents_with_diagnostics(
     """
     today = today or datetime.now(UTC).date()
     equity = Decimal(str(account.equity))
-    total_remaining = equity * TOTAL_DEPLOYMENT_CAP_PCT
+    short_puts = existing_short_puts or []
+    committed_per_sleeve, committed_per_symbol, committed_total = _committed_collateral(
+        short_puts, sleeves
+    )
+    total_remaining = max(
+        equity * TOTAL_DEPLOYMENT_CAP_PCT - committed_total, Decimal("0")
+    )
     per_symbol_cap_dollars = equity * per_symbol_cap_pct(equity)
     intents: list[TradeIntent] = []
     sleeve_diags: list[SleeveDiagnostic] = []
@@ -368,7 +431,10 @@ async def build_intents_with_diagnostics(
             continue
 
         target_delta = _target_delta_for(sleeve, regime.regime)
-        sleeve_remaining = equity * sleeve.target_pct
+        sleeve_remaining = max(
+            equity * sleeve.target_pct - committed_per_sleeve.get(sleeve.sleeve, Decimal("0")),
+            Decimal("0"),
+        )
 
         chains_fetched = 0
         chain_errors = 0
@@ -444,11 +510,17 @@ async def build_intents_with_diagnostics(
         for contract, _y in ranked:
             if sleeve_remaining <= 0 or total_remaining <= 0:
                 break
+            committed_for_underlying = committed_per_symbol.get(
+                contract.underlying, Decimal("0")
+            )
+            per_symbol_remaining = max(
+                per_symbol_cap_dollars - committed_for_underlying, Decimal("0")
+            )
             qty = _max_qty_for(
                 contract,
-                equity=equity,
                 sleeve_remaining=sleeve_remaining,
                 total_remaining=total_remaining,
+                per_symbol_remaining=per_symbol_remaining,
             )
             if qty < 1:
                 candidates_cap_rejected += 1
@@ -459,6 +531,7 @@ async def build_intents_with_diagnostics(
                     sleeve_remaining=str(sleeve_remaining),
                     total_remaining=str(total_remaining),
                     per_symbol_cap=str(per_symbol_cap_dollars),
+                    per_symbol_committed=str(committed_for_underlying),
                     contract_collateral=str(contract.strike * Decimal("100")),
                 )
                 continue

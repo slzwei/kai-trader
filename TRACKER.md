@@ -3,6 +3,35 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-28 . Phase 5e: Collateral accounting fix
+
+Real bug surfaced once Phase 5a-d were running live: `Failed: 2
+(AMZN P250, AVGO P400)` repeating every strategy tick because the
+cap math ignored capital already locked in open short put
+positions. Strategy kept building the same intents; broker kept
+rejecting them for insufficient buying power.
+
+- New `_committed_collateral(short_puts, sleeves)` helper aggregates
+  locked CSP collateral as (per_sleeve, per_symbol, total). Walks
+  short puts from the position list, parses OCC symbols, computes
+  `strike * 100 * abs(qty)` per contract, attributes each to the
+  sleeve whose whitelist owns the underlying.
+- `build_intents_with_diagnostics` accepts a new
+  `existing_short_puts` parameter. After computing the helper:
+    sleeve_remaining = max(0, equity * target_pct - committed_per_sleeve)
+    total_remaining  = max(0, equity * 0.70    - committed_total)
+    per_symbol_remaining = max(0, per_symbol_cap - committed_per_symbol[u])
+- `_max_qty_for` now takes `per_symbol_remaining` directly so the
+  caller controls the post-subtraction value.
+- Worker fetches `list_short_option_positions` (already in use for
+  profit-take) and threads it into both build paths.
+
+Tests: 7 new (sleeve cap reduction, total cap reduction,
+per-symbol reduction, unrelated underlying not blocked,
+empty-list legacy behavior, helper map correctness, helper
+ignores non-puts). Suite total 478 passing, 90% coverage. ruff +
+mypy strict clean.
+
 ## 2026-04-28 . Phase 5d: Earnings blackout filter
 
 Skip CSP entries on names with earnings inside the DTE window.
