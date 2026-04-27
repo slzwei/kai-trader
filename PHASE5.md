@@ -64,10 +64,10 @@ Four shippable units, each leaves the bot working on its own.
 
 **Acceptance**: For every CSP candidate, bot checks whether underlying has earnings inside DTE. If yes, skipped with diagnostic surface. Earnings dates cached 24h.
 
-- [ ] 5d.1 Earnings data source module (yfinance, fail-open)
-- [ ] 5d.2 Filter integration in `build_intents_with_diagnostics`
-- [ ] 5d.3 Configuration (`earnings_blackout_enabled` column on `sleeve_config`, default true)
-- [ ] 5d.4 Quality gates + docs + deploy
+- [x] 5d.1 Earnings data source module (yfinance, fail-open, 24h cache)
+- [x] 5d.2 Filter integration in `build_intents_with_diagnostics` (per-symbol pre-chain skip)
+- [x] 5d.3 Configuration (`earnings_blackout_enabled` column on `sleeve_config`, default true via migration 017)
+- [x] 5d.4 Quality gates (471 passing, ruff + mypy clean), docs updated
 
 ## What is explicitly NOT in Phase 5
 

@@ -665,3 +665,125 @@ async def test_diagnostics_flag_cap_rejection() -> None:
     assert len(warnings) == 1
     assert "per-symbol cap" in warnings[0]
     assert "150000" in warnings[0]
+
+
+# ------------- earnings blackout filter (Phase 5d) -------------
+
+
+async def test_earnings_filter_skips_symbol_in_blackout() -> None:
+    """When the filter returns True for a symbol, skip it; chain is never fetched."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    chain_calls: list[str] = []
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        chain_calls.append(symbol)
+        return [_put(strike=50, delta=-0.30, expiration=expiry, underlying=symbol)]
+
+    async def earnings_filter(symbol: str, _today: date, _dte_max: int) -> bool:
+        return symbol == "BLACKOUT"
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["BLACKOUT", "OK"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+        earnings_filter=earnings_filter,
+    )
+    assert chain_calls == ["OK"]
+    assert len(intents) == 1
+    assert intents[0].symbol == "OK"
+    sleeve = diag.sleeves[0]
+    assert sleeve.symbols_skipped_for_earnings == 1
+    assert sleeve.earnings_blackout_symbols == ("BLACKOUT",)
+
+
+async def test_earnings_filter_disabled_per_sleeve() -> None:
+    """A sleeve with earnings_blackout_enabled=False ignores the filter."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    chain_calls: list[str] = []
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        chain_calls.append(symbol)
+        return [_put(strike=50, delta=-0.30, expiration=expiry)]
+
+    async def always_blackout(_s: str, _t: date, _d: int) -> bool:
+        return True
+
+    sleeve_off = _sleeve("opportunistic", whitelist=["NVDA"])
+    # rebuild with earnings_blackout_enabled=False
+    sleeve_off = SleeveConfig(
+        sleeve=sleeve_off.sleeve,
+        target_pct=sleeve_off.target_pct,
+        target_delta_put_risk_on=sleeve_off.target_delta_put_risk_on,
+        target_delta_put_neutral=sleeve_off.target_delta_put_neutral,
+        target_delta_call=sleeve_off.target_delta_call,
+        target_dte_min=sleeve_off.target_dte_min,
+        target_dte_max=sleeve_off.target_dte_max,
+        profit_take_pct=sleeve_off.profit_take_pct,
+        roll_trigger_delta=sleeve_off.roll_trigger_delta,
+        symbol_whitelist=sleeve_off.symbol_whitelist,
+        enabled=sleeve_off.enabled,
+        updated_at=sleeve_off.updated_at,
+        updated_by=sleeve_off.updated_by,
+        earnings_blackout_enabled=False,
+    )
+
+    intents, _diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[sleeve_off],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+        earnings_filter=always_blackout,
+    )
+    assert chain_calls == ["NVDA"]
+    assert len(intents) == 1
+
+
+async def test_earnings_filter_failure_falls_open() -> None:
+    """A filter exception must not block trading - log and proceed."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=50, delta=-0.30, expiration=expiry)]
+
+    async def boom(_s: str, _t: date, _d: int) -> bool:
+        raise RuntimeError("yfinance down")
+
+    intents, _diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["AMZN"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+        earnings_filter=boom,
+    )
+    assert len(intents) == 1
+
+
+async def test_earnings_warning_surfaces_in_diagnostics() -> None:
+    today = date(2026, 4, 27)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return []
+
+    async def all_blackout(_s: str, _t: date, _d: int) -> bool:
+        return True
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["A", "B", "C"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+        earnings_filter=all_blackout,
+    )
+    assert intents == []
+    warnings = diag.warning_lines()
+    assert any("earnings blackout" in w for w in warnings)

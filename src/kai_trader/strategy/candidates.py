@@ -72,6 +72,8 @@ class SleeveDiagnostic:
     intents_built: int
     candidates_cap_rejected: int = 0
     per_symbol_cap_dollars: Decimal = Decimal("0")
+    symbols_skipped_for_earnings: int = 0
+    earnings_blackout_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,7 +88,10 @@ class BuildDiagnostics:
     sleeves: list[SleeveDiagnostic]
 
     def warning_lines(self) -> list[str]:
-        active = [s for s in self.sleeves if s.chains_fetched > 0]
+        active = [
+            s for s in self.sleeves
+            if s.chains_fetched > 0 or s.symbols_skipped_for_earnings > 0
+        ]
         if not active:
             return []
         warnings: list[str] = []
@@ -128,6 +133,19 @@ class BuildDiagnostics:
                 f"current account size."
             )
             return warnings
+        total_skipped_earnings = sum(
+            s.symbols_skipped_for_earnings for s in self.sleeves
+        )
+        if total_skipped_earnings > 0:
+            symbols = sorted({
+                sym for s in self.sleeves for sym in s.earnings_blackout_symbols
+            })
+            sample = ", ".join(symbols[:5])
+            more = f" (+{len(symbols) - 5} more)" if len(symbols) > 5 else ""
+            warnings.append(
+                f"{total_skipped_earnings} symbol(s) skipped for earnings "
+                f"blackout: {sample}{more}"
+            )
         return warnings
 
 
@@ -271,6 +289,9 @@ def _per_share_yield(contract: OptionContract) -> Decimal:
     return mid / contract.strike
 
 
+EarningsFilter = Callable[[str, date, int], Awaitable[bool]]
+
+
 async def build_intents(
     regime: RegimeSnapshot,
     sleeves: list[SleeveConfig],
@@ -278,6 +299,7 @@ async def build_intents(
     chain_fetcher: ChainFetcher,
     *,
     today: date | None = None,
+    earnings_filter: EarningsFilter | None = None,
 ) -> list[TradeIntent]:
     """Walk active sleeves and produce intent rows up to the cap matrix.
 
@@ -290,6 +312,7 @@ async def build_intents(
         account=account,
         chain_fetcher=chain_fetcher,
         today=today,
+        earnings_filter=earnings_filter,
     )
     return intents
 
@@ -301,6 +324,7 @@ async def build_intents_with_diagnostics(
     chain_fetcher: ChainFetcher,
     *,
     today: date | None = None,
+    earnings_filter: EarningsFilter | None = None,
 ) -> tuple[list[TradeIntent], BuildDiagnostics]:
     """Build intents and return the per-sleeve diagnostic counters alongside.
 
@@ -354,10 +378,34 @@ async def build_intents_with_diagnostics(
         puts_with_quotes = 0
         intents_built_for_sleeve = 0
         candidates_cap_rejected = 0
+        symbols_skipped_for_earnings = 0
+        earnings_blackout_symbols: list[str] = []
 
         # Phase 1: walk the whitelist, fetch each chain, pick a strike.
         ranked: list[tuple[OptionContract, Decimal]] = []
         for symbol in sleeve.symbol_whitelist:
+            if earnings_filter is not None and sleeve.earnings_blackout_enabled:
+                try:
+                    blackout = await earnings_filter(
+                        symbol, today, sleeve.target_dte_max
+                    )
+                except Exception as exc:
+                    _log.warning(
+                        "strategy.earnings_filter.failed",
+                        sleeve=sleeve.sleeve,
+                        symbol=symbol,
+                        error=str(exc),
+                    )
+                    blackout = False
+                if blackout:
+                    symbols_skipped_for_earnings += 1
+                    earnings_blackout_symbols.append(symbol)
+                    _log.info(
+                        "strategy.earnings.skipped",
+                        sleeve=sleeve.sleeve,
+                        symbol=symbol,
+                    )
+                    continue
             try:
                 chain = await chain_fetcher(symbol, None)
             except Exception as exc:
@@ -435,6 +483,8 @@ async def build_intents_with_diagnostics(
                 intents_built=intents_built_for_sleeve,
                 candidates_cap_rejected=candidates_cap_rejected,
                 per_symbol_cap_dollars=per_symbol_cap_dollars,
+                symbols_skipped_for_earnings=symbols_skipped_for_earnings,
+                earnings_blackout_symbols=tuple(earnings_blackout_symbols),
             )
         )
 

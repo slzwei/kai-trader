@@ -3,6 +3,42 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-28 . Phase 5d: Earnings blackout filter
+
+Skip CSP entries on names with earnings inside the DTE window.
+Selling premium into binary events is the easiest way to fund a
+losing month; this is the cheapest piece of risk hygiene that
+exists for a defensive wheel.
+
+- Migration `017_sleeve_earnings_blackout.sql` adds
+  `earnings_blackout_enabled` (boolean, default true) to
+  `sleeve_config`. Per-sleeve override via `update_sleeve` since
+  it is in the UPDATABLE_COLUMNS allow-list.
+- `strategy/earnings.py` wraps yfinance lookups with a 24-hour
+  per-symbol cache. Two principles: fail open (yfinance failure
+  returns None, never blocks trading) and cache aggressively
+  (earnings dates change once a quarter at most).
+- `build_intents_with_diagnostics` accepts an optional
+  `earnings_filter` parameter. When provided AND the sleeve has
+  the blackout flag enabled, each whitelisted symbol is checked
+  before its chain is fetched. Skipped symbols are counted in
+  the new `symbols_skipped_for_earnings` diagnostic and surfaced
+  via warning_lines.
+- Strategy worker passes `is_earnings_in_window` as the filter on
+  every tick.
+
+Tests: 12 new (8 in earnings.py covering fetch / cache TTL /
+fail-open / negative cache, 4 in candidates.py covering filter
+skip, per-sleeve disable, fail-open on filter exception, warning
+surface). Suite total 471 passing, 90% coverage. ruff + mypy
+strict clean.
+
+Phase 5 bundle complete: covered calls + assignment detection
+(5a), profit-take execution (5b), TradingStream for real-time
+fill notifications (5c), earnings blackout (5d). The wheel now
+runs both legs autonomously, captures premium-decay edge, pushes
+fills to Telegram in seconds, and avoids earnings landmines.
+
 ## 2026-04-28 . Phase 5c: TradingStream for real-time fill notifications
 
 Push-based fill awareness via Alpaca's WebSocket. Replaces the up-to-5-minute

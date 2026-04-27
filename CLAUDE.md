@@ -199,8 +199,20 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, **and 5c** shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, 5c, **and 5d** shipped:
 
+- Phase 5d adds the earnings blackout filter. Migration
+  `017_sleeve_earnings_blackout.sql` adds an
+  `earnings_blackout_enabled` column to `sleeve_config` (default
+  `true`). The new `kai_trader/strategy/earnings.py` looks up the
+  next earnings date per symbol via yfinance with a 24-hour
+  per-symbol cache; failures fail open (return None, log warning,
+  do not block trading). `build_intents_with_diagnostics` accepts
+  an optional `earnings_filter` callable; when the sleeve has the
+  flag enabled and the filter reports earnings inside the DTE
+  window, the symbol is skipped before any chain fetch and counted
+  in a new `symbols_skipped_for_earnings` diagnostic. The strategy
+  worker passes `is_earnings_in_window` as the filter on every tick.
 - Phase 5c ships the `TradingStream` WebSocket worker for real-time
   fill notifications. New package `kai_trader/streams/` with
   `trading_stream.py:TradingStreamWorker`. Subscribes to Alpaca's

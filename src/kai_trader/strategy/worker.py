@@ -64,6 +64,7 @@ from kai_trader.strategy.covered_calls import (
     build_call_intents,
 )
 from kai_trader.strategy.drawdown import check_and_trip as check_drawdown
+from kai_trader.strategy.earnings import is_earnings_in_window
 from kai_trader.strategy.profit_take import CloseIntent, evaluate_profit_takes
 from kai_trader.strategy.regime import RegimeSnapshot, compute_and_record
 from kai_trader.strategy.rolls import RollIntent, evaluate_rolls
@@ -177,6 +178,7 @@ class StrategyWorker:
             account=account,
             chain_fetcher=get_chain,
             today=today,
+            earnings_filter=is_earnings_in_window,
         )
 
         submitted: list[str] = []

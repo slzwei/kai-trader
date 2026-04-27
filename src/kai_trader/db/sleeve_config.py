@@ -32,6 +32,7 @@ UPDATABLE_COLUMNS: tuple[str, ...] = (
     "roll_trigger_delta",
     "symbol_whitelist",
     "enabled",
+    "earnings_blackout_enabled",
 )
 
 _log = get_logger(__name__)
@@ -54,6 +55,7 @@ class SleeveConfig:
     enabled: bool
     updated_at: datetime
     updated_by: str | None
+    earnings_blackout_enabled: bool = True
 
 
 def _row_to_config(row: dict[str, Any]) -> SleeveConfig:
@@ -74,6 +76,7 @@ def _row_to_config(row: dict[str, Any]) -> SleeveConfig:
         roll_trigger_delta=row["roll_trigger_delta"],
         symbol_whitelist=whitelist,
         enabled=row["enabled"],
+        earnings_blackout_enabled=row.get("earnings_blackout_enabled", True),
         updated_at=row["updated_at"],
         updated_by=row["updated_by"],
     )
