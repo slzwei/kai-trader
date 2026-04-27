@@ -31,7 +31,9 @@ from kai_trader.broker.alpaca import (
     close_position,
     get_account,
     get_order_status,
+    list_long_equity_positions,
     list_positions,
+    submit_short_call,
     submit_short_put,
 )
 from kai_trader.broker.options_data import get_chain
@@ -41,17 +43,24 @@ from kai_trader.db.orders import (
     mark_status,
     mark_submitted,
     pending_orders,
+    recent_orders,
     record_intent,
 )
 from kai_trader.db.sleeve_config import SleeveConfig, get_all_sleeves
 from kai_trader.db.system_flags import get_all_flags
 from kai_trader.logging import get_logger
 from kai_trader.notifications.producer import enqueue
+from kai_trader.strategy.assignment import detect_assignments, record_assignment
 from kai_trader.strategy.candidates import (
     TradeIntent,
     build_intents_with_diagnostics,
 )
 from kai_trader.strategy.clock import get_clock_snapshot
+from kai_trader.strategy.covered_calls import (
+    CallBuildDiagnostics,
+    CallIntent,
+    build_call_intents,
+)
 from kai_trader.strategy.drawdown import check_and_trip as check_drawdown
 from kai_trader.strategy.regime import RegimeSnapshot, compute_and_record
 from kai_trader.strategy.rolls import RollIntent, evaluate_rolls
@@ -175,6 +184,28 @@ class StrategyWorker:
             else:
                 skipped.append(label)
 
+        # Covered-call leg: detect put assignments, then build and submit
+        # CCs against any held shares. Assignment detection is idempotent;
+        # CC build skips if regime is risk_off.
+        assignments_recorded = await self._handle_assignments()
+        call_intents, call_diagnostics = await self._build_call_intents(
+            sleeves=sleeves,
+            regime=regime,
+            today=today,
+        )
+        cc_submitted: list[str] = []
+        cc_skipped: list[str] = []
+        cc_failed: list[str] = []
+        for ci in call_intents:
+            outcome = await self._submit_call_intent(ci, flags)
+            label = f"{ci.symbol} C{ci.strike}"
+            if outcome == "submitted":
+                cc_submitted.append(label)
+            elif outcome == "failed":
+                cc_failed.append(label)
+            else:
+                cc_skipped.append(label)
+
         rolled = sum(1 for r in rolls if r.reason == "rolled")
         held = len(rolls) - rolled
         sub_line = (
@@ -196,8 +227,29 @@ class StrategyWorker:
             skip_line,
             fail_line,
         ]
+        if assignments_recorded:
+            body_lines.append(
+                f"Assigned:  {assignments_recorded} new (shares now held)"
+            )
+        cc_total = len(cc_submitted) + len(cc_skipped) + len(cc_failed)
+        if cc_total > 0:
+            cc_line = (
+                f"CCs:       submitted {len(cc_submitted)}"
+                + (f" ({', '.join(cc_submitted)})" if cc_submitted else "")
+            )
+            body_lines.append(cc_line)
+            if cc_skipped:
+                body_lines.append(
+                    f"CCs skipped: {len(cc_skipped)} ({', '.join(cc_skipped)})"
+                )
+            if cc_failed:
+                body_lines.append(
+                    f"CCs failed:  {len(cc_failed)} ({', '.join(cc_failed)})"
+                )
         for warning in diagnostics.warning_lines():
             body_lines.append(f"Warning:   {warning}")
+        for warning in call_diagnostics.warning_lines():
+            body_lines.append(f"CC warn:   {warning}")
         subtitle = (
             f"regime={regime.regime} · VIX {regime.vix:.2f} · equity {account.equity}"
         )
@@ -345,6 +397,116 @@ class StrategyWorker:
             qty=intent.qty,
             limit_price=limit_price,
             client_order_id=f"kai-{row_id[:8]}",
+        )
+
+        if result.submitted and result.alpaca_order_id is not None:
+            await mark_submitted(
+                row_id,
+                alpaca_order_id=result.alpaca_order_id,
+                submitted_at=datetime.now(UTC),
+            )
+            return "submitted"
+
+        if result.reason in (
+            "kill_switch_engaged",
+            "trading_disabled",
+            "new_entries_disabled",
+        ):
+            await mark_status(row_id, "skipped_by_flag", error_text=result.reason)
+            return "skipped"
+
+        await mark_status(row_id, "failed", error_text=result.reason or result.error)
+        return "failed"
+
+    async def _handle_assignments(self) -> int:
+        """Match held shares against recently-filled CSPs, audit any new ones.
+
+        Returns the count of newly recorded assignment rows. Idempotent:
+        previously-recorded assignments are not duplicated.
+        """
+        try:
+            held = await list_long_equity_positions()
+        except Exception as exc:
+            _log.warning("strategy.assignments.fetch_failed", error=str(exc))
+            return 0
+        if not held:
+            return 0
+        # Pull a window of recent orders large enough to cover any open
+        # CSP plus prior assignment audit rows for those symbols.
+        try:
+            window = await recent_orders(limit=200)
+        except Exception as exc:
+            _log.warning("strategy.assignments.orders_fetch_failed", error=str(exc))
+            return 0
+        assignments = detect_assignments(held, window)
+        recorded = 0
+        for a in assignments:
+            try:
+                await record_assignment(a)
+                recorded += 1
+            except Exception as exc:
+                _log.error(
+                    "strategy.assignment.record_failed",
+                    symbol=a.symbol,
+                    source_order_id=a.source_order_id,
+                    error=str(exc),
+                )
+        return recorded
+
+    async def _build_call_intents(
+        self,
+        *,
+        sleeves: list[SleeveConfig],
+        regime: RegimeSnapshot,
+        today: date,
+    ) -> tuple[list[CallIntent], CallBuildDiagnostics]:
+        try:
+            held = await list_long_equity_positions()
+        except Exception as exc:
+            _log.warning("strategy.cc.positions_fetch_failed", error=str(exc))
+            return [], CallBuildDiagnostics(sleeves=[])
+        return await build_call_intents(
+            long_equity_positions=held,
+            sleeves=sleeves,
+            regime=regime,
+            chain_fetcher=get_chain,
+            today=today,
+        )
+
+    async def _submit_call_intent(
+        self,
+        intent: CallIntent,
+        flags: dict[str, bool],
+    ) -> str:
+        """Record + submit one CC intent. Returns 'submitted', 'skipped', 'failed'."""
+        limit_price = intent.bid if intent.bid > 0 else intent.mid
+        gating_decision = {
+            "trading_enabled": flags.get("trading_enabled", False),
+            "new_entries_enabled": flags.get("new_entries_enabled", False),
+            "kill_switch": flags.get("kill_switch", False),
+            "limit_price": str(limit_price),
+        }
+        intent_payload = {
+            "strike": str(intent.strike),
+            "expiration": intent.expiration.isoformat(),
+            "qty": intent.qty,
+            "target_delta": str(intent.target_delta),
+            "actual_delta": str(intent.actual_delta),
+        }
+        row_id = await record_intent(
+            sleeve=intent.sleeve,
+            symbol=intent.symbol,
+            option_symbol=intent.option_symbol,
+            action="open_covered_call",
+            intent_payload=intent_payload,
+            gating_decision=gating_decision,
+        )
+
+        result: SubmitResult = await submit_short_call(
+            option_symbol=intent.option_symbol,
+            qty=intent.qty,
+            limit_price=limit_price,
+            client_order_id=f"kai-cc-{row_id[:8]}",
         )
 
         if result.submitted and result.alpaca_order_id is not None:

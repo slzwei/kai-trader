@@ -176,6 +176,27 @@ async def list_positions() -> list[PositionSnapshot]:
     return snapshots
 
 
+async def list_long_equity_positions() -> list[PositionSnapshot]:
+    """Return long stock positions only, excluding options.
+
+    Used by Phase 5 covered-call logic to find shares that came from
+    put assignments. Filtering is by OCC-pattern detection on the
+    symbol because alpaca-py exposes asset_class but the narrowed
+    PositionSnapshot does not retain it.
+    """
+    from kai_trader.broker.options_data import parse_occ_symbol  # local import to avoid cycle
+
+    out: list[PositionSnapshot] = []
+    for p in await list_positions():
+        try:
+            parse_occ_symbol(p.symbol)
+        except ValueError:
+            # Not an OCC symbol. Treat as equity if long with positive qty.
+            if p.side.lower() == "long" and p.qty > 0:
+                out.append(p)
+    return out
+
+
 async def ping() -> bool:
     """Return True if the Alpaca API responds to a lightweight call.
 
@@ -290,6 +311,104 @@ async def submit_short_put(
 
     _log.info(
         "alpaca.submit.ok",
+        option_symbol=option_symbol,
+        alpaca_order_id=str(order.id),
+        order_status=str(order.status),
+    )
+    return SubmitResult(
+        submitted=True,
+        alpaca_order_id=str(order.id),
+        order_status=_enum_value(order.status),
+        reason=None,
+        flags=flags,
+    )
+
+
+async def submit_short_call(
+    *,
+    option_symbol: str,
+    qty: int,
+    limit_price: Decimal,
+    client_order_id: str | None = None,
+) -> SubmitResult:
+    """Submit a sell-to-open short call (covered call leg), gated by flags.
+
+    Same gating layer as ``submit_short_put``: kill_switch first,
+    trading_enabled second, new_entries_enabled third. Even though calls
+    against assigned shares technically reduce risk relative to holding
+    bare stock, they create new short-option exposure and are therefore
+    treated as new entries for flag-gating purposes.
+    """
+    flags = await get_all_flags()
+    if flags.get("kill_switch", False):
+        _log.warning(
+            "alpaca.submit_call.refused_kill_switch",
+            option_symbol=option_symbol,
+        )
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="kill_switch_engaged",
+            flags=flags,
+        )
+    if not flags.get("trading_enabled", False):
+        _log.warning(
+            "alpaca.submit_call.refused_trading_disabled",
+            option_symbol=option_symbol,
+        )
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="trading_disabled",
+            flags=flags,
+        )
+    if not flags.get("new_entries_enabled", False):
+        _log.warning(
+            "alpaca.submit_call.refused_new_entries_disabled",
+            option_symbol=option_symbol,
+        )
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="new_entries_disabled",
+            flags=flags,
+        )
+
+    request = LimitOrderRequest(
+        symbol=option_symbol,
+        qty=qty,
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.DAY,
+        limit_price=float(limit_price),
+        client_order_id=client_order_id,
+    )
+    try:
+        order = await _call_alpaca_with_retry("submit_order", request)
+    except Exception as exc:
+        _log.error("alpaca.submit_call.failed", option_symbol=option_symbol, error=str(exc))
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="submit_exception",
+            flags=flags,
+            error=str(exc),
+        )
+
+    if isinstance(order, dict):
+        return SubmitResult(
+            submitted=False,
+            alpaca_order_id=None,
+            order_status=None,
+            reason="raw_dict_payload",
+            flags=flags,
+        )
+
+    _log.info(
+        "alpaca.submit_call.ok",
         option_symbol=option_symbol,
         alpaca_order_id=str(order.id),
         order_status=str(order.status),

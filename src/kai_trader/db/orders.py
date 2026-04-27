@@ -25,7 +25,14 @@ OrderStatus = Literal[
     "skipped_by_flag",
     "failed",
 ]
-OrderAction = Literal["open_short_put", "close", "roll"]
+OrderAction = Literal[
+    "open_short_put",
+    "close",
+    "roll",
+    "open_covered_call",
+    "close_covered_call",
+    "assignment",
+]
 
 
 @dataclass(frozen=True)

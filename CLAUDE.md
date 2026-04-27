@@ -199,8 +199,22 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, **and 4** shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, **and 5a** shipped:
 
+- Phase 5a closes the wheel loop: covered calls + assignment detection.
+  Migration `015_extended_order_actions.sql` widens `orders.action` to
+  accept `open_covered_call`, `close_covered_call`, and `assignment`.
+  `broker/alpaca.py` adds `submit_short_call` (gated by the same flag
+  triad as puts) and `list_long_equity_positions` (filters out OCC
+  symbols). New strategy modules: `assignment.py` matches recently
+  filled CSPs against current long stock holdings and records audit
+  rows; `covered_calls.py` mirrors `candidates.py` for the call leg —
+  one CC per held underlying via sleeve whitelist match, qty derived
+  from `floor(shares / 100)`, no per-symbol cap math because shares
+  are the collateral. The strategy worker now runs assignment
+  detection and CC build/submit after CSP build each tick; tick
+  summary surfaces "Assigned: N new" and "CCs: ..." lines plus
+  per-warning diagnostics.
 - Phase 4 ships the conversational chat handler, the read-only DB role,
   the approval flow, and the proactive event dispatcher. `migrations/
   011-014` add `chat_history`, `decision_log`, `events`,

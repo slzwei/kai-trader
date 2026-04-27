@@ -140,12 +140,18 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
         reason="trading_disabled",
         flags={"trading_enabled": False, "kill_switch": False},
     ))
+    submit_short_call = AsyncMock(return_value=SubmitResult(
+        submitted=True, alpaca_order_id="alpaca-cc-1", order_status="accepted",
+        reason=None, flags={"trading_enabled": True, "kill_switch": False},
+    ))
     get_order_status = AsyncMock(return_value=_filled_status())
     pending_orders = AsyncMock(return_value=[])
+    recent_orders = AsyncMock(return_value=[])
     record_intent = AsyncMock(return_value="intent-uuid")
     mark_submitted = AsyncMock()
     mark_status = AsyncMock()
     list_positions = AsyncMock(return_value=[])
+    list_long_equity_positions = AsyncMock(return_value=[])
     close_position = AsyncMock(return_value=SubmitResult(
         submitted=True, alpaca_order_id="close-uuid", order_status="accepted",
         reason=None, flags={},
@@ -157,6 +163,7 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
         breached=False,
     ))
     evaluate_rolls = AsyncMock(return_value=[])
+    record_assignment = AsyncMock(return_value="asg-row-id")
 
     monkeypatch.setattr(worker_module, "enqueue", enqueue)
     monkeypatch.setattr(worker_module, "get_account", get_account)
@@ -171,9 +178,15 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     monkeypatch.setattr(worker_module, "mark_submitted", mark_submitted)
     monkeypatch.setattr(worker_module, "mark_status", mark_status)
     monkeypatch.setattr(worker_module, "list_positions", list_positions)
+    monkeypatch.setattr(
+        worker_module, "list_long_equity_positions", list_long_equity_positions
+    )
     monkeypatch.setattr(worker_module, "close_position", close_position)
     monkeypatch.setattr(worker_module, "check_drawdown", check_drawdown)
     monkeypatch.setattr(worker_module, "evaluate_rolls", evaluate_rolls)
+    monkeypatch.setattr(worker_module, "submit_short_call", submit_short_call)
+    monkeypatch.setattr(worker_module, "recent_orders", recent_orders)
+    monkeypatch.setattr(worker_module, "record_assignment", record_assignment)
     return locals()
 
 
@@ -513,3 +526,150 @@ async def test_tick_logs_held_rolls_without_executing(
 
     assert "0 rolled, 1 held" in summary
     _patch_dependencies["close_position"].assert_not_awaited()
+
+
+# ------------- Phase 5a: assignments + covered calls -------------
+
+
+def _call_contract(strike: float = 260, delta: float = 0.30) -> OptionContract:
+    return OptionContract(
+        symbol=f"AMZN260505C{int(strike * 1000):08d}",
+        underlying="AMZN",
+        option_type="call",
+        strike=Decimal(str(strike)),
+        expiration=date(2026, 5, 5),
+        bid=Decimal("1.10"),
+        ask=Decimal("1.20"),
+        last=None,
+        delta=Decimal(str(delta)),
+        gamma=Decimal("0.01"),
+        theta=Decimal("-0.05"),
+        vega=Decimal("0.10"),
+        implied_volatility=Decimal("0.20"),
+    )
+
+
+def _equity_position() -> object:
+    from kai_trader.broker.alpaca import PositionSnapshot
+    return PositionSnapshot(
+        symbol="AMZN",
+        qty=Decimal("100"),
+        side="long",
+        avg_entry_price=Decimal("250"),
+        current_price=Decimal("248"),
+        market_value=Decimal("24800"),
+        unrealized_pl=Decimal("-200"),
+        unrealized_intraday_pl=Decimal("-50"),
+    )
+
+
+def _filled_csp_for_amzn() -> OrderRow:
+    return OrderRow(
+        id="csp-1",
+        created_at=datetime(2026, 4, 27, tzinfo=UTC),
+        sleeve="stable_largecap",
+        symbol="AMZN",
+        option_symbol="AMZN260506P00250000",
+        action="open_short_put",
+        intent_payload={"qty": 1},
+        alpaca_order_id="alp-csp-1",
+        status="filled",
+        gating_decision=None,
+        submitted_at=datetime(2026, 4, 27, tzinfo=UTC),
+        filled_at=datetime(2026, 4, 27, tzinfo=UTC),
+        filled_avg_price=Decimal("1.10"),
+        error_text=None,
+    )
+
+
+def _amzn_sleeve() -> SleeveConfig:
+    return SleeveConfig(
+        sleeve="stable_largecap",
+        target_pct=Decimal("0.30"),
+        target_delta_put_risk_on=Decimal("-0.40"),
+        target_delta_put_neutral=Decimal("-0.30"),
+        target_delta_call=Decimal("0.30"),
+        target_dte_min=7,
+        target_dte_max=10,
+        profit_take_pct=Decimal("0.50"),
+        roll_trigger_delta=Decimal("0.45"),
+        symbol_whitelist=["AMZN"],
+        enabled=True,
+        updated_at=datetime(2026, 4, 27, tzinfo=UTC),
+        updated_by=None,
+    )
+
+
+async def test_tick_records_assignment_when_shares_appear(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False, "new_entries_enabled": True,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
+    _patch_dependencies["list_long_equity_positions"].return_value = [
+        _equity_position()
+    ]
+    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    _patch_dependencies["get_chain"].return_value = [_call_contract()]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "Assigned:  1 new" in summary
+    _patch_dependencies["record_assignment"].assert_awaited_once()
+
+
+async def test_tick_submits_covered_call_against_held_shares(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False, "new_entries_enabled": True,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
+    _patch_dependencies["list_long_equity_positions"].return_value = [
+        _equity_position()
+    ]
+    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    _patch_dependencies["get_chain"].return_value = [_call_contract()]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "CCs:" in summary
+    assert "AMZN C260" in summary
+    _patch_dependencies["submit_short_call"].assert_awaited_once()
+    submit_args = _patch_dependencies["submit_short_call"].await_args
+    assert submit_args.kwargs["option_symbol"].startswith("AMZN")
+    assert submit_args.kwargs["qty"] == 1
+
+
+async def test_tick_skips_cc_when_no_shares_held(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False, "new_entries_enabled": True,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
+    _patch_dependencies["list_long_equity_positions"].return_value = []
+    _patch_dependencies["recent_orders"].return_value = []
+    _patch_dependencies["get_chain"].return_value = [_call_contract()]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "CCs:" not in summary
+    _patch_dependencies["submit_short_call"].assert_not_awaited()
+    _patch_dependencies["record_assignment"].assert_not_awaited()

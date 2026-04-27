@@ -3,6 +3,35 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-28 . Phase 5a: Covered calls + assignment detection
+
+Closes the wheel loop. Without this, an assigned CSP left the bot holding
+100 shares per contract with no automated income capture against them.
+
+- Migration `015_extended_order_actions.sql` extends the `orders.action`
+  CHECK constraint to admit `open_covered_call`, `close_covered_call`,
+  and `assignment`.
+- `broker/alpaca.py` adds `submit_short_call` (gated by the same flag
+  triad as puts) and `list_long_equity_positions` (filters out OCC
+  symbols).
+- `strategy/assignment.py` is a pure matcher: take current long stock
+  positions and a recent-orders window, return assignments where a
+  filled `open_short_put` row matches a held underlying and no audit
+  row already records the pair. `record_assignment` writes the audit
+  row with `action='assignment'`, payload pointing back at the source
+  CSP.
+- `strategy/covered_calls.py` mirrors `candidates.py` for the call
+  leg. Each held underlying produces at most one CC intent at the
+  sleeve's `target_delta_call` within the sleeve DTE band. Quantity
+  is `floor(shares / 100)`, no capital cap math because shares are
+  collateral. `risk_off` blocks new CCs.
+- Worker tick now runs `_handle_assignments` then `_build_call_intents`
+  + `_submit_call_intent` after CSP build. Tick summary surfaces
+  "Assigned: N new" and "CCs: ..." plus diagnostic warnings.
+
+Tests: 28 new, suite total 427 passing, 91% coverage. `ruff` and
+`mypy --strict` clean.
+
 ## 2026-04-27 . Phase 4: Conversational bot + approval flow
 
 Plus a small precursor commit fixing a silent failure in the strategy
