@@ -155,17 +155,135 @@ async def test_health_labels_live_when_paper_off(
     assert "Alpaca LIVE" in text
 
 
-async def test_status_labels_mock_data(
-    fake_update_factory: Any, patched_db: dict[str, Any]
+async def test_status_renders_executive_summary(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        status_mod,
+        "get_account",
+        AsyncMock(return_value=AccountSnapshot(
+            equity=Decimal("100500"),
+            last_equity=Decimal("100000"),
+            cash=Decimal("60000"),
+            buying_power=Decimal("400000"),
+            portfolio_value=Decimal("100500"),
+            day_pl=Decimal("500"),
+            status="ACTIVE",
+            paper=True,
+        )),
+    )
+    monkeypatch.setattr(
+        status_mod,
+        "list_positions",
+        AsyncMock(return_value=[
+            PositionSnapshot(
+                symbol="SPY260505P00500000",
+                qty=Decimal("1"),
+                side="short",
+                avg_entry_price=Decimal("1.10"),
+                current_price=Decimal("0.55"),
+                market_value=Decimal("-55"),
+                unrealized_pl=Decimal("55"),
+                unrealized_intraday_pl=Decimal("10"),
+            ),
+        ]),
+    )
+    monkeypatch.setattr(
+        status_mod,
+        "get_all_flags",
+        AsyncMock(return_value={
+            "trading_enabled": True,
+            "new_entries_enabled": True,
+            "kill_switch": False,
+        }),
+    )
+    monkeypatch.setattr(
+        status_mod,
+        "evaluate_regime",
+        AsyncMock(return_value=RegimeSnapshot(
+            regime="neutral",
+            vix=18.5, vix_5d_change_pct=2.0,
+            spy_price=505.0, spy_20dma=495.0, spy_50dma=480.0,
+            realized_vol_10d_pct=12.0,
+        )),
+    )
+
     update = fake_update_factory(user_id=42, text="/status")
     await status_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "KAI STATUS" in text
-    assert "PHASE 1 MOCK DATA" in text
-    assert "Portfolio: $100,000" in text
-    assert "Positions: 0 active" in text
+    assert "Kai Trader status" in text
+    assert "Mode: Alpaca paper" in text
+    assert "Equity:        USD 100,500.00" in text
+    assert "Day P&L:       +USD 500.00 (+0.50%)" in text
+    assert "Positions:     1 open (1 short puts)" in text
+    assert "Regime:        neutral, VIX 18.50" in text
+    assert "Flags:         trading=on, entries=on" in text
+
+
+async def test_status_marks_kill_switch_engaged(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(status_mod, "get_account", AsyncMock(return_value=AccountSnapshot(
+        equity=Decimal("100000"), last_equity=Decimal("100000"),
+        cash=Decimal("100000"), buying_power=Decimal("400000"),
+        portfolio_value=Decimal("100000"), day_pl=Decimal("0"),
+        status="ACTIVE", paper=True,
+    )))
+    monkeypatch.setattr(status_mod, "list_positions", AsyncMock(return_value=[]))
+    monkeypatch.setattr(status_mod, "get_all_flags", AsyncMock(return_value={
+        "trading_enabled": False, "new_entries_enabled": False, "kill_switch": True,
+    }))
+    monkeypatch.setattr(status_mod, "evaluate_regime", AsyncMock(return_value=RegimeSnapshot(
+        regime="risk_off", vix=28.0, vix_5d_change_pct=15.0,
+        spy_price=470.0, spy_20dma=480.0, spy_50dma=485.0,
+        realized_vol_10d_pct=22.0,
+    )))
+
+    update = fake_update_factory(user_id=42, text="/status")
+    await status_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "KILL=ENGAGED" in text
+    assert "Regime:        risk_off" in text
+
+
+async def test_status_handles_regime_failure(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(status_mod, "get_account", AsyncMock(return_value=AccountSnapshot(
+        equity=Decimal("100000"), last_equity=Decimal("100000"),
+        cash=Decimal("100000"), buying_power=Decimal("400000"),
+        portfolio_value=Decimal("100000"), day_pl=Decimal("0"),
+        status="ACTIVE", paper=True,
+    )))
+    monkeypatch.setattr(status_mod, "list_positions", AsyncMock(return_value=[]))
+    monkeypatch.setattr(status_mod, "get_all_flags", AsyncMock(return_value={
+        "trading_enabled": True, "new_entries_enabled": True, "kill_switch": False,
+    }))
+    # Simulate yfinance VIX fetch dying.
+    monkeypatch.setattr(
+        status_mod, "evaluate_regime",
+        AsyncMock(side_effect=RuntimeError("yfinance down")),
+    )
+
+    update = fake_update_factory(user_id=42, text="/status")
+    await status_mod.handle(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Regime:        unavailable (RuntimeError)" in text
 
 
 async def test_account_renders_paper_snapshot(

@@ -1,34 +1,73 @@
-"""/status handler: Phase 1 returns mocked portfolio data with a clear label.
-
-The exact text matches the format locked in the Phase 1 spec so that later
-phases can swap in real values without the renderer changing shape.
-"""
+"""/status handler: executive summary across account, regime, positions, flags."""
 
 from __future__ import annotations
+
+from decimal import Decimal
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from kai_trader.bot.auth import CommandContext
-from kai_trader.bot.formatting import format_sgt_timestamp
+from kai_trader.bot.formatting import (
+    format_money,
+    format_sgt_timestamp,
+    format_signed_money,
+)
 from kai_trader.bot.handlers._common import run_command
+from kai_trader.broker.alpaca import get_account, list_positions
 from kai_trader.config import get_settings
+from kai_trader.db.system_flags import get_all_flags
+from kai_trader.strategy.regime import evaluate as evaluate_regime
 
 
 async def _build(_update: Update, _ctx: CommandContext) -> str:
-    ts = format_sgt_timestamp(get_settings().timezone)
+    settings = get_settings()
+    ts = format_sgt_timestamp(settings.timezone)
+
+    account = await get_account()
+    positions = await list_positions()
+    flags = await get_all_flags()
+    try:
+        regime = await evaluate_regime()
+        regime_line = f"{regime.regime}, VIX {regime.vix:.2f}"
+    except Exception as exc:
+        regime_line = f"unavailable ({type(exc).__name__})"
+
+    short_puts = sum(
+        1 for p in positions if p.side == "short" and "P" in p.symbol[-9:]
+    )
+    open_premium = sum(
+        (-p.market_value for p in positions if p.market_value is not None and p.side == "short"),
+        Decimal("0"),
+    )
+
+    mode = "paper" if account.paper else "LIVE"
+    day_pl_pct = (
+        (account.day_pl / account.last_equity * 100)
+        if account.last_equity > 0 else Decimal("0")
+    )
+
+    flag_bits = []
+    flag_bits.append("trading=" + ("on" if flags.get("trading_enabled") else "OFF"))
+    flag_bits.append("entries=" + ("on" if flags.get("new_entries_enabled") else "OFF"))
+    if flags.get("kill_switch"):
+        flag_bits.append("KILL=ENGAGED")
+    flags_str = ", ".join(flag_bits)
+
     return (
-        f"\U0001f4ca KAI STATUS · {ts}\n"
+        f"Kai Trader status. {ts}\n"
+        f"Mode: Alpaca {mode}\n"
         "\n"
-        "\U0001f527 PHASE 1 MOCK DATA\n"
+        f"Equity:        {format_money(account.equity)}\n"
+        f"Cash:          {format_money(account.cash)}\n"
+        f"Buying power:  {format_money(account.buying_power)}\n"
+        f"Day P&L:       {format_signed_money(account.day_pl)} ({day_pl_pct:+.2f}%)\n"
         "\n"
-        "\U0001f4b0 Portfolio: $100,000 (+0.00%)\n"
-        "\U0001f4b5 Cash: $100,000 (100%)\n"
-        "\U0001f4c8 MTD P&L: $0\n"
-        "\U0001f3af Positions: 0 active\n"
+        f"Positions:     {len(positions)} open ({short_puts} short puts)\n"
+        f"Open premium:  {format_money(open_premium)} short\n"
         "\n"
-        "Regime: System not yet trading\n"
-        "Status: Bot skeleton only"
+        f"Regime:        {regime_line}\n"
+        f"Flags:         {flags_str}"
     )
 
 
