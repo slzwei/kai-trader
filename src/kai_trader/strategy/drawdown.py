@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
+from kai_trader.bot.formatting import bold
 from kai_trader.db.account_snapshots import StoredSnapshot, recent_snapshots
 from kai_trader.db.system_flags import set_flag
 from kai_trader.logging import get_logger
@@ -95,10 +96,11 @@ async def check_and_trip(
 
     await set_flag("kill_switch", True, actor=WORKER_ACTOR_ID)
     body = (
-        f"DRAWDOWN CIRCUIT BREAKER. {check.drawdown_pct:.2f}% drop from "
-        f"{check.high_water_mark} to {check.current_equity}. Kill switch "
-        f"engaged automatically. Investigate before clearing with "
-        f"/flag kill_switch off."
+        f"{bold('DRAWDOWN CIRCUIT BREAKER')}\n"
+        f"{check.drawdown_pct:.2f}% drop from {check.high_water_mark} "
+        f"to {check.current_equity}.\n"
+        "Kill switch engaged automatically. Investigate before clearing "
+        "with /flag kill_switch off."
     )
     await enqueue(body, "critical", channel="telegram")
     _log.error(

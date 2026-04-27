@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 
-from telegram.ext import Application, CommandHandler
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, Defaults
 
 from kai_trader.bot.handlers import (
     account,
@@ -43,8 +44,18 @@ _strategy_worker: StrategyWorker | None = None
 
 
 def build_application(settings: Settings) -> Application:  # type: ignore[type-arg]
-    """Construct the bot Application with every handler registered."""
-    app = Application.builder().token(settings.telegram_bot_token.get_secret_value()).build()
+    """Construct the bot Application with every handler registered.
+
+    HTML parse mode is the default so handlers can use <b>, <i>, <pre>
+    without setting parse_mode on every reply call.
+    """
+    defaults = Defaults(parse_mode=ParseMode.HTML)
+    app = (
+        Application.builder()
+        .token(settings.telegram_bot_token.get_secret_value())
+        .defaults(defaults)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start.handle))
     app.add_handler(CommandHandler("help", help_handler.handle))

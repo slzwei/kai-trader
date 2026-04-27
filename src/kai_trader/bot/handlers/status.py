@@ -9,9 +9,13 @@ from telegram.ext import ContextTypes
 
 from kai_trader.bot.auth import CommandContext
 from kai_trader.bot.formatting import (
+    bold,
     format_money,
     format_sgt_timestamp,
     format_signed_money,
+    header,
+    pre,
+    render_table,
 )
 from kai_trader.bot.handlers._common import run_command
 from kai_trader.broker.alpaca import get_account, list_positions
@@ -29,7 +33,7 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
     flags = await get_all_flags()
     try:
         regime = await evaluate_regime()
-        regime_line = f"{regime.regime}, VIX {regime.vix:.2f}"
+        regime_line = f"{regime.regime} · VIX {regime.vix:.2f}"
     except Exception as exc:
         regime_line = f"unavailable ({type(exc).__name__})"
 
@@ -52,23 +56,27 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
     flag_bits.append("entries=" + ("on" if flags.get("new_entries_enabled") else "OFF"))
     if flags.get("kill_switch"):
         flag_bits.append("KILL=ENGAGED")
-    flags_str = ", ".join(flag_bits)
+    flags_str = " · ".join(flag_bits)
 
-    return (
-        f"Kai Trader status. {ts}\n"
-        f"Mode: Alpaca {mode}\n"
-        "\n"
-        f"Equity:        {format_money(account.equity)}\n"
-        f"Cash:          {format_money(account.cash)}\n"
-        f"Buying power:  {format_money(account.buying_power)}\n"
-        f"Day P&L:       {format_signed_money(account.day_pl)} ({day_pl_pct:+.2f}%)\n"
-        "\n"
-        f"Positions:     {len(positions)} open ({short_puts} short puts)\n"
-        f"Open premium:  {format_money(open_premium)} short\n"
-        "\n"
-        f"Regime:        {regime_line}\n"
-        f"Flags:         {flags_str}"
-    )
+    table = render_table([
+        ("Equity", format_money(account.equity)),
+        ("Cash", format_money(account.cash)),
+        ("Buying power", format_money(account.buying_power)),
+        ("Day P&L", f"{format_signed_money(account.day_pl)} ({day_pl_pct:+.2f}%)"),
+    ])
+
+    parts = [
+        header("Kai Trader · Status", f"{ts} · Alpaca {mode}"),
+        "",
+        pre(table),
+        f"{bold('Positions')}: {len(positions)} open · {short_puts} short put"
+        + ("s" if short_puts != 1 else ""),
+        f"{bold('Open premium')}: {format_money(open_premium)} short",
+        "",
+        f"{bold('Regime')}: {regime_line}",
+        f"{bold('Flags')}: {flags_str}",
+    ]
+    return "\n".join(parts)
 
 
 async def handle(update: Update, tg_ctx: ContextTypes.DEFAULT_TYPE) -> None:

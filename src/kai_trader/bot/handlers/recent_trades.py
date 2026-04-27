@@ -6,7 +6,12 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from kai_trader.bot.auth import CommandContext
-from kai_trader.bot.formatting import format_sgt_timestamp
+from kai_trader.bot.formatting import (
+    format_sgt_timestamp,
+    header,
+    italic,
+    pre,
+)
 from kai_trader.bot.handlers._common import run_command
 from kai_trader.config import get_settings
 from kai_trader.db.orders import OrderRow, recent_orders
@@ -31,14 +36,14 @@ def _parse_limit(args: str | None) -> int | str:
 
 
 def _format_order(order: OrderRow) -> str:
-    when = order.created_at.strftime("%Y-%m-%d %H:%M UTC")
+    when = order.created_at.strftime("%m-%d %H:%M")
     fill = ""
     if order.filled_avg_price is not None:
         fill = f" fill {order.filled_avg_price:.2f}"
     alpaca = order.alpaca_order_id[:8] if order.alpaca_order_id else "-"
     return (
-        f"{when} {order.sleeve}/{order.symbol} {order.action} "
-        f"{order.option_symbol} status={order.status} alpaca={alpaca}{fill}"
+        f"{when}  {order.sleeve}/{order.symbol:<6} {order.action:<16} "
+        f"{order.option_symbol:<22} {order.status:<16} {alpaca}{fill}"
     )
 
 
@@ -51,12 +56,11 @@ async def _build(_update: Update, ctx: CommandContext) -> str:
     settings = get_settings()
     ts = format_sgt_timestamp(settings.timezone)
     orders = await recent_orders(limit)
+    head = header("Recent Trades", ts)
     if not orders:
-        return f"Recent trades. {ts}\n\nNo orders recorded yet."
-
-    lines = [f"Recent trades, last {len(orders)}. {ts}", ""]
-    lines.extend(_format_order(o) for o in orders)
-    return "\n".join(lines)
+        return f"{head}\n\n{italic('No orders recorded yet.')}"
+    body = "\n".join(_format_order(o) for o in orders)
+    return f"{head}\n\n{pre(body)}"
 
 
 async def handle(update: Update, tg_ctx: ContextTypes.DEFAULT_TYPE) -> None:

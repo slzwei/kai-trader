@@ -102,8 +102,8 @@ async def test_health_reports_uptime_db_and_broker(
     assert "Bot uptime" in text
     assert "Postgres connection" in text
     assert "Alpaca paper" in text
-    assert "[ok]" in text
-    assert "[fail]" not in text
+    assert "[OK]" in text
+    assert "[FAIL]" not in text
     patched_db["ping"].assert_awaited_once()
     patched_broker["ping"].assert_awaited_once()
 
@@ -119,7 +119,7 @@ async def test_health_flags_db_failure(
     await health_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "[fail] Postgres connection" in text
+    assert "[FAIL] Postgres connection" in text
 
 
 async def test_health_flags_broker_failure(
@@ -133,7 +133,7 @@ async def test_health_flags_broker_failure(
     await health_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "[fail] Alpaca paper" in text
+    assert "[FAIL] Alpaca paper" in text
 
 
 async def test_health_labels_live_when_paper_off(
@@ -216,13 +216,17 @@ async def test_status_renders_executive_summary(
     await status_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Kai Trader status" in text
-    assert "Mode: Alpaca paper" in text
-    assert "Equity:        USD 100,500.00" in text
-    assert "Day P&L:       +USD 500.00 (+0.50%)" in text
-    assert "Positions:     1 open (1 short puts)" in text
-    assert "Regime:        neutral, VIX 18.50" in text
-    assert "Flags:         trading=on, entries=on" in text
+    assert "Kai Trader · Status" in text
+    assert "Alpaca paper" in text
+    assert "USD 100,500.00" in text
+    assert "+USD 500.00" in text
+    assert "+0.50%" in text
+    assert "1 open" in text
+    assert "1 short put" in text
+    assert "neutral" in text
+    assert "VIX 18.50" in text
+    assert "trading=on" in text
+    assert "entries=on" in text
 
 
 async def test_status_marks_kill_switch_engaged(
@@ -253,7 +257,7 @@ async def test_status_marks_kill_switch_engaged(
 
     text = _last_reply(update)
     assert "KILL=ENGAGED" in text
-    assert "Regime:        risk_off" in text
+    assert "risk_off" in text
 
 
 async def test_status_handles_regime_failure(
@@ -283,7 +287,7 @@ async def test_status_handles_regime_failure(
     await status_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Regime:        unavailable (RuntimeError)" in text
+    assert "unavailable (RuntimeError)" in text
 
 
 async def test_account_renders_paper_snapshot(
@@ -295,11 +299,11 @@ async def test_account_renders_paper_snapshot(
     await account_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Alpaca account (paper)" in text
-    assert "Status: ACTIVE" in text
-    assert "Equity: USD 100,000.00" in text
-    assert "Buying power: USD 400,000.00" in text
-    assert "Day P&L: +USD 500.00" in text
+    assert "Alpaca Account · paper" in text
+    assert "ACTIVE" in text
+    assert "USD 100,000.00" in text
+    assert "USD 400,000.00" in text
+    assert "+USD 500.00" in text
     patched_broker["get_account"].assert_awaited_once()
 
 
@@ -322,8 +326,8 @@ async def test_account_marks_live_explicitly(
     await account_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Alpaca account (LIVE)" in text
-    assert "Day P&L: -USD 1,000.00" in text
+    assert "Alpaca Account · LIVE" in text
+    assert "-USD 1,000.00" in text
 
 
 async def test_positions_empty_state(
@@ -335,7 +339,7 @@ async def test_positions_empty_state(
     await positions_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Alpaca positions" in text
+    assert "Open Positions" in text
     assert "No open positions." in text
     patched_broker["list_positions"].assert_awaited_once()
 
@@ -371,12 +375,14 @@ async def test_positions_renders_each_holding(
     await positions_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "AAPL 100 long" in text
+    assert "AAPL" in text
+    assert "100" in text
+    assert "long" in text
     assert "avg USD 150.00" in text
     assert "mark USD 152.50" in text
     assert "pl +USD 250.00" in text
     # Missing price fields render as 'n/a' rather than crashing.
-    assert "MSFT 50 long" in text
+    assert "MSFT" in text
     assert "mark n/a" in text
     assert "pl n/a" in text
 
@@ -425,15 +431,15 @@ async def test_flags_renders_all_three(
     await flags_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "System flags" in text
+    assert "System Flags" in text
     assert "trading_enabled: False" in text
     assert "new_entries_enabled: True" in text
     assert "kill_switch: False" in text
-    # [ok] = safe state. True is safe for the two enable flags; False is safe
+    # [OK] = safe state. True is safe for the two enable flags; False is safe
     # for kill_switch (engaged kill switch is the alarm state).
-    assert "[ok] new_entries_enabled" in text
-    assert "[fail] trading_enabled" in text
-    assert "[ok] kill_switch" in text
+    assert "[OK]   new_entries_enabled" in text
+    assert "[FAIL] trading_enabled" in text
+    assert "[OK]   kill_switch" in text
 
 
 async def test_flags_marks_engaged_kill_switch_as_failure(
@@ -457,9 +463,9 @@ async def test_flags_marks_engaged_kill_switch_as_failure(
     await flags_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "[ok] trading_enabled" in text
-    assert "[ok] new_entries_enabled" in text
-    assert "[fail] kill_switch" in text
+    assert "[OK]   trading_enabled" in text
+    assert "[OK]   new_entries_enabled" in text
+    assert "[FAIL] kill_switch" in text
 
 
 async def test_flag_sets_value_and_reports_prior(
@@ -703,10 +709,10 @@ async def test_history_renders_recent_snapshots(
     await history_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Account snapshots, last 2" in text
+    assert "Account Snapshots" in text
     assert "equity USD 100,000.00" in text
     assert "day_pl USD 500.00" in text
-    assert "2026-04-25 14:00 UTC" in text
+    assert "04-25 14:00" in text
 
 
 async def test_history_empty_state(
@@ -964,11 +970,11 @@ async def test_sleeves_renders_three_rows(
     await sleeves_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Sleeve config" in text
+    assert "Sleeve Config" in text
     assert "index_core" in text
     assert "stable_largecap" in text
     assert "opportunistic (DISABLED)" in text
-    assert "target: 40.0% of equity" in text
+    assert "40% of equity" in text
     assert "delta puts: -0.30 risk_on, -0.20 neutral" in text
 
 
@@ -1011,12 +1017,12 @@ async def test_regime_renders_classifier_output(
     await regime_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Regime: risk_on" in text
+    assert "Regime · risk_on" in text
     assert "full target deltas" in text
-    assert "VIX:                14.50" in text
-    assert "VIX 5d change:      -1.20%" in text
-    assert "SPY price:          505.00" in text
-    assert "Realized vol 10d:   12.00%" in text
+    assert "14.50" in text
+    assert "-1.20%" in text
+    assert "505.00" in text
+    assert "12.00%" in text
 
 
 async def test_regime_renders_risk_off_behaviour(
@@ -1041,7 +1047,7 @@ async def test_regime_renders_risk_off_behaviour(
     await regime_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Regime: risk_off" in text
+    assert "Regime · risk_off" in text
     assert "no new entries" in text
 
 
@@ -1097,11 +1103,11 @@ async def test_strategy_status_renders_dryrun(
     await strategy_status_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Strategy status" in text
-    assert "Market: open" in text
-    assert "Regime: risk_on" in text
-    assert "Kill switch: off" in text
-    assert "dry-run only" in text
+    assert "Strategy Status" in text
+    assert "Market" in text and "open" in text
+    assert "risk_on" in text
+    assert "Kill switch" in text and "off" in text
+    assert "Dry-run preview" in text
     assert "No candidate trades" in text
 
 
@@ -1156,8 +1162,8 @@ async def test_strategy_status_marks_kill_switch_engaged(
     await strategy_status_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Market: closed" in text
-    assert "Kill switch: ENGAGED" in text
+    assert "Market" in text and "closed" in text
+    assert "Kill switch" in text and "ENGAGED" in text
 
 
 async def test_trade_now_runs_a_tick(
@@ -1225,12 +1231,12 @@ async def test_recent_trades_renders_orders(
     await recent_trades_mod.handle(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Recent trades, last 2" in text
+    assert "Recent Trades" in text
     assert "index_core/SPY" in text
-    assert "status=filled" in text
+    assert "filled" in text
     assert "fill 1.25" in text
-    assert "alpaca=alpaca-u" in text
-    assert "status=skipped_by_flag" in text
+    assert "alpaca-u" in text
+    assert "skipped_by_flag" in text
 
 
 async def test_recent_trades_empty_state(

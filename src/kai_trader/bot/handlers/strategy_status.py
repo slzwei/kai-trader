@@ -1,10 +1,4 @@
-"""/strategy_status handler: on-demand dry-run intent display.
-
-Runs the same flow the StrategyWorker does on its own schedule, but
-replies inline rather than enqueueing a notification. Always evaluates
-even when the market is closed (operator can inspect what the worker
-would have considered if it were open).
-"""
+"""/strategy_status handler: on-demand intent-list display."""
 
 from __future__ import annotations
 
@@ -14,7 +8,13 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from kai_trader.bot.auth import CommandContext
-from kai_trader.bot.formatting import format_sgt_timestamp
+from kai_trader.bot.formatting import (
+    bold,
+    format_sgt_timestamp,
+    header,
+    italic,
+    pre,
+)
 from kai_trader.bot.handlers._common import run_command
 from kai_trader.broker.alpaca import get_account
 from kai_trader.broker.options_data import get_chain
@@ -45,15 +45,23 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
 
     market_state = "open" if clock.is_open else "closed"
     kill_state = "ENGAGED" if flags.get("kill_switch", False) else "off"
-    header = (
-        f"Strategy status. {ts}\n"
-        f"Market: {market_state}\n"
-        f"Regime: {regime.regime}, VIX {regime.vix:.2f}\n"
-        f"Equity: USD {account.equity}\n"
-        f"Kill switch: {kill_state}\n"
-        f"Note: dry-run only, no orders are placed in Phase 3.3.\n"
-    )
-    return header + "\n" + summarise_intents(intents)
+    meta_lines = [
+        f"{bold('Market')}: {market_state}",
+        f"{bold('Regime')}: {regime.regime} · VIX {regime.vix:.2f}",
+        f"{bold('Equity')}: USD {account.equity}",
+        f"{bold('Kill switch')}: {kill_state}",
+    ]
+    parts = [
+        header("Strategy Status", ts),
+        "\n".join(meta_lines),
+        italic("Dry-run preview. The worker submits on its own schedule."),
+        "",
+    ]
+    if intents:
+        parts.append(pre(summarise_intents(intents)))
+    else:
+        parts.append(italic(summarise_intents(intents)))
+    return "\n".join(parts)
 
 
 async def handle(update: Update, tg_ctx: ContextTypes.DEFAULT_TYPE) -> None:

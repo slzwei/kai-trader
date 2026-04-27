@@ -6,19 +6,19 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from kai_trader.bot.auth import CommandContext
-from kai_trader.bot.formatting import checkmark, format_sgt_timestamp
+from kai_trader.bot.formatting import (
+    format_sgt_timestamp,
+    header,
+    pre,
+    status_glyph,
+)
 from kai_trader.bot.handlers._common import run_command
 from kai_trader.config import get_settings
 from kai_trader.db.system_flags import KNOWN_FLAGS, get_all_flags
 
 
 def _is_safe(key: str, value: bool) -> bool:
-    """Return True if ``value`` is the safe/desired state for ``key``.
-
-    For ``trading_enabled`` and ``new_entries_enabled``, True means "on" and
-    is the operating state. For ``kill_switch``, True means "engaged" and is
-    the alarm state, so the polarity is inverted.
-    """
+    """[OK] = safe state. kill_switch is inverted (False is safe)."""
     if key == "kill_switch":
         return not value
     return value
@@ -29,10 +29,10 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
     ts = format_sgt_timestamp(settings.timezone)
     flags = await get_all_flags()
     lines = [
-        f"  {checkmark(_is_safe(key, flags[key]))} {key}: {flags[key]}"
+        f"{status_glyph(_is_safe(key, flags[key]))} {key}: {flags[key]}"
         for key in KNOWN_FLAGS
     ]
-    return f"System flags. {ts}\n\n" + "\n".join(lines)
+    return f"{header('System Flags', ts)}\n\n{pre(chr(10).join(lines))}"
 
 
 async def handle(update: Update, tg_ctx: ContextTypes.DEFAULT_TYPE) -> None:

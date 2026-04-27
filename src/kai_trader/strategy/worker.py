@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, date, datetime
 
+from kai_trader.bot.formatting import bold, header, pre
 from kai_trader.broker.alpaca import (
     SubmitResult,
     close_position,
@@ -128,15 +129,16 @@ class StrategyWorker:
             flags = await get_all_flags()
 
         if flags.get("kill_switch", False):
-            summary = (
-                f"Kill switch engaged. Reconciled {reconciled} open orders. "
+            note = (
+                f"Reconciled {reconciled} open orders. "
                 "No new candidates evaluated."
             )
             if dd_check.breached:
-                summary += (
+                note += (
                     f" Drawdown {dd_check.drawdown_pct:.2f}% from "
                     f"{dd_check.high_water_mark}."
                 )
+            summary = f"{bold('Kill switch engaged')}\n{note}"
             await enqueue(summary, "alert", channel="telegram")
             _log.info("strategy.tick.kill_switch_engaged", reconciled=reconciled)
             return summary
@@ -170,22 +172,33 @@ class StrategyWorker:
             else:
                 skipped.append(label)
 
-        header = (
-            f"Strategy tick. regime={regime.regime} "
-            f"vix={regime.vix:.2f} equity={account.equity}"
-        )
-        if transitioned:
-            header += " (regime changed since last tick)"
         rolled = sum(1 for r in rolls if r.reason == "rolled")
         held = len(rolls) - rolled
+        sub_line = (
+            f"Submitted: {len(submitted)}"
+            + (f" ({', '.join(submitted)})" if submitted else "")
+        )
+        skip_line = (
+            f"Skipped:   {len(skipped)}"
+            + (f" ({', '.join(skipped)})" if skipped else "")
+        )
+        fail_line = (
+            f"Failed:    {len(failed)}"
+            + (f" ({', '.join(failed)})" if failed else "")
+        )
         body_lines = [
             f"Reconciled: {reconciled} open orders.",
             f"Rolls:     {rolled} rolled, {held} held",
-            f"Submitted: {len(submitted)}" + (f" ({', '.join(submitted)})" if submitted else ""),
-            f"Skipped:   {len(skipped)}" + (f" ({', '.join(skipped)})" if skipped else ""),
-            f"Failed:    {len(failed)}" + (f" ({', '.join(failed)})" if failed else ""),
+            sub_line,
+            skip_line,
+            fail_line,
         ]
-        summary = header + "\n\n" + "\n".join(body_lines)
+        subtitle = (
+            f"regime={regime.regime} · VIX {regime.vix:.2f} · equity {account.equity}"
+        )
+        if transitioned:
+            subtitle += " · regime changed"
+        summary = header("Strategy Tick", subtitle) + "\n\n" + pre("\n".join(body_lines))
         await enqueue(summary, "info", channel="telegram")
         _log.info(
             "strategy.tick.completed",

@@ -10,6 +10,9 @@ from kai_trader.bot.formatting import (
     format_money,
     format_sgt_timestamp,
     format_signed_money,
+    header,
+    italic,
+    pre,
 )
 from kai_trader.bot.handlers._common import run_command
 from kai_trader.broker.alpaca import PositionSnapshot, list_positions
@@ -20,7 +23,7 @@ def _format_position(p: PositionSnapshot) -> str:
     avg = format_money(p.avg_entry_price)
     mark = format_money(p.current_price) if p.current_price is not None else "n/a"
     pl = format_signed_money(p.unrealized_pl) if p.unrealized_pl is not None else "n/a"
-    return f"{p.symbol} {p.qty} {p.side} avg {avg} mark {mark} pl {pl}"
+    return f"{p.symbol:<22} {p.qty:>4} {p.side:<5} avg {avg}  mark {mark}  pl {pl}"
 
 
 async def _build(_update: Update, _ctx: CommandContext) -> str:
@@ -28,11 +31,11 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
     ts = format_sgt_timestamp(settings.timezone)
     positions = await list_positions()
 
-    header = f"Alpaca positions. {ts}"
+    head = header("Open Positions", ts)
     if not positions:
-        return f"{header}\n\nNo open positions."
+        return f"{head}\n\n{italic('No open positions.')}"
     body = "\n".join(_format_position(p) for p in positions)
-    return f"{header}\n\n{body}"
+    return f"{head}\n\n{pre(body)}"
 
 
 async def handle(update: Update, tg_ctx: ContextTypes.DEFAULT_TYPE) -> None:
