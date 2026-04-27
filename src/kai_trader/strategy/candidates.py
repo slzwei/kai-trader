@@ -28,9 +28,34 @@ ChainFetcher = Callable[[str, date | None], Awaitable[list[OptionContract]]]
 _log = get_logger(__name__)
 
 
-PER_SYMBOL_CAP_PCT = Decimal("0.15")  # max 15% of equity per single underlying
 TOTAL_DEPLOYMENT_CAP_PCT = Decimal("0.70")  # max 70% of equity in CSP collateral
 MAX_CONTRACTS_PER_SYMBOL = 10  # hard ceiling regardless of sleeve headroom
+
+# Per-symbol concentration cap as a fraction of equity, scaled by account
+# size. Smaller accounts get a looser cap so a single CSP on a normal-priced
+# underlying (e.g. SPY at ~$580 strike = $58k collateral) can clear the
+# limit at all; large accounts tighten down for diversification. The total
+# deployment cap and the hard contract ceiling still bound risk.
+_PER_SYMBOL_CAP_TIERS: tuple[tuple[Decimal, Decimal], ...] = (
+    (Decimal("50000"), Decimal("1.00")),
+    (Decimal("150000"), Decimal("0.60")),
+    (Decimal("500000"), Decimal("0.30")),
+)
+_PER_SYMBOL_CAP_FLOOR = Decimal("0.15")
+
+
+def per_symbol_cap_pct(equity: Decimal) -> Decimal:
+    """Return the per-symbol cap fraction for the given equity.
+
+    Tiered so a $50k paper account can still take a single normal-priced
+    position while a $1M account stays diversified at 15%. The total
+    deployment cap (70%) and the per-symbol contract ceiling continue to
+    bound risk regardless of this value.
+    """
+    for threshold, pct in _PER_SYMBOL_CAP_TIERS:
+        if equity < threshold:
+            return pct
+    return _PER_SYMBOL_CAP_FLOOR
 
 
 @dataclass(frozen=True)
@@ -45,6 +70,8 @@ class SleeveDiagnostic:
     puts_in_dte_band: int
     puts_with_quotes: int
     intents_built: int
+    candidates_cap_rejected: int = 0
+    per_symbol_cap_dollars: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -68,6 +95,7 @@ class BuildDiagnostics:
         total_in_band = sum(s.puts_in_dte_band for s in active)
         total_with_quotes = sum(s.puts_with_quotes for s in active)
         total_intents = sum(s.intents_built for s in active)
+        total_cap_rejected = sum(s.candidates_cap_rejected for s in active)
         total_chains = sum(s.chains_fetched for s in active)
         if total_intents > 0:
             return []
@@ -87,6 +115,17 @@ class BuildDiagnostics:
             warnings.append(
                 f"in-band puts have no quotes ({total_in_band} matched DTE, "
                 f"none had bid+ask)"
+            )
+            return warnings
+        if total_cap_rejected > 0:
+            cap_dollars = max(
+                (s.per_symbol_cap_dollars for s in active if s.per_symbol_cap_dollars > 0),
+                default=Decimal("0"),
+            )
+            warnings.append(
+                f"all {total_cap_rejected} candidate(s) rejected by per-symbol "
+                f"cap (~${cap_dollars:.0f}). Strikes too expensive for the "
+                f"current account size."
             )
             return warnings
         return warnings
@@ -217,7 +256,7 @@ def _max_qty_for(
     per_contract_collateral = contract.strike * Decimal("100")
     if per_contract_collateral <= 0:
         return 0
-    per_symbol_cap = equity * PER_SYMBOL_CAP_PCT
+    per_symbol_cap = equity * per_symbol_cap_pct(equity)
     headroom = min(sleeve_remaining, total_remaining, per_symbol_cap)
     if headroom < per_contract_collateral:
         return 0
@@ -277,6 +316,7 @@ async def build_intents_with_diagnostics(
     today = today or datetime.now(UTC).date()
     equity = Decimal(str(account.equity))
     total_remaining = equity * TOTAL_DEPLOYMENT_CAP_PCT
+    per_symbol_cap_dollars = equity * per_symbol_cap_pct(equity)
     intents: list[TradeIntent] = []
     sleeve_diags: list[SleeveDiagnostic] = []
 
@@ -297,6 +337,8 @@ async def build_intents_with_diagnostics(
                     puts_in_dte_band=0,
                     puts_with_quotes=0,
                     intents_built=0,
+                    candidates_cap_rejected=0,
+                    per_symbol_cap_dollars=per_symbol_cap_dollars,
                 )
             )
             continue
@@ -311,6 +353,7 @@ async def build_intents_with_diagnostics(
         puts_in_dte_band = 0
         puts_with_quotes = 0
         intents_built_for_sleeve = 0
+        candidates_cap_rejected = 0
 
         # Phase 1: walk the whitelist, fetch each chain, pick a strike.
         ranked: list[tuple[OptionContract, Decimal]] = []
@@ -360,12 +403,15 @@ async def build_intents_with_diagnostics(
                 total_remaining=total_remaining,
             )
             if qty < 1:
+                candidates_cap_rejected += 1
                 _log.info(
                     "strategy.sleeve.no_fit",
                     sleeve=sleeve.sleeve,
                     symbol=contract.underlying,
                     sleeve_remaining=str(sleeve_remaining),
                     total_remaining=str(total_remaining),
+                    per_symbol_cap=str(per_symbol_cap_dollars),
+                    contract_collateral=str(contract.strike * Decimal("100")),
                 )
                 continue
 
@@ -387,6 +433,8 @@ async def build_intents_with_diagnostics(
                 puts_in_dte_band=puts_in_dte_band,
                 puts_with_quotes=puts_with_quotes,
                 intents_built=intents_built_for_sleeve,
+                candidates_cap_rejected=candidates_cap_rejected,
+                per_symbol_cap_dollars=per_symbol_cap_dollars,
             )
         )
 

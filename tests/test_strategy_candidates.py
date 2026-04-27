@@ -13,6 +13,7 @@ from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.strategy.candidates import (
     build_intents,
     build_intents_with_diagnostics,
+    per_symbol_cap_pct,
     select_put_strike,
     summarise_intents,
 )
@@ -341,10 +342,11 @@ async def test_build_intents_respects_total_deployment_cap() -> None:
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
-    # Each contract = $10k collateral. Per-symbol cap = $15k → 1 contract.
-    # Sleeve cap is huge so it does not bind. Total cap = 70% of $100k = $70k.
+    # $1M equity lands in the 15% per-symbol tier ($150k). Each contract =
+    # $100k collateral, so per-symbol cap binds at 1 contract per name.
+    # Sleeve cap is huge so it does not bind. Total cap = 70% of $1M = $700k.
     async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
-        return [_put(strike=100, delta=-0.30, expiration=expiry)]
+        return [_put(strike=1000, delta=-0.30, expiration=expiry)]
 
     intents = await build_intents(
         regime=_regime("risk_on"),
@@ -353,14 +355,14 @@ async def test_build_intents_respects_total_deployment_cap() -> None:
             whitelist=[f"SYM{i}" for i in range(10)],  # 10 symbols
             target_pct=Decimal("1.0"),
         )],
-        account=_account(equity=100_000),
+        account=_account(equity=1_000_000),
         chain_fetcher=fetcher,
         today=today,
     )
-    # Each symbol = 1 contract = $10k. Total cap = $70k → 7 symbols fit.
+    # Each symbol = 1 contract = $100k. Total cap = $700k → 7 symbols fit.
     assert len(intents) == 7
     total_collateral = sum(i.collateral for i in intents)
-    assert total_collateral == Decimal("70000")
+    assert total_collateral == Decimal("700000")
 
 
 async def test_build_intents_ranks_by_yield_within_sleeve() -> None:
@@ -585,3 +587,81 @@ def test_summarise_intents_includes_total_line() -> None:
     assert "1xP" in out
     assert "Total: 1 intents" in out
     assert "weighted yield" in out
+
+
+# ------------- per_symbol_cap_pct (dynamic by equity) -------------
+
+
+def test_per_symbol_cap_pct_tiny_account_unrestricted() -> None:
+    """Accounts under $50k get a 100% cap so a single CSP can fit at all."""
+    assert per_symbol_cap_pct(Decimal("10000")) == Decimal("1.00")
+    assert per_symbol_cap_pct(Decimal("49999")) == Decimal("1.00")
+
+
+def test_per_symbol_cap_pct_small_account_60pct() -> None:
+    """The $50k-$150k tier sits at 60%."""
+    assert per_symbol_cap_pct(Decimal("50000")) == Decimal("0.60")
+    assert per_symbol_cap_pct(Decimal("99911")) == Decimal("0.60")
+    assert per_symbol_cap_pct(Decimal("149999")) == Decimal("0.60")
+
+
+def test_per_symbol_cap_pct_mid_account_30pct() -> None:
+    assert per_symbol_cap_pct(Decimal("150000")) == Decimal("0.30")
+    assert per_symbol_cap_pct(Decimal("499999")) == Decimal("0.30")
+
+
+def test_per_symbol_cap_pct_large_account_15pct() -> None:
+    assert per_symbol_cap_pct(Decimal("500000")) == Decimal("0.15")
+    assert per_symbol_cap_pct(Decimal("10_000_000")) == Decimal("0.15")
+
+
+async def test_build_intents_at_small_account_takes_mid_priced_strike() -> None:
+    """At $99k equity the dynamic 60% cap unblocks names that the old 15%
+    cap would have rejected. AVGO-style $200 strike = $20k collateral."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=200, delta=-0.30, expiration=expiry, underlying="AVGO")]
+
+    # 40% sleeve = $39,964; old 15% per-symbol cap = $14,987 < $20k collateral
+    # → would have been rejected. New 60% cap = $59,946 → fits.
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "opportunistic", whitelist=["AVGO"], target_pct=Decimal("0.40")
+        )],
+        account=_account(equity=99_911),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert len(intents) == 1
+    assert intents[0].qty == 1
+    assert intents[0].collateral == Decimal("20000")
+
+
+async def test_diagnostics_flag_cap_rejection() -> None:
+    """When every candidate is too expensive for per-symbol cap, surface it."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    # $1M equity → 15% per-symbol cap = $150k. $2000 strike → $200k collateral.
+    # Sleeve has plenty of room (target_pct=1.0) but per-symbol cap blocks.
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=2000, delta=-0.30, expiration=expiry)]
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["EXPENSIVE"], target_pct=Decimal("1.0"))],
+        account=_account(equity=1_000_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert intents == []
+    sleeve = diag.sleeves[0]
+    assert sleeve.candidates_cap_rejected == 1
+    assert sleeve.per_symbol_cap_dollars == Decimal("150000")
+    warnings = diag.warning_lines()
+    assert len(warnings) == 1
+    assert "per-symbol cap" in warnings[0]
+    assert "150000" in warnings[0]

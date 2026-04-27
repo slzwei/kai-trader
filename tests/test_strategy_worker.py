@@ -241,9 +241,9 @@ async def test_tick_submits_when_flags_green(
     submit_args = _patch_dependencies["submit_short_put"].await_args
     # Limit price should be the contract bid.
     assert submit_args.kwargs["limit_price"] == Decimal("1.10")
-    # Phase 3.6: multi-contract within per-symbol cap (15% of $100k = $15k)
-    # at $5000 collateral per contract = 3 contracts.
-    assert submit_args.kwargs["qty"] == 3
+    # $100k equity lands in the 60% per-symbol tier ($60k), but the 40%
+    # sleeve cap binds first: $40k / $5000 collateral per contract = 8.
+    assert submit_args.kwargs["qty"] == 8
 
 
 async def test_tick_skipped_intent_records_skipped_status(
