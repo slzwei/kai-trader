@@ -47,7 +47,10 @@ from kai_trader.db.sleeve_config import SleeveConfig, get_all_sleeves
 from kai_trader.db.system_flags import get_all_flags
 from kai_trader.logging import get_logger
 from kai_trader.notifications.producer import enqueue
-from kai_trader.strategy.candidates import TradeIntent, build_intents
+from kai_trader.strategy.candidates import (
+    TradeIntent,
+    build_intents_with_diagnostics,
+)
 from kai_trader.strategy.clock import get_clock_snapshot
 from kai_trader.strategy.drawdown import check_and_trip as check_drawdown
 from kai_trader.strategy.regime import RegimeSnapshot, compute_and_record
@@ -151,7 +154,7 @@ class StrategyWorker:
         # capital is reflected in the sleeve cap math below.
         rolls = await self._handle_rolls(sleeves, regime, flags, today)
 
-        intents = await build_intents(
+        intents, diagnostics = await build_intents_with_diagnostics(
             regime=regime,
             sleeves=sleeves,
             account=account,
@@ -193,6 +196,8 @@ class StrategyWorker:
             skip_line,
             fail_line,
         ]
+        for warning in diagnostics.warning_lines():
+            body_lines.append(f"Warning:   {warning}")
         subtitle = (
             f"regime={regime.regime} · VIX {regime.vix:.2f} · equity {account.equity}"
         )

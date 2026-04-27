@@ -34,6 +34,65 @@ MAX_CONTRACTS_PER_SYMBOL = 10  # hard ceiling regardless of sleeve headroom
 
 
 @dataclass(frozen=True)
+class SleeveDiagnostic:
+    """Per-sleeve counters describing why intents were or were not built."""
+
+    sleeve: str
+    chains_fetched: int
+    chain_errors: int
+    puts_seen: int
+    puts_with_delta: int
+    puts_in_dte_band: int
+    puts_with_quotes: int
+    intents_built: int
+
+
+@dataclass(frozen=True)
+class BuildDiagnostics:
+    """Aggregate of per-sleeve diagnostics for one ``build_intents`` call.
+
+    Provides warning lines that surface the most common silent-failure modes.
+    The strategy worker appends these to its tick summary so an empty intent
+    list never goes unexplained.
+    """
+
+    sleeves: list[SleeveDiagnostic]
+
+    def warning_lines(self) -> list[str]:
+        active = [s for s in self.sleeves if s.chains_fetched > 0]
+        if not active:
+            return []
+        warnings: list[str] = []
+        total_puts = sum(s.puts_seen for s in active)
+        total_with_delta = sum(s.puts_with_delta for s in active)
+        total_in_band = sum(s.puts_in_dte_band for s in active)
+        total_with_quotes = sum(s.puts_with_quotes for s in active)
+        total_intents = sum(s.intents_built for s in active)
+        total_chains = sum(s.chains_fetched for s in active)
+        if total_intents > 0:
+            return []
+        if total_puts > 0 and total_with_delta == 0:
+            warnings.append(
+                f"options feed missing greeks ({total_puts} puts across "
+                f"{total_chains} chains, none with delta)"
+            )
+            return warnings
+        if total_with_delta > 0 and total_in_band == 0:
+            warnings.append(
+                f"no expirations in sleeve DTE band "
+                f"({total_with_delta} puts had delta, none in band)"
+            )
+            return warnings
+        if total_in_band > 0 and total_with_quotes == 0:
+            warnings.append(
+                f"in-band puts have no quotes ({total_in_band} matched DTE, "
+                f"none had bid+ask)"
+            )
+            return warnings
+        return warnings
+
+
+@dataclass(frozen=True)
 class TradeIntent:
     """A would-be cash-secured put trade for one symbol/expiration."""
 
@@ -183,22 +242,43 @@ async def build_intents(
 ) -> list[TradeIntent]:
     """Walk active sleeves and produce intent rows up to the cap matrix.
 
+    Backwards-compatible thin wrapper. Callers that also need diagnostic
+    counters should use :func:`build_intents_with_diagnostics`.
+    """
+    intents, _diag = await build_intents_with_diagnostics(
+        regime=regime,
+        sleeves=sleeves,
+        account=account,
+        chain_fetcher=chain_fetcher,
+        today=today,
+    )
+    return intents
+
+
+async def build_intents_with_diagnostics(
+    regime: RegimeSnapshot,
+    sleeves: list[SleeveConfig],
+    account: AccountSnapshot,
+    chain_fetcher: ChainFetcher,
+    *,
+    today: date | None = None,
+) -> tuple[list[TradeIntent], BuildDiagnostics]:
+    """Build intents and return the per-sleeve diagnostic counters alongside.
+
     Multi-contract per symbol allowed within the per-symbol concentration
     cap (15% of equity by default) and the total deployment cap (70% of
     equity). The total cap covers the whole portfolio, not per sleeve.
 
     Within each sleeve, candidates are ranked by per-share yield
-    (mid / strike) descending and greedy-filled in that order. This
-    concentrates capital in the week's highest-IV opportunities while
-    keeping the sleeve allocation discipline. Across sleeves, order is
-    the canonical sleeve sequence (index_core, stable_largecap,
-    opportunistic) so each sleeve gets its budgeted share of the total
-    deployment cap.
+    (mid / strike) descending and greedy-filled in that order. Diagnostic
+    counters are accumulated as the chain is walked so an empty result can
+    be explained without re-running the loop.
     """
     today = today or datetime.now(UTC).date()
     equity = Decimal(str(account.equity))
     total_remaining = equity * TOTAL_DEPLOYMENT_CAP_PCT
     intents: list[TradeIntent] = []
+    sleeve_diags: list[SleeveDiagnostic] = []
 
     for sleeve in sleeves:
         if not _is_sleeve_active(sleeve, regime.regime):
@@ -207,18 +287,38 @@ async def build_intents(
                 sleeve=sleeve.sleeve,
                 regime=regime.regime,
             )
+            sleeve_diags.append(
+                SleeveDiagnostic(
+                    sleeve=sleeve.sleeve,
+                    chains_fetched=0,
+                    chain_errors=0,
+                    puts_seen=0,
+                    puts_with_delta=0,
+                    puts_in_dte_band=0,
+                    puts_with_quotes=0,
+                    intents_built=0,
+                )
+            )
             continue
 
         target_delta = _target_delta_for(sleeve, regime.regime)
         sleeve_remaining = equity * sleeve.target_pct
 
+        chains_fetched = 0
+        chain_errors = 0
+        puts_seen = 0
+        puts_with_delta = 0
+        puts_in_dte_band = 0
+        puts_with_quotes = 0
+        intents_built_for_sleeve = 0
+
         # Phase 1: walk the whitelist, fetch each chain, pick a strike.
-        # Build a list of (contract, per_share_yield) that survived.
         ranked: list[tuple[OptionContract, Decimal]] = []
         for symbol in sleeve.symbol_whitelist:
             try:
                 chain = await chain_fetcher(symbol, None)
             except Exception as exc:
+                chain_errors += 1
                 _log.warning(
                     "strategy.chain_fetch.failed",
                     sleeve=sleeve.sleeve,
@@ -226,6 +326,20 @@ async def build_intents(
                     error=str(exc),
                 )
                 continue
+            chains_fetched += 1
+            for c in chain:
+                if c.option_type != "put":
+                    continue
+                puts_seen += 1
+                if c.delta is None:
+                    continue
+                puts_with_delta += 1
+                if not _within_dte_band(c.expiration, today, sleeve):
+                    continue
+                puts_in_dte_band += 1
+                if c.bid is None or c.ask is None:
+                    continue
+                puts_with_quotes += 1
             contract = select_put_strike(chain, target_delta, sleeve, today)
             if contract is None or contract.bid is None or contract.ask is None:
                 continue
@@ -261,8 +375,22 @@ async def build_intents(
             sleeve_remaining -= intent.collateral
             total_remaining -= intent.collateral
             intents.append(intent)
+            intents_built_for_sleeve += 1
 
-    return intents
+        sleeve_diags.append(
+            SleeveDiagnostic(
+                sleeve=sleeve.sleeve,
+                chains_fetched=chains_fetched,
+                chain_errors=chain_errors,
+                puts_seen=puts_seen,
+                puts_with_delta=puts_with_delta,
+                puts_in_dte_band=puts_in_dte_band,
+                puts_with_quotes=puts_with_quotes,
+                intents_built=intents_built_for_sleeve,
+            )
+        )
+
+    return intents, BuildDiagnostics(sleeves=sleeve_diags)
 
 
 def summarise_intents(intents: list[TradeIntent]) -> str:

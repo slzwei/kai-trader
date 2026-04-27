@@ -12,6 +12,7 @@ from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.strategy.candidates import (
     build_intents,
+    build_intents_with_diagnostics,
     select_put_strike,
     summarise_intents,
 )
@@ -435,6 +436,137 @@ async def test_build_intents_max_contracts_per_symbol_ceiling() -> None:
         today=today,
     )
     assert intents[0].qty == 10
+
+
+# ------------- diagnostics -------------
+
+
+async def test_diagnostics_flag_missing_greeks() -> None:
+    """Every put coming back without a delta surfaces the 'missing greeks' warning."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(strike=490, delta=-0.30, expiration=expiry),
+            _put(strike=485, delta=-0.40, expiration=expiry),
+        ]
+
+    # Strip deltas off the puts to mimic Alpaca's free options feed.
+    async def feedless(symbol: str, exp: Any) -> list[OptionContract]:
+        out = []
+        for c in await fetcher(symbol, exp):
+            out.append(
+                OptionContract(
+                    symbol=c.symbol,
+                    underlying=c.underlying,
+                    option_type=c.option_type,
+                    strike=c.strike,
+                    expiration=c.expiration,
+                    bid=c.bid,
+                    ask=c.ask,
+                    last=c.last,
+                    delta=None,
+                    gamma=None, theta=None, vega=None,
+                    implied_volatility=None,
+                )
+            )
+        return out
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["SPY", "QQQ"])],
+        account=_account(),
+        chain_fetcher=feedless,
+        today=today,
+    )
+    assert intents == []
+    sleeve = diag.sleeves[0]
+    assert sleeve.chains_fetched == 2
+    assert sleeve.puts_seen == 4
+    assert sleeve.puts_with_delta == 0
+    warnings = diag.warning_lines()
+    assert len(warnings) == 1
+    assert "missing greeks" in warnings[0]
+
+
+async def test_diagnostics_flag_dte_band_miss() -> None:
+    """Puts with deltas but no expiration in the sleeve DTE band."""
+    today = date(2026, 4, 27)
+    out_of_band = today + timedelta(days=30)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=490, delta=-0.30, expiration=out_of_band)]
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["SPY"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert intents == []
+    warnings = diag.warning_lines()
+    assert len(warnings) == 1
+    assert "DTE band" in warnings[0]
+
+
+async def test_diagnostics_flag_no_quotes() -> None:
+    """In-band puts with delta but no bid/ask still surface a warning."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=490, delta=-0.30, expiration=expiry, bid=None, ask=None)]
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["SPY"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert intents == []
+    warnings = diag.warning_lines()
+    assert len(warnings) == 1
+    assert "no quotes" in warnings[0]
+
+
+async def test_diagnostics_no_warning_when_intents_built() -> None:
+    """Successful intent construction silences the diagnostic line."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=50, delta=-0.30, expiration=expiry)]
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["SPY"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert len(intents) == 1
+    assert diag.warning_lines() == []
+
+
+async def test_diagnostics_skipped_sleeve_does_not_warn() -> None:
+    """risk_off skips every sleeve; the empty result is intentional, not a warning."""
+    today = date(2026, 4, 27)
+    chain_fetcher = AsyncMock(return_value=[])
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_off"),
+        sleeves=[_sleeve("index_core", whitelist=["SPY"])],
+        account=_account(),
+        chain_fetcher=chain_fetcher,
+        today=today,
+    )
+    assert intents == []
+    assert diag.warning_lines() == []
+
+
+# ------------- summarise_intents -------------
 
 
 def test_summarise_intents_empty() -> None:

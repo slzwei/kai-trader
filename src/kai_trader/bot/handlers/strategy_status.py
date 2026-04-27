@@ -21,7 +21,10 @@ from kai_trader.broker.options_data import get_chain
 from kai_trader.config import get_settings
 from kai_trader.db.sleeve_config import get_all_sleeves
 from kai_trader.db.system_flags import get_all_flags
-from kai_trader.strategy.candidates import build_intents, summarise_intents
+from kai_trader.strategy.candidates import (
+    build_intents_with_diagnostics,
+    summarise_intents,
+)
 from kai_trader.strategy.clock import get_clock_snapshot
 from kai_trader.strategy.regime import evaluate
 
@@ -35,7 +38,7 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
     regime = await evaluate()
     account = await get_account()
     sleeves = await get_all_sleeves()
-    intents = await build_intents(
+    intents, diagnostics = await build_intents_with_diagnostics(
         regime=regime,
         sleeves=sleeves,
         account=account,
@@ -61,6 +64,8 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
         parts.append(pre(summarise_intents(intents)))
     else:
         parts.append(italic(summarise_intents(intents)))
+    for warning in diagnostics.warning_lines():
+        parts.append(italic(f"Warning: {warning}"))
     return "\n".join(parts)
 
 
