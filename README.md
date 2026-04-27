@@ -1,9 +1,10 @@
 # Kai Trader
 
 Automated options wheel trading, monitored and controlled through Telegram.
-This repo is currently at **Phase 1: Foundation + Telegram bot skeleton**.
-No trading logic or broker integration yet. The bot answers read-only
-commands and audits every message.
+Phases 1, 2, and 3 (read-only Alpaca + flag surface + wheel strategy with
+order placement and roll/close logic) have shipped. Phase 4 adds a
+conversational Telegram bot ("Kai") with an approval flow for any change to
+trades, params, or watchlists.
 
 ## What this is
 
@@ -28,15 +29,27 @@ cd kai-trader
 
 # 2. Create your local .env
 cp .env.example .env
-# then edit .env and fill in the five required values:
+# then edit .env and fill in the required values:
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID,
-#   SUPABASE_URL, SUPABASE_DB_PASSWORD, SUPABASE_KEY
+#   SUPABASE_URL, SUPABASE_DB_PASSWORD, SUPABASE_KEY,
+#   ALPACA_API_KEY, ALPACA_SECRET_KEY,
+#   ANTHROPIC_API_KEY (for the chat handler),
+#   KAI_CHAT_RO_PASSWORD (for the read-only DB role).
 
 # 3. Install dependencies
 uv sync --extra dev
 
 # 4. Apply database migrations
 uv run python scripts/apply_migrations.py
+
+# 5. (One-time) Bootstrap the read-only Postgres role used by the chat
+#    layer. The script reads KAI_CHAT_RO_PASSWORD from the env. Re-run
+#    whenever you rotate the password.
+KAI_CHAT_RO_PASSWORD="$(grep KAI_CHAT_RO_PASSWORD .env | cut -d= -f2-)" \
+  uv run python scripts/create_chat_ro_role.py
+
+# 6. Set DATABASE_URL_RO in your .env to the same Supabase pooler URL
+#    you use for DATABASE_URL, but with kai_chat_ro / KAI_CHAT_RO_PASSWORD.
 ```
 
 The migration script is idempotent. Run it again whenever new `.sql` files
@@ -52,13 +65,15 @@ Then message `/start` to your bot from your whitelisted Telegram account.
 Non-whitelisted users are silently ignored; they get no reply at all, by
 design.
 
-Available commands in Phase 1:
+Slash commands cover read paths (account, positions, regime, sleeves,
+chain, history, etc.) and explicit operator actions (`/flag`, `/kill`,
+`/close`, `/trade_now`). Free-form text from the owner is routed to
+Kai, the conversational layer, which can read repo files, query the
+read-only DB, hit Alpaca read endpoints, and **propose** changes via
+inline Approve / Reject / Modify buttons. Kai never writes trades or
+params directly.
 
-- `/start` . wake check, echoes your Telegram ID
-- `/help` . command list
-- `/health` . bot uptime, Postgres ping, env completeness, SGT timestamp
-- `/status` . mocked portfolio summary (clearly labelled)
-- `/positions` . placeholder until the trading engine ships
+Run `/help` from your bot for the live command list.
 
 ## Run the tests
 
@@ -71,6 +86,14 @@ uv run mypy --strict src/
 The suite targets 80%+ coverage and currently sits around 92%. One
 integration test hits the live Supabase; it is skipped unless you set
 `SUPABASE_INTEGRATION_TEST=1` in your environment.
+
+## Render deployment
+
+`render.yaml` declares a single Background Worker (no inbound HTTP because
+the bot uses Telegram long-polling). The Background Worker stays up across
+idle periods, which matters for the chat handler and event dispatcher.
+Secrets (every `sync: false` key) are pasted into the Render dashboard and
+never committed.
 
 ## MCP integration
 

@@ -9,11 +9,20 @@ from __future__ import annotations
 import asyncio
 
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, Defaults
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    Defaults,
+    MessageHandler,
+    filters,
+)
 
 from kai_trader.bot.handlers import (
     account,
+    approval,
     chain,
+    chat,
     close,
     flag,
     flags,
@@ -35,12 +44,15 @@ from kai_trader.bot.handlers import (
 from kai_trader.bot.handlers import help as help_handler
 from kai_trader.config import Settings, get_settings
 from kai_trader.db.client import close_pool, get_pool
+from kai_trader.db.readonly import close_readonly_pool
+from kai_trader.events.dispatcher import EventDispatcher, build_owner_send
 from kai_trader.logging import configure_logging, get_logger
 from kai_trader.notifications.worker import NotificationWorker
 from kai_trader.strategy.worker import StrategyWorker
 
 _worker: NotificationWorker | None = None
 _strategy_worker: StrategyWorker | None = None
+_event_dispatcher: EventDispatcher | None = None
 
 
 def build_application(settings: Settings) -> Application:  # type: ignore[type-arg]
@@ -79,12 +91,18 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CommandHandler("close", close.handle_close))
     app.add_handler(CommandHandler("close_confirm", close.handle_confirm))
 
+    # Free-form text from the owner is routed to the conversational
+    # chat handler. Slash commands are matched by the CommandHandlers
+    # above; everything else falls through to chat.handle.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat.handle))
+    app.add_handler(CallbackQueryHandler(approval.handle))
+
     return app
 
 
 async def _startup(app: Application) -> None:  # type: ignore[type-arg]
-    """Prime DB pool, then spin up the notification + strategy workers."""
-    global _worker, _strategy_worker
+    """Prime DB pool, then spin up the notification + strategy + event workers."""
+    global _worker, _strategy_worker, _event_dispatcher
     await get_pool()
 
     settings = get_settings()
@@ -99,15 +117,22 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     _strategy_worker = StrategyWorker()
     await _strategy_worker.start()
 
+    _event_dispatcher = EventDispatcher(build_owner_send(app, owner_id))
+    await _event_dispatcher.start()
+
 
 async def _shutdown(_app: Application) -> None:  # type: ignore[type-arg]
-    global _worker, _strategy_worker
+    global _worker, _strategy_worker, _event_dispatcher
+    if _event_dispatcher is not None:
+        await _event_dispatcher.stop()
+        _event_dispatcher = None
     if _strategy_worker is not None:
         await _strategy_worker.stop()
         _strategy_worker = None
     if _worker is not None:
         await _worker.stop()
         _worker = None
+    await close_readonly_pool()
     await close_pool()
 
 

@@ -3,6 +3,94 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-27 . Phase 4: Conversational bot + approval flow
+
+Plus a small precursor commit fixing a silent failure in the strategy
+loop: the bot was building zero candidate intents every tick because
+Alpaca's free options feed returns no greeks, and `select_put_strike`
+drops every contract whose `delta is None`. Added per-sleeve diagnostic
+counters to `build_intents` and a single warning line in the tick
+summary so the operator sees `options feed missing greeks (12530 puts
+across 1 chains, none with delta)` instead of silent zeros. Same
+warning surfaces in `/strategy_status`. Real fix is to upgrade Alpaca
+to Algo Trader Plus so greeks populate.
+
+Phase 4 shipped:
+
+- Migrations 011-014: `chat_history`, `decision_log`, `events`,
+  `pending_changes`. All idempotent, all checksum-stable.
+- `scripts/create_chat_ro_role.py` (one-shot, password from
+  `KAI_CHAT_RO_PASSWORD`) creates and grants SELECT on every public
+  table to `kai_chat_ro`. Re-run safely to rotate the password.
+- `db/readonly.py`: second asyncpg pool keyed off `DATABASE_URL_RO`,
+  with a `run_readonly_select` that rejects anything other than a
+  single SELECT/WITH inside a `default_transaction_read_only=on`
+  transaction with a statement timeout. Fail-closed when the DSN is
+  unset.
+- New `chat` package: `client.py` wraps `AsyncAnthropic` with prompt
+  caching markers on the system prompt and tool definitions;
+  `tools.py` exposes `read_file`, `list_dir`, `grep_repo`,
+  `query_supabase`, `alpaca_read`, `recent_decisions`, `git_log`, and
+  `propose_change`; `conversation.py` runs the multi-turn tool loop
+  with a hard cap of 8 iterations and history compaction at 40 turns;
+  `chunker.py` splits replies on paragraph then sentence boundaries;
+  `locks.py` per-owner asyncio.Lock registry.
+- `bot/handlers/chat.py` routes any non-slash text from the owner to
+  the conversation orchestrator, holds the per-user lock, refreshes
+  the typing indicator every 4 seconds, and chunks long replies.
+- `bot/handlers/approval.py` is a `CallbackQueryHandler` for the
+  inline keyboard. Approve runs `approvals.applier.apply_pending`,
+  writes a `decision_log` row, marks status applied (or failed). All
+  outcomes append a `system` row to `chat_history` so Kai sees the
+  result on the next turn. Stranger callbacks silent-ignore.
+- `approvals/applier.py` handles three kinds: `order` is a stub
+  (Phase 4 deliberately does not place orders; Phase 5 will), and
+  `strategy_param` and `watchlist_edit` go through the existing
+  `db.sleeve_config.update_sleeve` allow-list.
+- `events/dispatcher.py` mirrors the notification worker pattern:
+  poll every 5s, claim a batch with `for update skip locked`, render
+  each via `events/render.py`, send through a closure over
+  `app.bot.send_message`, mark dispatched. Pending-change events
+  render with inline buttons keyed `pc:approve|reject|modify:<id>`.
+- `bot/main.py` registers the new `MessageHandler` and
+  `CallbackQueryHandler`, starts the `EventDispatcher` alongside the
+  notification + strategy workers, and closes the read-only pool on
+  shutdown.
+- `Dockerfile` now installs `git` so the `git_log` tool degrades
+  cleanly even though `.dockerignore` excludes `.git` (the deployed
+  container runs without commit history; `git_log` returns a polite
+  error message instead of crashing).
+- `render.yaml` adds `ANTHROPIC_API_KEY` and `DATABASE_URL_RO` as
+  `sync: false` envs. Service stays a Background Worker (no inbound
+  HTTP, long-polling, idle-tolerant).
+
+Tests: 393 passing, 2 skipped, 91% coverage. New suites:
+`test_chat_db.py` (19), `test_chat_readonly.py` (8),
+`test_chat_chunker.py` (6), `test_chat_locks.py` (3),
+`test_chat_tools.py` (21), `test_chat_conversation.py` (8),
+`test_approvals_applier.py` (6), `test_events_dispatcher_render.py`
+(12), `test_handler_chat.py` (6), `test_handler_approval.py` (9).
+The Anthropic SDK is mocked in conversation tests; real API calls
+gated behind separate integration tests would land in a follow-up.
+
+Open follow-ups:
+
+- Phase 5 wires real order placement into `applier._apply_order`
+  (currently a stub returning `{"stub": True}`). The trading engine
+  will read `pending_changes` rows of kind `order` and submit through
+  `broker.alpaca.submit_short_put`, then write a `decision_log` row
+  with the Alpaca order id.
+- Streaming chat replies (currently one-shot).
+- Voice / image input. Out of scope.
+
+To use Phase 4 once the env is configured:
+
+  1. Apply migrations: `uv run python scripts/apply_migrations.py`
+  2. Bootstrap the read-only role:
+     `KAI_CHAT_RO_PASSWORD=... uv run python scripts/create_chat_ro_role.py`
+  3. Set `ANTHROPIC_API_KEY` and `DATABASE_URL_RO` in `.env`.
+  4. Restart the bot. Send any plain text from your Telegram account.
+
 ## 2026-04-27 . Phase 3.6: Recalibrate for 3% monthly target
 
 After verifying 3.5, the original 3.2 calibration looked too tight on

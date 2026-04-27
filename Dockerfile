@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
 # uv installer is the official Astral one. Pinned via the install URL,
 # which gives us a reproducible binary on container build.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get install -y --no-install-recommends curl ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
     && ln -s /root/.local/bin/uv /usr/local/bin/uv

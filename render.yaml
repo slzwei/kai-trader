@@ -39,3 +39,7 @@ services:
         sync: false
       - key: ALPACA_SECRET_KEY
         sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DATABASE_URL_RO
+        sync: false

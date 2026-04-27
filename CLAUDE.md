@@ -162,6 +162,10 @@ kai-trader/
 | ENV                   | no       | `dev`, `staging`, or `prod`. Default `dev`.        |
 | LOG_LEVEL             | no       | `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default INFO. |
 | TIMEZONE              | no       | IANA name. Default `Asia/Singapore`.               |
+| ANTHROPIC_API_KEY     | for chat | Required for the conversational handler. Without it, free-form messages return a "not configured" reply and slash commands continue to work. |
+| CHAT_MODEL            | no       | Override the chat model. Default `claude-sonnet-4-6`. |
+| DATABASE_URL_RO       | for chat | Read-only DSN for the chat tool layer. Authenticate as `kai_chat_ro`. Without it, `query_supabase` fails closed. |
+| KAI_CHAT_RO_PASSWORD  | bootstrap | Used by `scripts/create_chat_ro_role.py` to create or rotate the `kai_chat_ro` role. Not read at runtime by the bot. |
 
 ## Conventions
 
@@ -180,10 +184,52 @@ kai-trader/
   with placeholder values.
 - Migrations are plain SQL, numbered, idempotent. Applied in filename order.
   `schema_migrations` tracks what has been run.
+- Free-form text from the owner is routed to Kai (the conversational
+  handler). Slash commands stay authoritative; the LLM is for inspection
+  and for proposing changes.
+- Kai's tool layer is the **only** path to data. The system prompt enforces
+  grounding. Reads go through the read-only `kai_chat_ro` role.
+- Anything that mutates trades, params, or watchlists must go through
+  `pending_changes`. The applier (the only writer outside the trading
+  engine) lives in `kai_trader.approvals.applier` and writes a
+  `decision_log` row for every applied change.
+- Outbound notifications that are not direct chat replies go through the
+  `events` table and the `EventDispatcher` worker. The existing
+  `notifications` queue stays for plain-text strategy heartbeats.
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6 shipped (Phase 3 complete + recalibrated):
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, **and 4** shipped:
+
+- Phase 4 ships the conversational chat handler, the read-only DB role,
+  the approval flow, and the proactive event dispatcher. `migrations/
+  011-014` add `chat_history`, `decision_log`, `events`,
+  `pending_changes`. `scripts/create_chat_ro_role.py` (run once after
+  migrations) creates the `kai_chat_ro` Postgres role used by the chat
+  tool layer's `query_supabase` tool.
+- New modules: `kai_trader/chat/{client,tools,conversation,system_prompt,
+  chunker,locks}.py`, `kai_trader/db/{chat_history,decision_log,events,
+  pending_changes,readonly}.py`, `kai_trader/approvals/applier.py`,
+  `kai_trader/events/{dispatcher,render}.py`,
+  `kai_trader/bot/handlers/{chat,approval}.py`.
+- Free-form Telegram text from the owner is routed to
+  `chat.conversation.handle_message`, which calls
+  `claude-sonnet-4-6` via the official `anthropic` SDK with prompt
+  caching on the system prompt and tool definitions. The tool surface is
+  read-only with one exception: `propose_change` writes a row to
+  `pending_changes` (status=pending) and enqueues a
+  `pending_change_created` event.
+- The `EventDispatcher` worker drains `events`, renders each into a
+  Telegram message (with inline Approve / Reject / Modify buttons for
+  pending changes), and marks dispatched. The `CallbackQueryHandler`
+  routes the click, runs the applier on Approve, and writes a
+  `decision_log` row.
+- Per-user `asyncio.Lock` (in `chat.locks`) serialises concurrent chat
+  messages from the same owner. The chat handler keeps the typing
+  indicator alive via a 4-second refresh task and chunks long replies on
+  paragraph boundaries to fit Telegram's 4096-char limit.
+
+Earlier phases unchanged:
 
 - Repo scaffolding, typed config, structlog, pyproject.
 - Ten SQL migrations: system flags, bot commands, notifications, positions,

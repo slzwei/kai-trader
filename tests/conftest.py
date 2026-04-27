@@ -36,6 +36,8 @@ def _env(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     monkeypatch.setenv("ALPACA_API_KEY", "PKTEST00000000000000")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test-alpaca-secret")
     monkeypatch.setenv("ALPACA_PAPER", "true")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
+    monkeypatch.setenv("DATABASE_URL_RO", "postgresql://kai_chat_ro:test@localhost:5432/test")
     monkeypatch.setenv("ENV", "dev")
     monkeypatch.setenv("LOG_LEVEL", "INFO")
     monkeypatch.setenv("TIMEZONE", "Asia/Singapore")

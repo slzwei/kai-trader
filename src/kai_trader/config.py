@@ -60,6 +60,32 @@ class Settings(BaseSettings):
         ),
     )
 
+    anthropic_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        alias="ANTHROPIC_API_KEY",
+        description="Required for the conversational chat handler. When unset, /help still works but free-form messages are ignored.",
+    )
+    chat_model: str = Field(
+        default="claude-sonnet-4-6",
+        alias="CHAT_MODEL",
+        description="Claude model id used by the chat handler.",
+    )
+    chat_max_tokens: int = Field(default=1500, alias="CHAT_MAX_TOKENS")
+    chat_history_keep: int = Field(default=20, alias="CHAT_HISTORY_KEEP")
+    chat_history_compact_threshold: int = Field(
+        default=40,
+        alias="CHAT_HISTORY_COMPACT_THRESHOLD",
+    )
+    database_url_ro: SecretStr | None = Field(
+        default=None,
+        alias="DATABASE_URL_RO",
+        description=(
+            "Read-only Postgres DSN used by the chat tool layer. Should "
+            "authenticate as the kai_chat_ro role. When unset, query_supabase "
+            "tool calls fail closed."
+        ),
+    )
+
     env: Environment = Field(default="dev", alias="ENV")
     log_level: LogLevel = Field(default="INFO", alias="LOG_LEVEL")
     timezone: str = Field(default="Asia/Singapore", alias="TIMEZONE")
@@ -97,6 +123,7 @@ class Settings(BaseSettings):
 
     def env_completeness(self) -> dict[str, bool]:
         """Lightweight presence check used by the /health command."""
+        ro = self.database_url_ro
         return {
             "TELEGRAM_BOT_TOKEN": bool(self.telegram_bot_token.get_secret_value()),
             "TELEGRAM_OWNER_ID": self.telegram_owner_id > 0,
@@ -105,6 +132,8 @@ class Settings(BaseSettings):
             "SUPABASE_KEY": self.supabase_key.get_secret_value() not in ("", "unset"),
             "ALPACA_API_KEY": bool(self.alpaca_api_key.get_secret_value()),
             "ALPACA_SECRET_KEY": bool(self.alpaca_secret_key.get_secret_value()),
+            "ANTHROPIC_API_KEY": bool(self.anthropic_api_key.get_secret_value()),
+            "DATABASE_URL_RO": bool(ro.get_secret_value()) if ro is not None else False,
         }
 
 
