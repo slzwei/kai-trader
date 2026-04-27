@@ -18,6 +18,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
+from alpaca.data.enums import OptionsFeed
 from alpaca.data.historical import OptionHistoricalDataClient
 from alpaca.data.requests import OptionChainRequest
 
@@ -139,7 +140,10 @@ async def get_chain(
     """
     upper = underlying.upper()
     client = _get_client()
-    request_kwargs: dict[str, Any] = {"underlying_symbol": upper}
+    request_kwargs: dict[str, Any] = {
+        "underlying_symbol": upper,
+        "feed": OptionsFeed.OPRA,
+    }
     if expiration is not None:
         request_kwargs["expiration_date"] = expiration
     request = OptionChainRequest(**request_kwargs)
