@@ -49,10 +49,12 @@ from kai_trader.events.dispatcher import EventDispatcher, build_owner_send
 from kai_trader.logging import configure_logging, get_logger
 from kai_trader.notifications.worker import NotificationWorker
 from kai_trader.strategy.worker import StrategyWorker
+from kai_trader.streams.trading_stream import TradingStreamWorker
 
 _worker: NotificationWorker | None = None
 _strategy_worker: StrategyWorker | None = None
 _event_dispatcher: EventDispatcher | None = None
+_trading_stream: TradingStreamWorker | None = None
 
 
 def build_application(settings: Settings) -> Application:  # type: ignore[type-arg]
@@ -101,8 +103,8 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
 
 
 async def _startup(app: Application) -> None:  # type: ignore[type-arg]
-    """Prime DB pool, then spin up the notification + strategy + event workers."""
-    global _worker, _strategy_worker, _event_dispatcher
+    """Prime DB pool, then spin up notification + strategy + event + stream workers."""
+    global _worker, _strategy_worker, _event_dispatcher, _trading_stream
     await get_pool()
 
     settings = get_settings()
@@ -120,9 +122,15 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     _event_dispatcher = EventDispatcher(build_owner_send(app, owner_id))
     await _event_dispatcher.start()
 
+    _trading_stream = TradingStreamWorker(settings=settings)
+    await _trading_stream.start()
+
 
 async def _shutdown(_app: Application) -> None:  # type: ignore[type-arg]
-    global _worker, _strategy_worker, _event_dispatcher
+    global _worker, _strategy_worker, _event_dispatcher, _trading_stream
+    if _trading_stream is not None:
+        await _trading_stream.stop()
+        _trading_stream = None
     if _event_dispatcher is not None:
         await _event_dispatcher.stop()
         _event_dispatcher = None

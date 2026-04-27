@@ -3,6 +3,35 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-04-28 . Phase 5c: TradingStream for real-time fill notifications
+
+Push-based fill awareness via Alpaca's WebSocket. Replaces the up-to-5-minute
+delay between a fill on Alpaca and Shawn seeing it in Telegram, while
+keeping the periodic `_reconcile_pending` as a fallback.
+
+- New package `kai_trader/streams/`. `trading_stream.py` owns one
+  persistent connection to Alpaca's `trade_updates` channel.
+- Reconnect with exponential backoff capped at 60s; consecutive-failure
+  counter logged on each disconnect. Heartbeat task logs status every
+  60s while connected so silent stream failures are visible.
+- Event handler `_on_trade_update`:
+  - `fill` -> orders row status=filled, filled_avg_price + filled_at
+    populated, Telegram notification "Fill: SYM side qty @ price".
+  - `partial_fill` -> fill data updated but status unchanged (stays
+    submitted until full fill). Telegram notification "Partial fill".
+  - `canceled` / `expired` -> status=cancelled, no notification.
+  - `rejected` -> status=failed, no notification.
+- Broad-except wrapper around the handler so a single bad message
+  cannot kill the consumer task.
+- Wired into `bot/main.py` startup/shutdown alongside the existing
+  workers. Order: DB pool -> notifications -> strategy -> events ->
+  trading stream.
+
+Tests: 17 new (event extraction, status mapping, handler routing for
+each event type, lifecycle including idempotent start and reconnect
+backoff, DB-side SQL routing for terminal vs partial). Suite total
+459 passing, 90% coverage. ruff + mypy strict clean.
+
 ## 2026-04-28 . Phase 5b: Profit-take execution
 
 Captures the defensive wheel's premium-decay edge: close CSPs when

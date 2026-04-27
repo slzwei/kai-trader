@@ -199,8 +199,19 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, **and 5b** shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, **and 5c** shipped:
 
+- Phase 5c ships the `TradingStream` WebSocket worker for real-time
+  fill notifications. New package `kai_trader/streams/` with
+  `trading_stream.py:TradingStreamWorker`. Subscribes to Alpaca's
+  `trade_updates` channel; on each event, applies the matching
+  `orders` row mutation (status, filled_at, filled_avg_price) and
+  enqueues a Telegram notification for fill / partial_fill via the
+  existing notifications producer. Reconnects with exponential
+  backoff (cap 60s); heartbeat logs every 60s while connected. The
+  strategy worker's periodic `_reconcile_pending` stays as belt
+  and suspenders. Wired into `bot/main.py` startup/shutdown
+  alongside the other workers.
 - Phase 5b adds profit-take execution. Migration
   `016_profit_take_close_action.sql` extends `orders.action` to admit
   `profit_take_close`. `broker/alpaca.py` adds `submit_buy_to_close`
