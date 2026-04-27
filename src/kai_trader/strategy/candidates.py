@@ -166,6 +166,13 @@ def _max_qty_for(
     return min(qty, MAX_CONTRACTS_PER_SYMBOL)
 
 
+def _per_share_yield(contract: OptionContract) -> Decimal:
+    """Mid price as a fraction of strike. Used to rank candidates within a sleeve."""
+    assert contract.bid is not None and contract.ask is not None
+    mid = (contract.bid + contract.ask) / Decimal("2")
+    return mid / contract.strike
+
+
 async def build_intents(
     regime: RegimeSnapshot,
     sleeves: list[SleeveConfig],
@@ -180,10 +187,13 @@ async def build_intents(
     cap (15% of equity by default) and the total deployment cap (70% of
     equity). The total cap covers the whole portfolio, not per sleeve.
 
-    Greedy fill order is the symbol whitelist sequence. We do not re-rank
-    by yield because most symbols in a well-curated whitelist are within
-    a tight yield band and re-ranking adds complexity with little upside;
-    the caps do the heavy lifting.
+    Within each sleeve, candidates are ranked by per-share yield
+    (mid / strike) descending and greedy-filled in that order. This
+    concentrates capital in the week's highest-IV opportunities while
+    keeping the sleeve allocation discipline. Across sleeves, order is
+    the canonical sleeve sequence (index_core, stable_largecap,
+    opportunistic) so each sleeve gets its budgeted share of the total
+    deployment cap.
     """
     today = today or datetime.now(UTC).date()
     equity = Decimal(str(account.equity))
@@ -202,9 +212,10 @@ async def build_intents(
         target_delta = _target_delta_for(sleeve, regime.regime)
         sleeve_remaining = equity * sleeve.target_pct
 
+        # Phase 1: walk the whitelist, fetch each chain, pick a strike.
+        # Build a list of (contract, per_share_yield) that survived.
+        ranked: list[tuple[OptionContract, Decimal]] = []
         for symbol in sleeve.symbol_whitelist:
-            if sleeve_remaining <= 0 or total_remaining <= 0:
-                break
             try:
                 chain = await chain_fetcher(symbol, None)
             except Exception as exc:
@@ -215,11 +226,19 @@ async def build_intents(
                     error=str(exc),
                 )
                 continue
-
             contract = select_put_strike(chain, target_delta, sleeve, today)
             if contract is None or contract.bid is None or contract.ask is None:
                 continue
+            ranked.append((contract, _per_share_yield(contract)))
 
+        # Phase 2: sort highest yield first (stable sort preserves whitelist
+        # order on ties, which keeps behaviour deterministic).
+        ranked.sort(key=lambda pair: pair[1], reverse=True)
+
+        # Phase 3: greedy-fill in yield order.
+        for contract, _y in ranked:
+            if sleeve_remaining <= 0 or total_remaining <= 0:
+                break
             qty = _max_qty_for(
                 contract,
                 equity=equity,
@@ -230,7 +249,7 @@ async def build_intents(
                 _log.info(
                     "strategy.sleeve.no_fit",
                     sleeve=sleeve.sleeve,
-                    symbol=symbol,
+                    symbol=contract.underlying,
                     sleeve_remaining=str(sleeve_remaining),
                     total_remaining=str(total_remaining),
                 )

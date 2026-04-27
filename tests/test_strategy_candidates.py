@@ -362,6 +362,61 @@ async def test_build_intents_respects_total_deployment_cap() -> None:
     assert total_collateral == Decimal("70000")
 
 
+async def test_build_intents_ranks_by_yield_within_sleeve() -> None:
+    """Highest mid/strike (per-share yield) should fill before lower-yield names."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    # Two candidates with equal target-delta hits but different premiums.
+    # LOWY: $50 strike, $0.50 mid -> yield 1.0%
+    # HIGHY: $50 strike, $1.50 mid -> yield 3.0%
+    # Whitelist puts LOWY first to verify the rank wins over insertion order.
+    chains: dict[str, list[OptionContract]] = {
+        "LOWY": [_put(strike=50, delta=-0.30, expiration=expiry, bid=0.45, ask=0.55, underlying="LOWY")],
+        "HIGHY": [_put(strike=50, delta=-0.30, expiration=expiry, bid=1.45, ask=1.55, underlying="HIGHY")],
+    }
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return chains[symbol]
+
+    # Sleeve cap = $7000. Per-symbol cap = $15k. Each contract = $5000.
+    # Both could fit one contract each; high-yield should fill first.
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("opportunistic", whitelist=["LOWY", "HIGHY"], target_pct=Decimal("0.07"))],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+
+    assert len(intents) == 1
+    assert intents[0].symbol == "HIGHY"
+
+
+async def test_build_intents_yield_ranking_preserves_order_on_ties() -> None:
+    """Stable sort means whitelist order breaks ties between equal-yield names."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    # Both candidates have identical mid/strike yield; whitelist order wins.
+    chains = {
+        "FIRST": [_put(strike=50, delta=-0.30, expiration=expiry, bid=0.95, ask=1.05, underlying="FIRST")],
+        "SECOND": [_put(strike=50, delta=-0.30, expiration=expiry, bid=0.95, ask=1.05, underlying="SECOND")],
+    }
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return chains[symbol]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("opportunistic", whitelist=["FIRST", "SECOND"], target_pct=Decimal("0.06"))],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert intents[0].symbol == "FIRST"
+
+
 async def test_build_intents_max_contracts_per_symbol_ceiling() -> None:
     """A very cheap stock cannot exceed MAX_CONTRACTS_PER_SYMBOL even with big cap."""
     today = date(2026, 4, 27)
