@@ -193,3 +193,38 @@ async def test_recent_orders_decodes_json_payloads() -> None:
 
     assert rows[0].intent_payload == {"strike": "500"}
     assert rows[0].gating_decision == {"trading_enabled": True}
+
+
+async def test_has_failed_since_returns_true_when_row_exists() -> None:
+    pool = _fake_pool()
+    pool._conn.fetchrow = AsyncMock(return_value={"?column?": 1})
+    cutoff = datetime(2026, 4, 28, tzinfo=UTC)
+
+    with patch("kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)):
+        result = await orders.has_failed_since(
+            option_symbol="AMZN260501P00200000",
+            action="open_short_put",
+            since=cutoff,
+        )
+
+    assert result is True
+    args, _ = pool._conn.fetchrow.await_args
+    sql = args[0]
+    assert "status = 'failed'" in sql
+    assert args[1] == "AMZN260501P00200000"
+    assert args[2] == "open_short_put"
+    assert args[3] == cutoff
+
+
+async def test_has_failed_since_returns_false_when_absent() -> None:
+    pool = _fake_pool()
+    pool._conn.fetchrow = AsyncMock(return_value=None)
+
+    with patch("kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)):
+        result = await orders.has_failed_since(
+            option_symbol="AMZN260501P00200000",
+            action="open_short_put",
+            since=datetime(2026, 4, 28, tzinfo=UTC),
+        )
+
+    assert result is False
