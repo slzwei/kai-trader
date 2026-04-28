@@ -147,6 +147,7 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     get_order_status = AsyncMock(return_value=_filled_status())
     pending_orders = AsyncMock(return_value=[])
     recent_orders = AsyncMock(return_value=[])
+    has_failed_since = AsyncMock(return_value=False)
     record_intent = AsyncMock(return_value="intent-uuid")
     mark_submitted = AsyncMock()
     mark_status = AsyncMock()
@@ -195,6 +196,7 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     monkeypatch.setattr(worker_module, "evaluate_rolls", evaluate_rolls)
     monkeypatch.setattr(worker_module, "submit_short_call", submit_short_call)
     monkeypatch.setattr(worker_module, "recent_orders", recent_orders)
+    monkeypatch.setattr(worker_module, "has_failed_since", has_failed_since)
     monkeypatch.setattr(worker_module, "record_assignment", record_assignment)
     return locals()
 
@@ -320,6 +322,32 @@ async def test_tick_failed_intent_records_failure(
     assert "Failed:    1" in summary
     args = _patch_dependencies["mark_status"].await_args
     assert args.args[1] == "failed"
+    # The exception detail must be persisted, not just the generic reason.
+    assert args.kwargs["error_text"] == "submit_exception: alpaca down"
+
+
+async def test_tick_skips_intent_with_prior_same_day_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """If a contract already failed today, the worker should not retry it."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
+    _patch_dependencies["get_chain"].return_value = [_put_contract()]
+    _patch_dependencies["has_failed_since"].return_value = True
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "Skipped:   1" in summary
+    _patch_dependencies["record_intent"].assert_not_awaited()
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    _patch_dependencies["mark_status"].assert_not_awaited()
 
 
 # ------------- reconciliation -------------
@@ -811,3 +839,105 @@ async def test_tick_skips_profit_take_when_kill_switch_engaged(
 
     await worker_module.StrategyWorker().tick()
     _patch_dependencies["submit_buy_to_close"].assert_not_awaited()
+
+
+# ------------- open positions surfaced in tick summary -------------
+
+
+def test_format_open_positions_lines_empty_returns_empty() -> None:
+    from kai_trader.strategy.worker import _format_open_positions_lines
+    assert _format_open_positions_lines([], Decimal("100000")) == []
+
+
+def test_format_open_positions_lines_renders_short_puts() -> None:
+    from kai_trader.broker.alpaca import PositionSnapshot
+    from kai_trader.strategy.worker import _format_open_positions_lines
+
+    positions = [
+        PositionSnapshot(
+            symbol="AMZN260506P00250000",
+            qty=Decimal("-2"),
+            side="short",
+            avg_entry_price=Decimal("4.55"),
+            current_price=Decimal("5.05"),
+            market_value=None,
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        ),
+        PositionSnapshot(
+            symbol="AVGO260506P00400000",
+            qty=Decimal("-1"),
+            side="short",
+            avg_entry_price=Decimal("6.0"),
+            current_price=Decimal("7.1"),
+            market_value=None,
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        ),
+    ]
+    out = _format_open_positions_lines(positions, Decimal("99686"))
+    text = "\n".join(out)
+    assert "Open shorts:" in text
+    assert "AMZN P250 x2" in text
+    assert "AVGO P400 x1" in text
+    # 2 * $250 * 100 = $50,000; 1 * $400 * 100 = $40,000
+    assert "USD 50,000.00" in text
+    assert "USD 40,000.00" in text
+    # Total committed $90,000; cap = 70% * $99,686 = $69,780.20
+    assert "Committed: USD 90,000.00" in text
+    assert "USD 69,780.20" in text
+
+
+def test_format_open_positions_skips_calls_and_invalid_symbols() -> None:
+    from kai_trader.broker.alpaca import PositionSnapshot
+    from kai_trader.strategy.worker import _format_open_positions_lines
+
+    positions = [
+        PositionSnapshot(  # short call (skip)
+            symbol="AMZN260506C00260000",
+            qty=Decimal("-1"),
+            side="short",
+            avg_entry_price=Decimal("1.0"),
+            current_price=None,
+            market_value=None,
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        ),
+        PositionSnapshot(  # not OCC (skip)
+            symbol="AMZN",
+            qty=Decimal("-100"),
+            side="short",
+            avg_entry_price=Decimal("250"),
+            current_price=None,
+            market_value=None,
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        ),
+    ]
+    out = _format_open_positions_lines(positions, Decimal("100000"))
+    assert out == []  # nothing valid to render
+
+
+async def test_tick_summary_includes_open_positions(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """When short puts exist, the tick body shows them with committed-vs-cap."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False, "new_entries_enabled": True,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
+    _patch_dependencies["list_short_option_positions"].return_value = [
+        _short_put_position_for_amzn()  # 1 contract AMZN P250 = $25k
+    ]
+    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "Open shorts:" in summary
+    assert "AMZN P250 x1" in summary
+    assert "Committed:" in summary

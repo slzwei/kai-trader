@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
-from kai_trader.bot.formatting import bold, header, pre
+from kai_trader.bot.formatting import bold, format_money, header, pre
 from kai_trader.broker.alpaca import (
+    PositionSnapshot,
     SubmitResult,
     close_position,
     get_account,
@@ -38,10 +40,11 @@ from kai_trader.broker.alpaca import (
     submit_short_call,
     submit_short_put,
 )
-from kai_trader.broker.options_data import get_chain
+from kai_trader.broker.options_data import get_chain, parse_occ_symbol
 from kai_trader.db.orders import (
     OrderRow,
     OrderStatus,
+    has_failed_since,
     mark_status,
     mark_submitted,
     pending_orders,
@@ -54,6 +57,7 @@ from kai_trader.logging import get_logger
 from kai_trader.notifications.producer import enqueue
 from kai_trader.strategy.assignment import detect_assignments, record_assignment
 from kai_trader.strategy.candidates import (
+    TOTAL_DEPLOYMENT_CAP_PCT,
     TradeIntent,
     build_intents_with_diagnostics,
 )
@@ -72,6 +76,58 @@ from kai_trader.strategy.rolls import RollIntent, evaluate_rolls
 _log = get_logger(__name__)
 
 _TERMINAL_ALPACA_STATUSES = {"filled", "canceled", "expired", "rejected"}
+
+
+def _format_open_positions_lines(
+    short_puts: list[PositionSnapshot],
+    equity: Decimal,
+) -> list[str]:
+    """Render open short puts + committed-vs-total-cap as tick body lines.
+
+    Returns an empty list when nothing is open so the tick stays compact.
+    Output is monospace-friendly inside a <pre> block.
+    """
+    if not short_puts:
+        return []
+    lines: list[str] = ["Open shorts:"]
+    total = Decimal("0")
+    for p in short_puts:
+        try:
+            underlying, _exp, opt_type, strike = parse_occ_symbol(p.symbol)
+        except ValueError:
+            continue
+        if opt_type != "put":
+            continue
+        qty = abs(p.qty)
+        if qty <= 0:
+            continue
+        collateral = strike * Decimal("100") * qty
+        total += collateral
+        lines.append(
+            f"  {underlying} P{strike:.0f} x{int(qty)}  {format_money(collateral)}"
+        )
+    if total == 0:
+        return []
+    cap = equity * TOTAL_DEPLOYMENT_CAP_PCT
+    pct = (total / cap * Decimal("100")).quantize(Decimal("1")) if cap > 0 else Decimal("0")
+    lines.append(
+        f"Committed: {format_money(total)} of {format_money(cap)} cap ({pct}%)"
+    )
+    lines.append("")
+    return lines
+
+
+def _format_error_text(result: SubmitResult) -> str | None:
+    """Combine SubmitResult.reason and .error so the actual exception is persisted.
+
+    Without this, a submit_exception falls into the ``reason or error``
+    fallback and only the generic ``submit_exception`` tag reaches the
+    DB. The exception detail (the part that explains *why* Alpaca
+    refused) lives only in ``result.error`` and was being dropped.
+    """
+    if result.reason and result.error:
+        return f"{result.reason}: {result.error}"
+    return result.reason or result.error
 
 
 class StrategyWorker:
@@ -241,6 +297,7 @@ class StrategyWorker:
             + (f" ({', '.join(failed)})" if failed else "")
         )
         body_lines = [
+            *_format_open_positions_lines(existing_shorts, account.equity),
             f"Reconciled: {reconciled} open orders.",
             f"Rolls:     {rolled} rolled, {held} held",
             sub_line,
@@ -356,7 +413,9 @@ class StrategyWorker:
                 submitted_at=datetime.now(UTC),
             )
         else:
-            await mark_status(close_row_id, "failed", error_text=close_result.reason)
+            await mark_status(
+                close_row_id, "failed", error_text=_format_error_text(close_result)
+            )
             return
 
         new_row_id = await record_intent(
@@ -384,7 +443,9 @@ class StrategyWorker:
                 submitted_at=datetime.now(UTC),
             )
         else:
-            await mark_status(new_row_id, "failed", error_text=new_result.reason)
+            await mark_status(
+                new_row_id, "failed", error_text=_format_error_text(new_result)
+            )
 
     async def _submit_intent(
         self,
@@ -392,6 +453,27 @@ class StrategyWorker:
         flags: dict[str, bool],
     ) -> str:
         """Record the intent then submit. Returns 'submitted', 'skipped', 'failed'."""
+        # Suppress retry storms: if this exact contract already has a
+        # failed open_short_put row from earlier today, skip without
+        # writing a new row or hitting Alpaca. The 5-minute tick was
+        # otherwise re-submitting the same failing strikes indefinitely.
+        today_start = datetime.combine(
+            datetime.now(UTC).date(),
+            datetime.min.time(),
+            tzinfo=UTC,
+        )
+        if await has_failed_since(
+            option_symbol=intent.option_symbol,
+            action="open_short_put",
+            since=today_start,
+        ):
+            _log.info(
+                "strategy.submit.skipped_prior_failure",
+                option_symbol=intent.option_symbol,
+                symbol=intent.symbol,
+            )
+            return "skipped"
+
         # Use bid when present; fall back to mid (already a Decimal in the intent).
         limit_price = intent.bid if intent.bid > 0 else intent.mid
         gating_decision = {
@@ -439,7 +521,7 @@ class StrategyWorker:
             await mark_status(row_id, "skipped_by_flag", error_text=result.reason)
             return "skipped"
 
-        await mark_status(row_id, "failed", error_text=result.reason or result.error)
+        await mark_status(row_id, "failed", error_text=_format_error_text(result))
         return "failed"
 
     async def _handle_profit_takes(
@@ -523,7 +605,7 @@ class StrategyWorker:
         if result.reason == "kill_switch_engaged":
             await mark_status(row_id, "skipped_by_flag", error_text=result.reason)
             return "skipped"
-        await mark_status(row_id, "failed", error_text=result.reason or result.error)
+        await mark_status(row_id, "failed", error_text=_format_error_text(result))
         return "failed"
 
     async def _handle_assignments(self) -> int:
@@ -633,7 +715,7 @@ class StrategyWorker:
             await mark_status(row_id, "skipped_by_flag", error_text=result.reason)
             return "skipped"
 
-        await mark_status(row_id, "failed", error_text=result.reason or result.error)
+        await mark_status(row_id, "failed", error_text=_format_error_text(result))
         return "failed"
 
     async def _reconcile_pending(self) -> int:

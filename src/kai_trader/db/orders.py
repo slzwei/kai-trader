@@ -187,3 +187,33 @@ async def pending_orders() -> list[OrderRow]:
             """
         )
     return [_row_to_order(dict(row)) for row in rows]
+
+
+async def has_failed_since(
+    *,
+    option_symbol: str,
+    action: OrderAction,
+    since: datetime,
+) -> bool:
+    """Return True if a row for this option_symbol+action is failed since `since`.
+
+    Used to suppress same-day retry storms when a contract submission has
+    already failed once. The caller passes the cutoff so the policy
+    (today, last hour, etc.) stays in the worker rather than the DB layer.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            select 1 from orders
+             where option_symbol = $1
+               and action = $2
+               and status = 'failed'
+               and created_at >= $3
+             limit 1
+            """,
+            option_symbol,
+            action,
+            since,
+        )
+    return row is not None
