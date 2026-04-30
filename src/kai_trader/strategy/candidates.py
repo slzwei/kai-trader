@@ -336,11 +336,40 @@ def _max_qty_for(
     return min(qty, MAX_CONTRACTS_PER_SYMBOL)
 
 
-def _per_share_yield(contract: OptionContract) -> Decimal:
-    """Mid price as a fraction of strike. Used to rank candidates within a sleeve."""
-    assert contract.bid is not None and contract.ask is not None
+SPREAD_QUALITY_CUTOFF_PCT = Decimal("0.30")
+
+
+def _score_candidate(contract: OptionContract, today: date) -> Decimal | None:
+    """Multi-factor ranking score for one candidate put. Higher is better.
+
+    ``score = annualised_yield * spread_quality``
+
+    Annualised yield captures premium-per-dollar-locked, normalised across
+    DTEs so a 7-day and a 10-day candidate are comparable. Spread quality
+    is the liquidity proxy: tighter spread = better fill, wider spread
+    drops the score. Both factors are unit-Decimal quantities.
+
+    Returns ``None`` when the contract fails the minimum liquidity test
+    (spread >= 30% of mid). The caller drops these so they never enter
+    the greedy fill, regardless of how attractive the headline yield is.
+    A wide spread on the OPRA feed usually means an order won't fill at
+    the bid, so the headline number is fiction.
+    """
+    if contract.bid is None or contract.ask is None:
+        return None
     mid = (contract.bid + contract.ask) / Decimal("2")
-    return mid / contract.strike
+    if mid <= 0 or contract.strike <= 0:
+        return None
+    spread = contract.ask - contract.bid
+    if spread < 0:
+        return None
+    spread_pct = spread / mid
+    if spread_pct >= SPREAD_QUALITY_CUTOFF_PCT:
+        return None
+    spread_quality = Decimal("1") - spread_pct / SPREAD_QUALITY_CUTOFF_PCT
+    dte = max((contract.expiration - today).days, 1)
+    annualised_yield = (mid / contract.strike) * (Decimal("365") / Decimal(dte))
+    return annualised_yield * spread_quality
 
 
 EarningsFilter = Callable[[str, date, int], Awaitable[bool]]
@@ -500,15 +529,24 @@ async def build_intents_with_diagnostics(
             contract = select_put_strike(chain, target_delta, sleeve, today)
             if contract is None or contract.bid is None or contract.ask is None:
                 continue
-            ranked.append((contract, _per_share_yield(contract)))
+            score = _score_candidate(contract, today)
+            if score is None:
+                continue
+            ranked.append((contract, score))
 
-        # Phase 2: sort highest yield first (stable sort preserves whitelist
-        # order on ties, which keeps behaviour deterministic).
+        # Phase 2: sort highest score first. Score = annualised_yield *
+        # spread_quality (see _score_candidate). Stable sort preserves
+        # whitelist order on ties so behaviour stays deterministic.
         ranked.sort(key=lambda pair: pair[1], reverse=True)
 
-        # Phase 3: greedy-fill in yield order.
+        # Phase 3: greedy-fill in score order. Stops early when the
+        # per-tick entry cap is hit so a large pool does not flood the
+        # book in one tick. The cap is per-sleeve so multi-sleeve
+        # configurations stay independent.
         for contract, _y in ranked:
             if sleeve_remaining <= 0 or total_remaining <= 0:
+                break
+            if intents_built_for_sleeve >= sleeve.max_new_entries_per_tick:
                 break
             committed_for_underlying = committed_per_symbol.get(
                 contract.underlying, Decimal("0")

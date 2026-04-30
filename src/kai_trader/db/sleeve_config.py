@@ -33,6 +33,7 @@ UPDATABLE_COLUMNS: tuple[str, ...] = (
     "symbol_whitelist",
     "enabled",
     "earnings_blackout_enabled",
+    "max_new_entries_per_tick",
 )
 
 _log = get_logger(__name__)
@@ -56,6 +57,7 @@ class SleeveConfig:
     updated_at: datetime
     updated_by: str | None
     earnings_blackout_enabled: bool = True
+    max_new_entries_per_tick: int = 2
 
 
 def _row_to_config(row: dict[str, Any]) -> SleeveConfig:
@@ -77,6 +79,7 @@ def _row_to_config(row: dict[str, Any]) -> SleeveConfig:
         symbol_whitelist=whitelist,
         enabled=row["enabled"],
         earnings_blackout_enabled=row.get("earnings_blackout_enabled", True),
+        max_new_entries_per_tick=row.get("max_new_entries_per_tick", 2),
         updated_at=row["updated_at"],
         updated_by=row["updated_by"],
     )

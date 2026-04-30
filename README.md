@@ -1,16 +1,236 @@
 # Kai Trader
 
-Automated options wheel trading, monitored and controlled through Telegram.
-Phases 1, 2, and 3 (read-only Alpaca + flag surface + wheel strategy with
-order placement and roll/close logic) have shipped. Phase 4 adds a
-conversational Telegram bot ("Kai") with an approval flow for any change to
-trades, params, or watchlists.
+Automated options wheel trading on Alpaca, controlled through a private
+Telegram bot, with all state in Supabase Postgres. Single-owner system
+designed for paper-first, then live with explicit flag flips.
 
 ## What this is
 
-A single-owner trading system that will eventually run a defensive, premium
-capture wheel strategy on Alpaca. You interact with it through a private
-Telegram bot. Database of record is Supabase Postgres.
+A defensive, premium-capture wheel: sell cash-secured puts at a target
+delta, take profits early, roll when challenged for net credit, accept
+assignment when the math says so, then sell covered calls against held
+shares until called away. Repeat. The system is built around the
+single-sleeve, small-account configuration shipped by migration 018,
+optimised for accounts in the $25k-$100k range.
+
+## How the strategy works
+
+### The universe
+
+One active sleeve (`index_core`) with a 30-name pool of cheap-liquid
+optionable underlyings. Each name has weekly options on Alpaca's OPRA
+feed and a low enough strike that one CSP fits inside a small account.
+
+| Bucket | Tickers |
+|---|---|
+| Defensive large-caps | F, T, BAC, PFE, KO, KVUE, VZ, INTC, CSCO, GE, KMI, KHC, MO, WBA |
+| Mid-cap growth / cyclical | HOOD, SOFI, PLTR, MU, MARA, RIOT, SNAP, RIVN |
+| Quality | WFC, GM, C |
+| Non-correlated ETFs | GDX, SLV, XLF, XLE, EEM |
+
+The two other sleeves (`stable_largecap`, `opportunistic`) are
+disabled. Re-enable them in `sleeve_config` if you want the original
+three-bucket allocation back.
+
+### Tick cadence
+
+The strategy worker runs every **5 minutes** during US market hours.
+Order reconciliation runs on every tick regardless of market state, so
+overnight fills are reflected at the next open. A separate
+`TradingStream` WebSocket subscribes to Alpaca `trade_updates` for
+real-time fill notifications; the 5-minute reconciliation is
+belt-and-suspenders.
+
+Each tick performs, in order:
+
+1. Reconcile any pending Alpaca orders.
+2. Skip if market is closed.
+3. Run the drawdown circuit breaker (auto-trips kill switch on breach).
+4. Skip if `kill_switch` is engaged (heartbeat only).
+5. Compute the regime, write a row only on transition.
+6. Evaluate rolls on existing short puts.
+7. Evaluate profit-takes on existing short puts.
+8. Build new CSP intents from the pool, submit the top-ranked picks.
+9. Detect put assignments, build and submit covered calls.
+10. Post a tick summary to Telegram.
+
+### Strike selection
+
+For each whitelisted underlying:
+
+1. Skip if next earnings falls inside the DTE window
+   (`earnings_blackout_enabled=true`, yfinance lookup, fail-open on
+   error).
+2. Fetch the option chain.
+3. Pick the put whose absolute delta is closest to the target for the
+   current regime, with expiration inside the sleeve's 7-10 DTE band.
+
+| Regime | Target put delta | Target call delta |
+|---|---|---|
+| `risk_on` | -0.40 | +0.30 |
+| `neutral` | -0.30 | +0.30 |
+| `risk_off` | no new entries | no new entries |
+
+### Ranking the candidates
+
+Once a strike is picked per symbol, candidates are scored and the
+greedy fill takes the best:
+
+```
+score = annualised_yield_pct × spread_quality
+
+annualised_yield_pct = (mid / strike) × (365 / DTE) × 100
+spread_quality       = 1 - (ask - bid) / mid / 0.30   (0 .. 1)
+```
+
+A spread of 30% or more of mid hard-rejects the candidate (the OPRA
+feed often has stale quotes on thin names; a wide-spread headline
+yield is fiction because you cannot fill at the bid). Annualisation
+makes a 7-day and a 10-day candidate directly comparable.
+
+The greedy fill iterates score-descending and stops as soon as any
+cap binds. Stable sort means whitelist order breaks ties.
+
+### Capital deployment caps
+
+Three caps clamp how much of the account is at risk in cash-secured
+puts. All three are enforced *after* subtracting collateral already
+locked in open short puts, so the strategy will not re-attempt to
+open contracts you already hold.
+
+| Cap | Value | Source |
+|---|---|---|
+| Total deployment | 70% of equity | `TOTAL_DEPLOYMENT_CAP_PCT` in `candidates.py` |
+| Sleeve | 100% of equity (`index_core` is the only active sleeve) | `sleeve_config.target_pct` |
+| Per-symbol | tiered by equity (see below) | `_PER_SYMBOL_CAP_TIERS` in `candidates.py` |
+| Hard contract ceiling | 10 contracts per symbol | `MAX_CONTRACTS_PER_SYMBOL` |
+
+The per-symbol cap loosens for smaller accounts so a single normal
+CSP can clear:
+
+| Equity | Per-symbol cap |
+|---|---|
+| under $50k | 100% |
+| $50k to $150k | 60% |
+| $150k to $500k | 30% |
+| $500k or more | 15% |
+
+### Per-tick entry cap
+
+A single tick will submit at most **2 new CSPs per sleeve**
+(`sleeve_config.max_new_entries_per_tick`, default 2). With a
+30-name pool, this prevents one volatile day from flooding the book.
+Additional candidates wait for the next tick.
+
+### Profit-take
+
+For each open short put: read the original credit from the filled CSP
+order, look up the current ask, and submit a buy-to-close at the ask
+when
+
+```
+current_ask <= original_credit × (1 - profit_take_pct)
+```
+
+Default `profit_take_pct = 0.50`, so the system closes at 50% of max
+credit captured. Capital released by a profit-take is available on
+the same tick for new entries.
+
+### Rolling
+
+A short put becomes a roll candidate when its live delta crosses
+`roll_trigger_delta` (default `0.50`). The roll candidate must be:
+
+- Same underlying.
+- Strike strictly **lower** (further OTM).
+- Expiration **on or after** the current expiration, inside the DTE
+  band.
+- Closest to the regime's target delta among qualifying contracts.
+
+Rolls only execute for **net credit**. If `new_bid - current_ask <= 0`,
+the position holds and the operator sees a `no_net_credit_candidate`
+line in the tick summary. Better to accept assignment risk than lock
+in a debit.
+
+`risk_off` does **not** block rolls (rolling reduces risk on a
+challenged position).
+
+### Covered calls
+
+After CSP processing each tick, the worker:
+
+1. Detects assignments by matching held long equity against
+   recently-filled CSPs. Records an idempotent audit row in `orders`.
+2. For each held block (100 shares per contract), finds the sleeve
+   that whitelists the underlying and picks the call closest to
+   `target_delta_call` (default 0.30) inside the DTE band.
+3. Submits the CC at bid. Quantity = `floor(shares / 100)`.
+
+No capital math here. The shares are the collateral.
+
+### Regime classifier
+
+Pure function over VIX and SPY indicators (yfinance ^VIX + Alpaca
+daily SPY bars):
+
+```
+risk_off  if  VIX > 25
+          OR  SPY price < SPY 50DMA
+          OR  VIX 5-day change > +30%
+
+risk_on   if  VIX < 17
+          AND SPY price > SPY 20DMA
+          AND SPY realized vol (10d) < 15%
+
+neutral   otherwise
+```
+
+A row is written to `regime_history` only on transition.
+
+### Defensive layers
+
+- **Three flags**, all enforced inside the broker submit calls as the
+  last gate before HTTP:
+  - `kill_switch=true` blocks every new order. Closes still allowed.
+  - `trading_enabled=false` blocks new entries (puts and calls).
+    Rolls still allowed.
+  - `new_entries_enabled=false` blocks new puts. Rolls and closes
+    proceed.
+- **Drawdown circuit breaker**: if equity drops 7% or more from the
+  7-day high-water mark, `kill_switch` is auto-engaged and a
+  critical-priority Telegram notification fires. Idempotent; will
+  not re-notify on subsequent ticks while still tripped.
+- **Earnings blackout**: per-sleeve flag skips any underlying whose
+  next earnings announcement falls inside the sleeve's DTE window.
+  yfinance lookup with 24-hour per-symbol cache; fail-open on lookup
+  errors.
+- **Retry-storm suppressor**: an option contract that already has a
+  failed `open_short_put` row from earlier today is skipped without
+  another DB write or HTTP call. Stops the 5-minute tick from spamming
+  Alpaca with the same failing strike.
+- **Spread-quality reject**: any candidate with a bid-ask spread of
+  30% or more of mid never enters the ranker.
+
+### Authority and overrides
+
+The strategy never writes to its own config. Free-form Telegram text
+from the owner routes to Kai (the conversational handler), which can
+read state and **propose** changes via inline Approve / Reject /
+Modify buttons. The applier in `kai_trader.approvals.applier` is the
+only writer for config mutations and writes a `decision_log` row for
+every applied change. Direct `/flag`, `/kill`, `/close`,
+`/close_confirm`, and `/trade_now` slash commands stay authoritative
+for time-sensitive operator actions.
+
+### Where the numbers live
+
+| Setting | Location |
+|---|---|
+| Sleeve config (whitelist, deltas, DTE band, profit-take, roll trigger, per-tick cap, earnings flag) | `sleeve_config` table; latest values in migrations `006`, `009`, `017`, `018` |
+| Total deployment cap, per-symbol tiers, hard contract ceiling, spread cutoff | `src/kai_trader/strategy/candidates.py` |
+| Drawdown threshold and lookback | `src/kai_trader/strategy/drawdown.py` |
+| Regime thresholds | `src/kai_trader/strategy/regime.py` |
+| Tick cadence | `StrategyWorker.poll_interval` in `src/kai_trader/strategy/worker.py` |
 
 ## Prerequisites
 

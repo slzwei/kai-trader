@@ -30,6 +30,7 @@ def _sleeve(
     target_delta_neutral: Decimal = Decimal("-0.20"),
     dte_min: int = 7,
     dte_max: int = 10,
+    max_new_entries_per_tick: int = 100,
 ) -> SleeveConfig:
     return SleeveConfig(
         sleeve=name,
@@ -43,6 +44,7 @@ def _sleeve(
         roll_trigger_delta=Decimal("0.45"),
         symbol_whitelist=whitelist if whitelist is not None else ["SPY"],
         enabled=enabled,
+        max_new_entries_per_tick=max_new_entries_per_tick,
         updated_at=datetime(2026, 4, 26, tzinfo=UTC),
         updated_by=None,
     )
@@ -952,6 +954,221 @@ async def test_committed_collateral_helper_returns_correct_maps() -> None:
     assert per_symbol["AVGO"] == Decimal("40000")
     assert per_symbol["ORPHAN"] == Decimal("10000")
     assert total == Decimal("100000")  # everything counts toward total
+
+
+# ------------- _score_candidate (multi-factor ranker) -------------
+
+
+def test_score_candidate_higher_for_better_yield() -> None:
+    """A higher mid/strike at the same spread should score higher."""
+    from kai_trader.strategy.candidates import _score_candidate
+
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+    low = _put(strike=50, delta=-0.30, expiration=expiry, bid=0.45, ask=0.55)
+    high = _put(strike=50, delta=-0.30, expiration=expiry, bid=1.45, ask=1.55)
+    score_low = _score_candidate(low, today)
+    score_high = _score_candidate(high, today)
+    assert score_low is not None
+    assert score_high is not None
+    assert score_high > score_low
+
+
+def test_score_candidate_penalises_wide_spread() -> None:
+    """Same yield, wider spread, lower score."""
+    from kai_trader.strategy.candidates import _score_candidate
+
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+    # Same mid (1.00) so annualised yield is identical; only spread differs.
+    tight = _put(strike=50, delta=-0.30, expiration=expiry, bid=0.99, ask=1.01)
+    wide = _put(strike=50, delta=-0.30, expiration=expiry, bid=0.88, ask=1.12)
+    score_tight = _score_candidate(tight, today)
+    score_wide = _score_candidate(wide, today)
+    assert score_tight is not None
+    assert score_wide is not None
+    assert score_tight > score_wide
+
+
+def test_score_candidate_rejects_too_wide_spread() -> None:
+    """Spread >= 30% of mid returns None: caller must skip."""
+    from kai_trader.strategy.candidates import _score_candidate
+
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+    # bid=0.40, ask=1.00 → mid=0.70, spread=0.60, spread_pct=0.857.
+    junk = _put(strike=50, delta=-0.30, expiration=expiry, bid=0.40, ask=1.00)
+    assert _score_candidate(junk, today) is None
+
+
+def test_score_candidate_normalises_across_dte() -> None:
+    """Annualisation makes a 14-DTE candidate comparable to a 7-DTE one.
+
+    A contract that pays the same mid over twice the DTE is half the
+    annualised yield, so the shorter-DTE candidate should score higher.
+    """
+    from kai_trader.strategy.candidates import _score_candidate
+
+    today = date(2026, 4, 27)
+    near = today + timedelta(days=7)
+    far = today + timedelta(days=14)
+    seven = _put(strike=50, delta=-0.30, expiration=near, bid=0.99, ask=1.01)
+    fourteen = _put(strike=50, delta=-0.30, expiration=far, bid=0.99, ask=1.01)
+    score_seven = _score_candidate(seven, today)
+    score_fourteen = _score_candidate(fourteen, today)
+    assert score_seven is not None
+    assert score_fourteen is not None
+    assert score_seven > score_fourteen
+
+
+def test_score_candidate_returns_none_for_missing_quotes() -> None:
+    from kai_trader.strategy.candidates import _score_candidate
+
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+    no_bid = _put(strike=50, delta=-0.30, expiration=expiry, bid=None, ask=1.00)
+    no_ask = _put(strike=50, delta=-0.30, expiration=expiry, bid=0.99, ask=None)
+    assert _score_candidate(no_bid, today) is None
+    assert _score_candidate(no_ask, today) is None
+
+
+async def test_build_intents_skips_wide_spread_contracts() -> None:
+    """A whitelist entry whose only candidate has a junk spread is dropped."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    chains: dict[str, list[OptionContract]] = {
+        "JUNK": [_put(strike=50, delta=-0.30, expiration=expiry,
+                      bid=0.40, ask=1.00, underlying="JUNK")],
+        "OK": [_put(strike=50, delta=-0.30, expiration=expiry,
+                    bid=0.99, ask=1.01, underlying="OK")],
+    }
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return chains[symbol]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "index_core", whitelist=["JUNK", "OK"], target_pct=Decimal("1.0")
+        )],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    symbols = {i.symbol for i in intents}
+    assert "JUNK" not in symbols
+    assert "OK" in symbols
+
+
+# ------------- max_new_entries_per_tick (per-sleeve entry cap) -------------
+
+
+async def test_per_tick_cap_limits_new_entries() -> None:
+    """A 5-symbol pool with cap=2 should fill only the top 2 by score."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    # Five candidates, distinct yields. Top two by mid/strike: B (3%) and D (2.5%).
+    chains: dict[str, list[OptionContract]] = {
+        "A": [_put(strike=50, delta=-0.30, expiration=expiry,
+                   bid=0.45, ask=0.55, underlying="A")],          # 1.0%
+        "B": [_put(strike=50, delta=-0.30, expiration=expiry,
+                   bid=1.45, ask=1.55, underlying="B")],          # 3.0%
+        "C": [_put(strike=50, delta=-0.30, expiration=expiry,
+                   bid=0.95, ask=1.05, underlying="C")],          # 2.0%
+        "D": [_put(strike=50, delta=-0.30, expiration=expiry,
+                   bid=1.20, ask=1.30, underlying="D")],          # 2.5%
+        "E": [_put(strike=50, delta=-0.30, expiration=expiry,
+                   bid=0.70, ask=0.80, underlying="E")],          # 1.5%
+    }
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return chains[symbol]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "index_core",
+            whitelist=["A", "B", "C", "D", "E"],
+            target_pct=Decimal("1.0"),
+            max_new_entries_per_tick=2,
+        )],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert len(intents) == 2
+    selected = {i.symbol for i in intents}
+    assert selected == {"B", "D"}
+
+
+async def test_per_tick_cap_zero_blocks_all_entries() -> None:
+    """A cap of 0 means no new entries are added even with viable candidates."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=50, delta=-0.30, expiration=expiry)]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "index_core",
+            whitelist=["SPY"],
+            target_pct=Decimal("1.0"),
+            max_new_entries_per_tick=0,
+        )],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert intents == []
+
+
+async def test_per_tick_cap_independent_per_sleeve() -> None:
+    """Each sleeve enforces its own cap, not a portfolio-wide one."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    chains: dict[str, list[OptionContract]] = {
+        "X1": [_put(strike=50, delta=-0.30, expiration=expiry, underlying="X1")],
+        "X2": [_put(strike=50, delta=-0.30, expiration=expiry, underlying="X2")],
+        "Y1": [_put(strike=50, delta=-0.30, expiration=expiry, underlying="Y1")],
+        "Y2": [_put(strike=50, delta=-0.30, expiration=expiry, underlying="Y2")],
+    }
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return chains[symbol]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[
+            _sleeve(
+                "index_core",
+                whitelist=["X1", "X2"],
+                target_pct=Decimal("0.50"),
+                max_new_entries_per_tick=1,
+            ),
+            _sleeve(
+                "stable_largecap",
+                whitelist=["Y1", "Y2"],
+                target_pct=Decimal("0.50"),
+                max_new_entries_per_tick=1,
+            ),
+        ],
+        account=_account(equity=200_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    by_sleeve: dict[str, int] = {}
+    for i in intents:
+        by_sleeve[i.sleeve] = by_sleeve.get(i.sleeve, 0) + 1
+    assert by_sleeve.get("index_core") == 1
+    assert by_sleeve.get("stable_largecap") == 1
+
+
+# ------------- legacy collateral accounting tests -------------
 
 
 async def test_committed_helper_ignores_non_put_options() -> None:
