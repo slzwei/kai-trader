@@ -1288,17 +1288,164 @@ async def test_recent_trades_rejects_out_of_range(
     fetch.assert_not_awaited()
 
 
-async def test_close_stages_pending(
+def _equity_position(symbol: str = "SPY") -> PositionSnapshot:
+    return PositionSnapshot(
+        symbol=symbol,
+        qty=Decimal("100"),
+        side="long",
+        avg_entry_price=Decimal("400.00"),
+        current_price=Decimal("410.00"),
+        market_value=Decimal("41000"),
+        unrealized_pl=Decimal("1000"),
+        unrealized_intraday_pl=Decimal("0"),
+    )
+
+
+def _option_position(
+    symbol: str,
+    *,
+    qty: str = "-2",
+    side: str = "short",
+    avg: str = "4.55",
+    mark: str = "0.15",
+    pl: str = "880",
+) -> PositionSnapshot:
+    return PositionSnapshot(
+        symbol=symbol,
+        qty=Decimal(qty),
+        side=side,
+        avg_entry_price=Decimal(avg),
+        current_price=Decimal(mark),
+        market_value=Decimal("0"),
+        unrealized_pl=Decimal(pl),
+        unrealized_intraday_pl=Decimal("0"),
+    )
+
+
+async def test_close_stages_equity_match(
     fake_update_factory: Any,
     patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from unittest.mock import AsyncMock
+
     close_mod._reset_pending()
+    monkeypatch.setattr(
+        close_mod,
+        "list_positions",
+        AsyncMock(return_value=[_equity_position("SPY")]),
+    )
+
     update = fake_update_factory(user_id=42, text="/close SPY")
     await close_mod.handle_close(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
-    assert "Close staged for SPY" in text
+    assert "Open positions matching SPY" in text
+    assert "/close_confirm SPY" in text
     assert (42, "SPY") in close_mod._pending
+
+
+async def test_close_stages_option_under_underlying(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    close_mod._reset_pending()
+    occ = "AMZN260506P00250000"
+    monkeypatch.setattr(
+        close_mod,
+        "list_positions",
+        AsyncMock(return_value=[_option_position(occ)]),
+    )
+
+    update = fake_update_factory(user_id=42, text="/close AMZN")
+    await close_mod.handle_close(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert "Open positions matching AMZN" in text
+    assert occ in text
+    # Decoded contract metadata so the operator can sanity-check before confirm.
+    assert "put $250.00" in text
+    assert "exp 2026-05-06" in text
+    assert f"/close_confirm {occ}" in text
+    assert (42, occ) in close_mod._pending
+    # The bare ticker must not get staged when only an option matches.
+    assert (42, "AMZN") not in close_mod._pending
+
+
+async def test_close_lists_multiple_options_for_same_underlying(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    close_mod._reset_pending()
+    put = "AAPL250619P00150000"
+    call = "AAPL250619C00200000"
+    monkeypatch.setattr(
+        close_mod,
+        "list_positions",
+        AsyncMock(return_value=[_option_position(put), _option_position(call)]),
+    )
+
+    update = fake_update_factory(user_id=42, text="/close AAPL")
+    await close_mod.handle_close(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert put in text
+    assert call in text
+    assert f"/close_confirm {put}" in text
+    assert f"/close_confirm {call}" in text
+    assert (42, put) in close_mod._pending
+    assert (42, call) in close_mod._pending
+
+
+async def test_close_accepts_full_occ_symbol(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    close_mod._reset_pending()
+    occ = "AMZN260506P00250000"
+    monkeypatch.setattr(
+        close_mod,
+        "list_positions",
+        AsyncMock(return_value=[_option_position(occ)]),
+    )
+
+    update = fake_update_factory(user_id=42, text=f"/close {occ}")
+    await close_mod.handle_close(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert occ in text
+    assert (42, occ) in close_mod._pending
+
+
+async def test_close_when_no_matching_position(
+    fake_update_factory: Any,
+    patched_db: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    close_mod._reset_pending()
+    monkeypatch.setattr(
+        close_mod,
+        "list_positions",
+        AsyncMock(return_value=[_option_position("AMZN260506P00250000")]),
+    )
+
+    update = fake_update_factory(user_id=42, text="/close TSLA")
+    await close_mod.handle_close(update, None)  # type: ignore[arg-type]
+
+    text = _last_reply(update)
+    assert text == "No open positions matching TSLA."
+    assert close_mod._pending == {}
 
 
 async def test_close_usage_when_no_args(
