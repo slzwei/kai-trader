@@ -1322,7 +1322,24 @@ def _option_position(
     )
 
 
-async def test_close_stages_equity_match(
+def _last_reply_markup(update: Any) -> Any:
+    """Pull the ``reply_markup`` kwarg from the latest reply_text call."""
+    _, kwargs = update.effective_message.reply_text.call_args
+    return kwargs.get("reply_markup")
+
+
+def _patch_close_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The new handle_close bypasses run_command, so it imports
+    mark_command_response and record_intent directly. Patch them
+    at the close module so the global patched_db fixture (which
+    patches the _common.py copy) doesn't miss them."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(close_mod, "mark_command_response", AsyncMock())
+    monkeypatch.setattr(close_mod, "record_intent", AsyncMock(return_value="audit"))
+
+
+async def test_close_lists_equity_match_with_button(
     fake_update_factory: Any,
     patched_db: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -1330,6 +1347,7 @@ async def test_close_stages_equity_match(
     from unittest.mock import AsyncMock
 
     close_mod._reset_pending()
+    _patch_close_audit(monkeypatch)
     monkeypatch.setattr(
         close_mod,
         "list_positions",
@@ -1340,12 +1358,17 @@ async def test_close_stages_equity_match(
     await close_mod.handle_close(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
+    markup = _last_reply_markup(update)
     assert "Open positions matching SPY" in text
-    assert "/close_confirm SPY" in text
-    assert (42, "SPY") in close_mod._pending
+    # /close itself does not stage; staging happens on the button tap.
+    assert close_mod._pending == {}
+    assert markup is not None
+    buttons = [btn for row in markup.inline_keyboard for btn in row]
+    assert len(buttons) == 1
+    assert buttons[0].callback_data == "cls:stage:SPY"
 
 
-async def test_close_stages_option_under_underlying(
+async def test_close_lists_option_under_underlying_with_button(
     fake_update_factory: Any,
     patched_db: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -1353,6 +1376,7 @@ async def test_close_stages_option_under_underlying(
     from unittest.mock import AsyncMock
 
     close_mod._reset_pending()
+    _patch_close_audit(monkeypatch)
     occ = "AMZN260506P00250000"
     monkeypatch.setattr(
         close_mod,
@@ -1364,15 +1388,17 @@ async def test_close_stages_option_under_underlying(
     await close_mod.handle_close(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
+    markup = _last_reply_markup(update)
     assert "Open positions matching AMZN" in text
     assert occ in text
-    # Decoded contract metadata so the operator can sanity-check before confirm.
+    # Decoded contract metadata so the operator can sanity-check before tap.
     assert "put $250.00" in text
     assert "exp 2026-05-06" in text
-    assert f"/close_confirm {occ}" in text
-    assert (42, occ) in close_mod._pending
-    # The bare ticker must not get staged when only an option matches.
-    assert (42, "AMZN") not in close_mod._pending
+    buttons = [btn for row in markup.inline_keyboard for btn in row]
+    assert len(buttons) == 1
+    assert buttons[0].callback_data == f"cls:stage:{occ}"
+    # Button label should compactly identify the contract.
+    assert "AMZN" in buttons[0].text and "$250P" in buttons[0].text
 
 
 async def test_close_lists_multiple_options_for_same_underlying(
@@ -1383,6 +1409,7 @@ async def test_close_lists_multiple_options_for_same_underlying(
     from unittest.mock import AsyncMock
 
     close_mod._reset_pending()
+    _patch_close_audit(monkeypatch)
     put = "AAPL250619P00150000"
     call = "AAPL250619C00200000"
     monkeypatch.setattr(
@@ -1395,12 +1422,12 @@ async def test_close_lists_multiple_options_for_same_underlying(
     await close_mod.handle_close(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
+    markup = _last_reply_markup(update)
     assert put in text
     assert call in text
-    assert f"/close_confirm {put}" in text
-    assert f"/close_confirm {call}" in text
-    assert (42, put) in close_mod._pending
-    assert (42, call) in close_mod._pending
+    callback_data = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert f"cls:stage:{put}" in callback_data
+    assert f"cls:stage:{call}" in callback_data
 
 
 async def test_close_accepts_full_occ_symbol(
@@ -1411,6 +1438,7 @@ async def test_close_accepts_full_occ_symbol(
     from unittest.mock import AsyncMock
 
     close_mod._reset_pending()
+    _patch_close_audit(monkeypatch)
     occ = "AMZN260506P00250000"
     monkeypatch.setattr(
         close_mod,
@@ -1422,8 +1450,10 @@ async def test_close_accepts_full_occ_symbol(
     await close_mod.handle_close(update, None)  # type: ignore[arg-type]
 
     text = _last_reply(update)
+    markup = _last_reply_markup(update)
     assert occ in text
-    assert (42, occ) in close_mod._pending
+    callback_data = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert f"cls:stage:{occ}" in callback_data
 
 
 async def test_close_when_no_matching_position(
@@ -1434,6 +1464,7 @@ async def test_close_when_no_matching_position(
     from unittest.mock import AsyncMock
 
     close_mod._reset_pending()
+    _patch_close_audit(monkeypatch)
     monkeypatch.setattr(
         close_mod,
         "list_positions",
@@ -1446,6 +1477,189 @@ async def test_close_when_no_matching_position(
     text = _last_reply(update)
     assert text == "No open positions matching TSLA."
     assert close_mod._pending == {}
+    # No keyboard when there is nothing to act on.
+    assert _last_reply_markup(update) is None
+
+
+# ------------- Callback handler tests -------------
+
+
+def _callback_query(data: str) -> Any:
+    from unittest.mock import AsyncMock, MagicMock
+
+    q = MagicMock()
+    q.data = data
+    q.answer = AsyncMock()
+    q.edit_message_reply_markup = AsyncMock()
+    q.edit_message_text = AsyncMock()
+    q.message = MagicMock()
+    q.message.text_html = "Original"
+    return q
+
+
+def _callback_update(*, user_id: int, query: Any) -> Any:
+    from unittest.mock import MagicMock
+
+    update = MagicMock()
+    update.callback_query = query
+    update.effective_user = MagicMock()
+    update.effective_user.id = user_id
+    return update
+
+
+async def test_close_callback_silent_ignore_for_stranger() -> None:
+    from unittest.mock import MagicMock
+
+    close_mod._reset_pending()
+    query = _callback_query("cls:stage:SPY")
+    update = _callback_update(user_id=999, query=query)
+    await close_mod.handle_callback(update, MagicMock())  # type: ignore[arg-type]
+    query.answer.assert_not_awaited()
+
+
+async def test_close_callback_unrecognised_data() -> None:
+    from unittest.mock import MagicMock
+
+    close_mod._reset_pending()
+    query = _callback_query("garbage")
+    update = _callback_update(user_id=42, query=query)
+    await close_mod.handle_callback(update, MagicMock())  # type: ignore[arg-type]
+    query.answer.assert_awaited_with("Unrecognised button.")
+
+
+async def test_close_callback_stage_edits_to_confirm_prompt() -> None:
+    from unittest.mock import MagicMock
+
+    close_mod._reset_pending()
+    occ = "AMZN260506P00250000"
+    query = _callback_query(f"cls:stage:{occ}")
+    update = _callback_update(user_id=42, query=query)
+
+    await close_mod.handle_callback(update, MagicMock())  # type: ignore[arg-type]
+
+    query.answer.assert_awaited_with("Confirm to close.")
+    query.edit_message_text.assert_awaited()
+    edit_call = query.edit_message_text.await_args
+    assert occ in edit_call.args[0]
+    markup = edit_call.kwargs["reply_markup"]
+    callback_data = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert f"cls:do:{occ}" in callback_data
+    assert f"cls:cancel:{occ}" in callback_data
+    # Staged so cls:do can consume within the TTL.
+    assert (42, occ) in close_mod._pending
+
+
+async def test_close_callback_do_executes_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    close_mod._reset_pending()
+    occ = "AMZN260506P00250000"
+    close_mod._stage(42, occ)
+
+    monkeypatch.setattr(
+        close_mod,
+        "close_position",
+        AsyncMock(
+            return_value=SubmitResult(
+                submitted=True,
+                alpaca_order_id="alpaca-uuid",
+                order_status="accepted",
+                reason=None,
+                flags={"kill_switch": False, "trading_enabled": True},
+            )
+        ),
+    )
+    record = AsyncMock(return_value="audit-row")
+    monkeypatch.setattr(close_mod, "record_intent", record)
+
+    query = _callback_query(f"cls:do:{occ}")
+    update = _callback_update(user_id=42, query=query)
+    await close_mod.handle_callback(update, MagicMock())  # type: ignore[arg-type]
+
+    query.answer.assert_awaited_with("Submitting close.")
+    query.edit_message_text.assert_awaited()
+    final_text = query.edit_message_text.await_args.args[0]
+    assert occ in final_text
+    assert "alpaca-uuid" in final_text
+    record.assert_awaited_once()
+    # Staged entry should have been consumed.
+    assert (42, occ) not in close_mod._pending
+
+
+async def test_close_callback_do_when_stale_re_stage_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+    from unittest.mock import AsyncMock, MagicMock
+
+    close_mod._reset_pending()
+    occ = "AMZN260506P00250000"
+    # Stage with a stale timestamp so _consume returns None.
+    close_mod._pending[(42, occ)] = close_mod._PendingClose(
+        user_id=42, symbol=occ,
+        staged_at=time.monotonic() - close_mod.CONFIRM_TTL_SECONDS - 1,
+    )
+    monkeypatch.setattr(close_mod, "close_position", AsyncMock())
+
+    query = _callback_query(f"cls:do:{occ}")
+    update = _callback_update(user_id=42, query=query)
+    await close_mod.handle_callback(update, MagicMock())  # type: ignore[arg-type]
+
+    final_text = query.edit_message_text.await_args.args[0]
+    assert "Stale" in final_text
+    assert "Re-stage with /close" in final_text
+
+
+async def test_close_callback_cancel_clears_and_edits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    close_mod._reset_pending()
+    occ = "AMZN260506P00250000"
+    close_mod._stage(42, occ)
+    query = _callback_query(f"cls:cancel:{occ}")
+    update = _callback_update(user_id=42, query=query)
+
+    await close_mod.handle_callback(update, MagicMock())  # type: ignore[arg-type]
+
+    query.answer.assert_awaited_with("Cancelled.")
+    final_text = query.edit_message_text.await_args.args[0]
+    assert "cancelled" in final_text.lower()
+    assert (42, occ) not in close_mod._pending
+
+
+async def test_close_callback_do_when_kill_switch_engaged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    close_mod._reset_pending()
+    occ = "AMZN260506P00250000"
+    close_mod._stage(42, occ)
+    monkeypatch.setattr(
+        close_mod,
+        "close_position",
+        AsyncMock(
+            return_value=SubmitResult(
+                submitted=False,
+                alpaca_order_id=None,
+                order_status=None,
+                reason="kill_switch_engaged",
+                flags={"kill_switch": True, "trading_enabled": False},
+            )
+        ),
+    )
+    monkeypatch.setattr(close_mod, "record_intent", AsyncMock(return_value="audit"))
+
+    query = _callback_query(f"cls:do:{occ}")
+    update = _callback_update(user_id=42, query=query)
+    await close_mod.handle_callback(update, MagicMock())  # type: ignore[arg-type]
+
+    final_text = query.edit_message_text.await_args.args[0]
+    assert "kill_switch engaged" in final_text
 
 
 async def test_close_usage_when_no_args(

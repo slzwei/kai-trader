@@ -97,7 +97,10 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     # chat handler. Slash commands are matched by the CommandHandlers
     # above; everything else falls through to chat.handle.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat.handle))
-    app.add_handler(CallbackQueryHandler(approval.handle))
+    # Inline-keyboard callbacks. Each handler is scoped to its prefix so
+    # the dispatch is unambiguous.
+    app.add_handler(CallbackQueryHandler(approval.handle, pattern=r"^pc:"))
+    app.add_handler(CallbackQueryHandler(close.handle_callback, pattern=r"^cls:"))
 
     return app
 
