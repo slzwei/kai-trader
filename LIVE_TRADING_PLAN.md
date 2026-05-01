@@ -148,6 +148,11 @@ These are the issues that surfaced during the live diagnostic. Each becomes a ha
 | **F-9** | Medium | Per-name notional cap is implicit (sleeve cap → per-symbol headroom math) but there is no explicit hard limit. MARA at $23K = 23% of equity is over a sensible 15% cap. See G-4, T-7.2. |
 | **F-10** | Medium | No portfolio-level Greeks (delta, vega, gamma) aggregation or limits. The book's net exposures are blind. See G-4, T-7.1. |
 | **F-11** | Strategic | The multi-factor ranker referenced in `migration_018` claims to score by "annualised yield × spread quality" but it is unverified whether it actually scores on the variable that matters for an options seller: **IV / RV ratio**. If it does not, the strategy is harvesting time decay without conditioning on whether vol is rich. That is not edge; that is randomly selling premium. See T-6.1, T-6.5. |
+| **F-12** | Critical | `MAX_CONTRACTS_PER_SYMBOL = 10` at `candidates.py:32` is documented as a "hard ceiling regardless of sleeve headroom" but `_max_qty_for` (`candidates.py:317-336`) only applies it **per build call**, not against existing held contracts. **Observed live**: MARA reached 30 contracts (3 ticks × 10) and SNAP reached 40 contracts (4 ticks × 10), both 3-4× the intended ceiling. The constant exists to prevent exactly this; the implementation silently fails. See G-11, W-2. |
+| **F-13** | Critical | The per-symbol $ cap (`per_symbol_cap_pct` × equity, default 60% of equity at $100K-tier) is **strike-blind**. On SPY-class strikes (~$580) it reasonably bounds qty. On MARA at $11.50 strike it allows 52 contracts; on SNAP at $6 it allows 100. This is how 40% of equity wound up in one social-media stock and 51% in one crypto miner. See G-11, W-3. |
+| **F-14** | Critical | No per-tick total-deployment cap. **Observed**: 4 ticks across 20 minutes (18:22 to 18:42 UTC on May 1) took the book from 0% to 96% of the $70,683 deployment cap, leaving $2,500 of dry powder for any overnight regime change. A live system needs daily ramp limits, per-tick velocity caps, or both. See G-12, W-4. |
+| **F-15** | High | The greedy ranker keeps returning MARA P11.50 and SNAP P6 as top scores each tick (high annualised yield × tight spread). Phase 5e's collateral-aware cap math only blocks re-attempts when the per-symbol $ cap is fully consumed; below that, the same strikes accumulate. The ranker has no anti-recency penalty and no cool-down between entries on the same symbol. See G-12, W-4. |
+| **F-16** | Medium | Entry deltas are not verified post-fill. Target was -0.40 (risk_on) or -0.30 (neutral); `actual_delta` is stored only inside `orders.intent_payload` jsonb, not in a queryable column. **Without a post-fill check, a fill significantly outside the target band is invisible** until next tick's reconciliation, and even then only by inspecting position deltas. See G-13, W-9. |
 
 ---
 
@@ -167,6 +172,9 @@ These are not improvements; they are **defects** the system has today that would
 | **G-8: State persistence** | `_pending` and any other in-memory transactional state move to Postgres. Bot restart leaves zero ambiguity about what was staged or in-flight. | T-8.1 |
 | **G-9: Two-channel critical alerting** | Telegram for routine. SMS or PagerDuty (or equivalent) for: kill_switch tripped, broker error rate > N/min, last-tick > 30 min ago, drawdown threshold hit. One channel = single point of failure. | T-8.4 |
 | **G-10: Operator runbooks committed** | `docs/runbooks/*.md` covering: bot won't start, broker 5xx for 5 min, last tick 1 hour ago, unexpected assignment, kill_switch stuck on, staged close lost. Each: symptoms, diagnosis, fix, prevention. | T-8.7 |
+| **G-11: Per-symbol caps enforced cumulatively** | `MAX_CONTRACTS_PER_SYMBOL` and the per-symbol $ cap both subtract existing held contracts/collateral before computing remaining headroom. A symbol at the contract ceiling cannot accumulate further on subsequent ticks. The $ cap is tightened to a strike-aware floor that does not balloon for low-priced underlyings. | W-2, W-3 |
+| **G-12: Deployment velocity capped + per-symbol cool-down** | Total new collateral deployed in any single tick is capped (default ≤ 10% of equity). A symbol entered in tick N is excluded from candidate selection for the next K ticks (default K = 6, ≈ 30 minutes at 5-min cadence). Greedy re-selection of the same strike is prevented by construction, not by chance. | W-4 |
+| **G-13: Post-fill delta within target band** | Every filled CSP records `actual_delta` in a queryable column (not just inside intent_payload). A post-fill check warns or kill-switches if `abs(actual_delta - target_delta) > tolerance` (default tolerance 0.10). Operator gets a Telegram notification within one tick of a fill that lands materially outside intent. | W-9 |
 
 ---
 
@@ -523,17 +531,49 @@ These are the tasks to do **first**, before any of the larger phase work. Each i
 - Add a unit test: mock to return None; same assertion.
 - Run `uv run pytest tests/test_strategy_earnings*` — must be green.
 - Commit message: `fix: earnings filter fails closed on data unavailability`.
+- Resolves: F-3, G-2.
 
-### W-2: Per-name notional pre-submit cap (2-4 hours)
-- File: `src/kai_trader/strategy/candidates.py` (in `build_intents_with_diagnostics` after the existing collateral math).
-- Add a constant `PER_NAME_NOTIONAL_CAP_PCT = 0.15`.
-- Before emitting any intent: compute the symbol's existing collateral from the passed-in `existing_short_puts`. If `existing + new_intent_collateral > equity * PER_NAME_NOTIONAL_CAP_PCT`, reduce qty (or skip if even 1 contract breaches).
-- Increment a new diagnostic counter: `symbols_skipped_for_per_name_cap`.
-- Emit the diagnostic in the tick summary.
-- Test: a sleeve with $50K equity, MARA already at $7K (14%), candidate would add $2K → reject (would push to 18%, over 15% cap). A test where it stays under: pass.
-- Commit message: `feat: per-name 15% notional cap as pre-submit hard limit`.
+### W-2: Make MAX_CONTRACTS_PER_SYMBOL cumulative against existing positions (2-3 hours)
+- Files: `src/kai_trader/strategy/candidates.py` (the `_max_qty_for` function at line 317-336 and its callers).
+- The constant `MAX_CONTRACTS_PER_SYMBOL = 10` at line 32 is documented as a hard ceiling but only applies per build call. Production observation: MARA reached 30 contracts and SNAP 40 contracts because successive ticks each filled up to the cap.
+- Pass the symbol's existing held contract count into `_max_qty_for` (or via the broader build context). Compute `remaining_contract_headroom = max(0, MAX_CONTRACTS_PER_SYMBOL - existing_qty)`. Cap the returned qty by `remaining_contract_headroom`.
+- The existing held count can be derived from the same `existing_short_puts` list already passed to `build_intents_with_diagnostics`. Sum `abs(qty)` for positions whose underlying matches the candidate's underlying.
+- New diagnostic counter: `symbols_skipped_for_contract_ceiling`. Surface in tick summary.
+- Tests:
+  - Existing 8 contracts of MARA, candidate yields 5 → reduce to 2 (10 - 8).
+  - Existing 10 contracts of MARA, candidate yields anything → return 0.
+  - No existing → return min(qty, 10) (current behaviour preserved).
+- Commit message: `fix: per-symbol contract ceiling counts existing held positions`.
+- Resolves: F-12 (MARA / SNAP over-accumulation), G-11 (partial).
 
-### W-3: Persist `_pending` close state to Postgres (4-6 hours)
+### W-3: Tighten per-symbol $ cap with strike-aware floor (2-4 hours)
+- Files: `src/kai_trader/strategy/candidates.py` (`per_symbol_cap_pct` at lines 39-58, callers in `build_intents_with_diagnostics`).
+- The existing tiered cap (60% for $50K-$150K accounts, 30% for $150K-$500K, 15% over) is strike-blind. On low-priced names like MARA at $11.50 the 60% cap allows 52 contracts; on SNAP at $6 it allows 100.
+- Add a hard `PER_NAME_NOTIONAL_CAP_PCT = 0.15` ceiling that applies regardless of equity tier. The current tiered system can stay but must always cap at 15% as the upper bound.
+- Pre-submit check (after the existing cap math, before emitting an intent): compute the symbol's existing collateral. If `existing + new_intent_collateral > equity * 0.15`, reduce qty (or skip if even 1 contract breaches).
+- New diagnostic counter: `symbols_skipped_for_per_name_dollar_cap`. Surface in tick summary.
+- Tests:
+  - $100K equity, MARA already at $13K (13%), candidate adds 1 contract worth $1.15K → allowed (would be 14.15%).
+  - $100K equity, MARA already at $14K (14%), candidate adds 1 contract worth $1.15K → reject (would be 15.15%).
+  - $100K equity, no MARA position, candidate would add 30 MARA $11.50 contracts ($34.5K) → reduce qty to 13 (which is $14.95K, still under the cap).
+- Commit message: `feat: enforce 15% per-name notional cap regardless of strike`.
+- Resolves: F-13, G-11 (full).
+
+### W-4: Per-tick deployment velocity cap + per-symbol cool-down (3-5 hours)
+- Files: `src/kai_trader/strategy/candidates.py`, possibly new `src/kai_trader/strategy/cooldown.py`, possibly `src/kai_trader/db/orders.py` for cool-down lookup.
+- Two related fixes:
+  1. **Per-tick total-deployment cap.** Sum the total new collateral across all candidate intents in a single tick. Cap at `PER_TICK_DEPLOYMENT_CAP_PCT * equity` (default 0.10, i.e. 10% of equity). If the cap is exceeded, drop lowest-ranked candidates first until under.
+  2. **Per-symbol cool-down.** A symbol entered (filled or submitted) in the last `COOLDOWN_TICKS` ticks (default 6, ≈ 30 minutes at 5-min cadence) is excluded from candidate selection.
+- Cool-down lookup: query `orders` for the symbol's latest `submitted_at` and compare to now. Add an `orders` index on `(symbol, submitted_at desc)` if not present.
+- Diagnostic counters: `intents_dropped_for_velocity_cap`, `symbols_skipped_for_cooldown`. Surface in tick summary.
+- Tests:
+  - 5 candidates each $5K, equity $100K → cap 10% = $10K → top 2 candidates pass, rest dropped with `dropped_for_velocity_cap`.
+  - Symbol entered 3 ticks ago, cool-down = 6 ticks → skipped.
+  - Symbol entered 7 ticks ago, cool-down = 6 ticks → eligible.
+- Commit message: `feat: per-tick deployment cap and per-symbol cool-down`.
+- Resolves: F-14 (velocity), F-15 (greedy re-selection), G-12.
+
+### W-5: Persist `_pending` close state to Postgres (4-6 hours)
 - New migration `020_pending_close_state.sql`:
   ```sql
   create table pending_close (
@@ -554,32 +594,46 @@ These are the tasks to do **first**, before any of the larger phase work. Each i
 - On `bot/main.py` startup, run `cleanup_expired` once.
 - Tests: existing close handler tests need to mock the new helpers. Bot restart simulation: stage, kill cache, restart, confirm — assert the consume succeeds.
 - Commit message: `feat: persist /close staged state to Postgres for restart safety`.
+- Resolves: F-7, G-8 (partial — full state persistence still needs in-flight orders).
 
-### W-4: Fix or update the 5 failing strategy worker tests (2-4 hours)
+### W-6: Fix or update the 5 failing strategy worker tests (2-4 hours)
 - File: `tests/test_strategy_worker.py`.
 - Run each failing test individually. Read the actual production tick output, compare to assertion. Decide per test: is the production behaviour wrong (fix code), or has behaviour intentionally changed (update assertion)?
 - For `test_tick_submits_when_flags_green`: production reports "no expirations in sleeve DTE band" with the seeded fake chain. Likely the test fixture seeds a chain that doesn't include any expiration inside the new DTE filter. Update the fixture to include a contract at the right DTE.
 - Apply the same diagnostic rigor to the other 4 failing tests.
 - Run `uv run pytest` — must be 0 failures.
 - Commit message: `test: align strategy worker tests with post-5137da5 ranker behaviour`.
+- Resolves: F-5, G-6.
 
-### W-5: Memory profile + Render plan decision (1-2 hours, mostly waiting)
+### W-7: Memory profile + Render plan decision (1-2 hours, mostly waiting)
 - Add `tracemalloc.start()` at bot startup.
 - Add a periodic snapshot every hour that logs the top 20 allocations (file:line, size).
 - Deploy. Let it run 48h.
 - Read the snapshots: is there a leak (steady growth) or a baseline bigger than 512MB?
 - Decision: if leak, fix the leak. If baseline, bump Render plan to Standard ($25/mo).
 - Commit and document.
+- Resolves: F-4, G-3 (begins the 14-day clean-run window).
 
-### W-6: Document the multi-factor ranker + add IV/RV hard filter (3-5 hours)
+### W-8: Document the multi-factor ranker + add IV/RV hard filter (3-5 hours)
 - File: `src/kai_trader/strategy/candidates.py` (the ranker code added in commit `5137da5`).
 - Read the existing ranker. Write a top-of-function docstring listing the factors and weights.
 - Add an `iv_rv_ratio_min` constant (default 1.10). For each candidate, compute IV30 from the chain and RV30 from `market_data.get_daily_bars`. Reject if ratio < threshold.
-- Diagnostic counter: `symbols_skipped_for_iv_rv_floor`.
+- Diagnostic counter: `symbols_skipped_for_iv_rv_floor`. Surface in tick summary.
 - Test: candidate where IV30 = 0.30, RV30 = 0.35 (ratio 0.86) is rejected. Where IV30 = 0.40, RV30 = 0.30 (ratio 1.33) is allowed.
 - Commit message: `feat: enforce IV/RV >= 1.10 floor on entry selection`.
+- Resolves: F-11 (partial; T-6.5 completes the edge verification).
 
-After W-1 through W-6, you have a meaningfully safer paper system. **None of this is sufficient for live capital** — that's what Phases 6-9 are for. But this clears the highest-ROI defects from the immediate state.
+### W-9: Post-fill delta verification (3-4 hours)
+- Files: new migration `021_orders_actual_delta.sql`, `src/kai_trader/db/orders.py`, `src/kai_trader/strategy/worker.py` (the reconciliation path), possibly a new `src/kai_trader/strategy/post_fill_check.py`.
+- Migration adds `actual_delta numeric` and `target_delta numeric` columns to `orders` (queryable, indexed if needed).
+- When an intent is recorded, write `target_delta` from the regime's target.
+- When a fill is reconciled (`_reconcile_pending` in `worker.py`), look up the filled contract's current delta from the chain (or use the chain snapshot at fill time if cached); write to `actual_delta`.
+- Define `DELTA_TOLERANCE = 0.10` constant. After each reconciliation, if `abs(actual_delta - target_delta) > DELTA_TOLERANCE`, enqueue a `notifications` row at priority `warning` with the symbol, target, actual, and order id. Multiple breaches in one tick get batched into one notification.
+- Tests: target -0.40, actual -0.45 → no warning (within 0.10). Target -0.40, actual -0.55 → warning enqueued.
+- Commit message: `feat: post-fill delta verification with warning on out-of-band fills`.
+- Resolves: F-16, G-13.
+
+After W-1 through W-9, the strategy has cumulative caps, velocity limits, cool-downs, fail-closed earnings, persisted state, fixed tests, IV/RV-conditioned selection, and delta verification. **None of this is sufficient for live capital** — that's what Phases 6-9 are for. But this clears the highest-ROI defects from the immediate state and closes the over-allocation failure mode that produced the MARA-30 / SNAP-40 incident.
 
 ---
 
@@ -590,7 +644,7 @@ For each task above, the bar is:
 2. Unit tests added covering the happy path and at least one edge case.
 3. `uv run ruff check` clean.
 4. `uv run mypy --strict src/` clean (the benign `unused section(s): module = ['tests.*']` note is OK).
-5. `uv run pytest` zero failures (this requires W-4 to land first; until then, expected failures are documented in the commit message).
+5. `uv run pytest` zero failures (this requires W-6 to land first; until then, expected failures are documented in the commit message).
 6. Conventional commit message.
 7. **For any change that touches the broker submitters or the strategy entry path: a manual paper test.** Send a `/trade_now` from Telegram, confirm the change took effect as intended, attach the Telegram screenshot to the PR or commit description.
 
@@ -638,8 +692,8 @@ If you are picking this up fresh:
 4. **Pick W-1 (earnings fail-closed).** Smallest, highest-leverage. Execute end-to-end (read code, plan change, write code, write test, run tests, commit).
 5. **Push and verify deploy.** `git push origin main:claude/kai-trader-phase-1-sHFJk`. Watch Render. If no deploy event appears in 30 seconds, ask the user to hit Manual Deploy.
 6. **Confirm paper behaviour.** Send `/strategy_status` from Telegram. If the change is observable in the tick summary, screenshot.
-7. **Repeat for W-2 through W-6** in order.
-8. **Once W-1..W-6 are done, plan Phase 6 work.** Phase 6 is large enough that it should be its own sub-plan with the user.
+7. **Repeat for W-2 through W-9** in order.
+8. **Once W-1..W-9 are done, plan Phase 6 work.** Phase 6 is large enough that it should be its own sub-plan with the user.
 
 The user can interrupt at any time and shift priorities. When they do, **stop, ask what they want, then proceed.** Do not assume the existing plan is canonical if the user is asking about something else.
 
