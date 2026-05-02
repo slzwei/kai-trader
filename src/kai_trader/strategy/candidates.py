@@ -77,6 +77,8 @@ class SleeveDiagnostic:
     earnings_blackout_symbols: tuple[str, ...] = ()
     symbols_skipped_for_earnings_unknown: int = 0
     earnings_unknown_symbols: tuple[str, ...] = ()
+    symbols_skipped_for_contract_ceiling: int = 0
+    contract_ceiling_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,24 @@ class BuildDiagnostics:
                 f"all {total_cap_rejected} candidate(s) rejected by per-symbol "
                 f"cap (~${cap_dollars:.0f}). Strikes too expensive for the "
                 f"current account size."
+            )
+            return warnings
+        total_skipped_ceiling = sum(
+            s.symbols_skipped_for_contract_ceiling for s in self.sleeves
+        )
+        if total_skipped_ceiling > 0:
+            ceiling_symbols = sorted({
+                sym for s in self.sleeves for sym in s.contract_ceiling_symbols
+            })
+            sample = ", ".join(ceiling_symbols[:5])
+            more = (
+                f" (+{len(ceiling_symbols) - 5} more)"
+                if len(ceiling_symbols) > 5
+                else ""
+            )
+            warnings.append(
+                f"{total_skipped_ceiling} symbol(s) at per-symbol contract "
+                f"ceiling ({MAX_CONTRACTS_PER_SYMBOL}): {sample}{more}"
             )
             return warnings
         total_skipped_earnings = sum(
@@ -325,26 +345,62 @@ def _committed_collateral(
     return per_sleeve, per_symbol, total
 
 
+def _existing_contract_counts(
+    short_puts: list[PositionSnapshot],
+) -> dict[str, int]:
+    """Map each underlying ticker to its open short-put contract count.
+
+    Used by W-2 to enforce the per-symbol contract ceiling
+    cumulatively across ticks. Phase 5e already subtracts dollar
+    collateral; this complements that with a contract count so a
+    single name cannot accumulate beyond ``MAX_CONTRACTS_PER_SYMBOL``
+    no matter how many ticks fire.
+    """
+    counts: dict[str, int] = {}
+    for position in short_puts:
+        try:
+            underlying, _exp, opt_type, _strike = parse_occ_symbol(position.symbol)
+        except ValueError:
+            continue
+        if opt_type != "put":
+            continue
+        qty = abs(position.qty)
+        if qty <= 0:
+            continue
+        counts[underlying] = counts.get(underlying, 0) + int(qty)
+    return counts
+
+
 def _max_qty_for(
     contract: OptionContract,
     *,
     sleeve_remaining: Decimal,
     total_remaining: Decimal,
     per_symbol_remaining: Decimal,
+    existing_qty: int = 0,
 ) -> int:
-    """Compute the largest qty respecting sleeve cap, total cap, per-symbol cap.
+    """Compute the largest qty respecting sleeve, total, per-symbol caps.
 
-    All three remaining values are post-subtraction of any collateral
-    already committed to open positions.
+    All three remaining dollar values are post-subtraction of any
+    collateral already committed to open positions. ``existing_qty`` is
+    the open short-put contract count for the candidate's underlying;
+    the function caps the returned qty at
+    ``max(0, MAX_CONTRACTS_PER_SYMBOL - existing_qty)`` so the per-name
+    contract ceiling is enforced cumulatively across ticks (W-2). The
+    historical behaviour (no existing positions) is preserved when
+    ``existing_qty`` is zero.
     """
     per_contract_collateral = contract.strike * Decimal("100")
     if per_contract_collateral <= 0:
+        return 0
+    contract_remaining = max(0, MAX_CONTRACTS_PER_SYMBOL - existing_qty)
+    if contract_remaining <= 0:
         return 0
     headroom = min(sleeve_remaining, total_remaining, per_symbol_remaining)
     if headroom < per_contract_collateral:
         return 0
     qty = int(headroom // per_contract_collateral)
-    return min(qty, MAX_CONTRACTS_PER_SYMBOL)
+    return min(qty, contract_remaining)
 
 
 SPREAD_QUALITY_CUTOFF_PCT = Decimal("0.30")
@@ -440,6 +496,7 @@ async def build_intents_with_diagnostics(
     committed_per_sleeve, committed_per_symbol, committed_total = _committed_collateral(
         short_puts, sleeves
     )
+    existing_contracts = _existing_contract_counts(short_puts)
     total_remaining = max(
         equity * TOTAL_DEPLOYMENT_CAP_PCT - committed_total, Decimal("0")
     )
@@ -486,8 +543,10 @@ async def build_intents_with_diagnostics(
         candidates_cap_rejected = 0
         symbols_skipped_for_earnings = 0
         symbols_skipped_for_earnings_unknown = 0
+        symbols_skipped_for_contract_ceiling = 0
         earnings_blackout_symbols: list[str] = []
         earnings_unknown_symbols: list[str] = []
+        contract_ceiling_symbols: list[str] = []
 
         # Phase 1: walk the whitelist, fetch each chain, pick a strike.
         ranked: list[tuple[OptionContract, Decimal]] = []
@@ -572,11 +631,28 @@ async def build_intents_with_diagnostics(
             per_symbol_remaining = max(
                 per_symbol_cap_dollars - committed_for_underlying, Decimal("0")
             )
+            existing_qty = existing_contracts.get(contract.underlying, 0)
+            if existing_qty >= MAX_CONTRACTS_PER_SYMBOL:
+                # W-2: per-symbol contract ceiling already met by held
+                # positions. Refusing here is the cumulative version of
+                # the historical per-build cap.
+                symbols_skipped_for_contract_ceiling += 1
+                if contract.underlying not in contract_ceiling_symbols:
+                    contract_ceiling_symbols.append(contract.underlying)
+                _log.info(
+                    "strategy.sleeve.contract_ceiling",
+                    sleeve=sleeve.sleeve,
+                    symbol=contract.underlying,
+                    existing_qty=existing_qty,
+                    ceiling=MAX_CONTRACTS_PER_SYMBOL,
+                )
+                continue
             qty = _max_qty_for(
                 contract,
                 sleeve_remaining=sleeve_remaining,
                 total_remaining=total_remaining,
                 per_symbol_remaining=per_symbol_remaining,
+                existing_qty=existing_qty,
             )
             if qty < 1:
                 candidates_cap_rejected += 1
@@ -597,6 +673,7 @@ async def build_intents_with_diagnostics(
                 continue
             sleeve_remaining -= intent.collateral
             total_remaining -= intent.collateral
+            existing_contracts[contract.underlying] = existing_qty + intent.qty
             intents.append(intent)
             intents_built_for_sleeve += 1
 
@@ -618,6 +695,10 @@ async def build_intents_with_diagnostics(
                     symbols_skipped_for_earnings_unknown
                 ),
                 earnings_unknown_symbols=tuple(earnings_unknown_symbols),
+                symbols_skipped_for_contract_ceiling=(
+                    symbols_skipped_for_contract_ceiling
+                ),
+                contract_ceiling_symbols=tuple(contract_ceiling_symbols),
             )
         )
 

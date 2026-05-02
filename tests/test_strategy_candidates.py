@@ -1237,7 +1237,7 @@ async def test_committed_helper_ignores_non_put_options() -> None:
 
     sleeves = [_sleeve("stable_largecap", whitelist=["AMZN"])]
     positions = [
-        # Short call — ignored by put-only collateral accounting
+        # Short call. Ignored by put-only collateral accounting.
         PositionSnapshot(
             symbol="AMZN260506C00260000",
             qty=Decimal("-1"),
@@ -1248,7 +1248,7 @@ async def test_committed_helper_ignores_non_put_options() -> None:
             unrealized_pl=None,
             unrealized_intraday_pl=None,
         ),
-        # Long stock — not OCC
+        # Long stock. Not OCC.
         PositionSnapshot(
             symbol="AMZN",
             qty=Decimal("100"),
@@ -1264,3 +1264,160 @@ async def test_committed_helper_ignores_non_put_options() -> None:
     assert total == Decimal("0")
     assert per_symbol == {}
     assert per_sleeve["stable_largecap"] == Decimal("0")
+
+
+# ------------- W-2 cumulative MAX_CONTRACTS_PER_SYMBOL -------------
+
+
+async def test_max_qty_for_caps_at_remaining_contract_headroom() -> None:
+    """W-2: existing 8 contracts of MARA cap a 5-contract candidate at 2 (10 - 8)."""
+    from kai_trader.strategy.candidates import _max_qty_for
+
+    contract = _put(
+        strike=11.5,
+        delta=-0.40,
+        expiration=date(2026, 5, 8),
+        underlying="MARA",
+    )
+    # Headroom in dollars permits 5 contracts at $1.15k each = $5.75k total.
+    qty = _max_qty_for(
+        contract,
+        sleeve_remaining=Decimal("100000"),
+        total_remaining=Decimal("100000"),
+        per_symbol_remaining=Decimal("100000"),
+        existing_qty=8,
+    )
+    assert qty == 2
+
+
+async def test_max_qty_for_returns_zero_when_ceiling_already_met() -> None:
+    """W-2: existing 10 contracts means no further qty is permitted."""
+    from kai_trader.strategy.candidates import _max_qty_for
+
+    contract = _put(
+        strike=11.5,
+        delta=-0.40,
+        expiration=date(2026, 5, 8),
+        underlying="MARA",
+    )
+    qty = _max_qty_for(
+        contract,
+        sleeve_remaining=Decimal("100000"),
+        total_remaining=Decimal("100000"),
+        per_symbol_remaining=Decimal("100000"),
+        existing_qty=10,
+    )
+    assert qty == 0
+
+
+async def test_max_qty_for_no_existing_preserves_legacy_behaviour() -> None:
+    """W-2: existing_qty default of 0 yields the historical min(qty, 10) behaviour."""
+    from kai_trader.strategy.candidates import _max_qty_for
+
+    contract = _put(
+        strike=5,
+        delta=-0.30,
+        expiration=date(2026, 5, 8),
+        underlying="VERYCHEAP",
+    )
+    # Headroom permits >100 contracts at $500 each, so the ceiling binds.
+    qty = _max_qty_for(
+        contract,
+        sleeve_remaining=Decimal("1000000"),
+        total_remaining=Decimal("1000000"),
+        per_symbol_remaining=Decimal("1000000"),
+    )
+    assert qty == 10
+
+
+async def test_build_intents_skips_when_contract_ceiling_already_met() -> None:
+    """W-2: a symbol at the per-symbol contract ceiling is skipped on subsequent ticks."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=11.5, delta=-0.40, expiration=expiry, underlying="MARA")]
+
+    # 10 existing MARA short puts already at the ceiling.
+    held = [
+        _short_put_position("MARA260508P00011500", "-10"),
+    ]
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[
+            _sleeve("opportunistic", whitelist=["MARA"], target_pct=Decimal("1.0"))
+        ],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+        existing_short_puts=held,
+    )
+    assert intents == []
+    sleeve = diag.sleeves[0]
+    assert sleeve.symbols_skipped_for_contract_ceiling == 1
+    assert sleeve.contract_ceiling_symbols == ("MARA",)
+
+
+async def test_build_intents_reduces_qty_when_partial_ceiling_remaining() -> None:
+    """W-2: existing 8 MARA contracts means a new attempt is reduced to 2."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=11.5, delta=-0.40, expiration=expiry, underlying="MARA")]
+
+    held = [
+        _short_put_position("MARA260508P00011500", "-8"),
+    ]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[
+            _sleeve("opportunistic", whitelist=["MARA"], target_pct=Decimal("1.0"))
+        ],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+        existing_short_puts=held,
+    )
+    assert len(intents) == 1
+    assert intents[0].qty == 2
+
+
+async def test_existing_contract_counts_helper_aggregates_per_symbol() -> None:
+    """The W-2 helper sums |qty| for short put positions per underlying."""
+    from kai_trader.strategy.candidates import _existing_contract_counts
+
+    positions = [
+        _short_put_position("MARA260508P00011500", "-10"),
+        _short_put_position("MARA260515P00012000", "-5"),
+        _short_put_position("SNAP260508P00006000", "-20"),
+    ]
+    counts = _existing_contract_counts(positions)
+    assert counts == {"MARA": 15, "SNAP": 20}
+
+
+async def test_contract_ceiling_warning_surfaces_in_diagnostics() -> None:
+    """The W-2 ceiling diagnostic surfaces in tick warning lines."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=11.5, delta=-0.40, expiration=expiry, underlying="MARA")]
+
+    held = [_short_put_position("MARA260508P00011500", "-10")]
+
+    _intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[
+            _sleeve("opportunistic", whitelist=["MARA"], target_pct=Decimal("1.0"))
+        ],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+        existing_short_puts=held,
+    )
+    warnings = diag.warning_lines()
+    assert any("contract ceiling" in w for w in warnings)
+    assert any("MARA" in w for w in warnings)
