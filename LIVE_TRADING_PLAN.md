@@ -153,6 +153,7 @@ These are the issues that surfaced during the live diagnostic. Each becomes a ha
 | **F-14** | Critical | No per-tick total-deployment cap and no daily new-deployment cap. **Observed**: 4 ticks across 20 minutes (18:22 to 18:42 UTC on May 1) took the book from 0% to 96% of the $70,683 deployment cap, leaving $2,500 of dry powder for any overnight regime change. A live system needs both a per-tick velocity cap (prevents single-tick blow-out) and a daily ramp cap (prevents 4-hour blow-out across many ticks). See G-12, W-4. |
 | **F-15** | High | The greedy ranker keeps returning MARA P11.50 and SNAP P6 as top scores each tick (high annualised yield × tight spread). Phase 5e's collateral-aware cap math only blocks re-attempts when the per-symbol $ cap is fully consumed; below that, the same strikes accumulate. The ranker has no anti-recency penalty and no cool-down between entries on the same symbol. See G-12, W-4. |
 | **F-16** | Medium | Entry deltas are not verified post-fill. Target was -0.40 (risk_on) or -0.30 (neutral); `actual_delta` is stored only inside `orders.intent_payload` jsonb, not in a queryable column. **Without a post-fill check, a fill significantly outside the target band is invisible** until next tick's reconciliation, and even then only by inspecting position deltas. See G-13, W-9. |
+| **F-17** | High | Per-symbol decision rationale is not persisted structurally. The `BuildDiagnostics` object computes per-symbol filter outcomes (skipped for earnings / IV-RV floor / contract ceiling / per-name cap / cool-down / no qualifying strike, plus `selected`) every tick, but the result is rendered into the Telegram heartbeat as free-form text, then discarded. Operator cannot answer "why didn't we enter MSFT on 2026-04-30" without grepping notification rows. `intent_payload` only stores `qty/strike/expiration/target_delta/actual_delta`; `bid/ask/mid/collateral/expected_premium/yield_pct/score` are computed and thrown away. Discovered during the 2026-05-02 diagnostic conversation. See G-14, Phase 6.1. |
 
 ---
 
@@ -175,6 +176,7 @@ These are not improvements; they are **defects** the system has today that would
 | **G-11: Per-symbol caps enforced cumulatively** | `MAX_CONTRACTS_PER_SYMBOL` and the per-symbol $ cap both subtract existing held contracts/collateral before computing remaining headroom. A symbol at the contract ceiling cannot accumulate further on subsequent ticks. The $ cap is tightened to a strike-aware floor that does not balloon for low-priced underlyings. | W-2, W-3 |
 | **G-12: Deployment velocity capped (per tick + per day) + per-symbol cool-down** | Total new collateral deployed in any single tick is capped (default ≤ 10% of equity). Total new collateral deployed since UTC midnight is capped (default ≤ 30% of equity). A symbol entered in tick N is excluded from candidate selection for the next K ticks (default K = 6, ≈ 30 minutes at 5-min cadence). Greedy re-selection of the same strike, intra-day blow-out, and inter-tick stacking are all prevented by construction, not by chance. | W-4 |
 | **G-13: Post-fill delta within target band** | Every filled CSP records `actual_delta` in a queryable column (not just inside intent_payload). A post-fill check warns or kill-switches if `abs(actual_delta - target_delta) > tolerance` (default tolerance 0.10). Operator gets a Telegram notification within one tick of a fill that lands materially outside intent. | W-9 |
+| **G-14: Per-symbol decision auditability** | Every per-symbol candidate decision (selected or skipped) is recorded in a queryable Postgres table (`tick_decisions`) with a structured `reason` jsonb. Each tick gets a `tick_id` UUID; every `orders` row produced by that tick joins back via `tick_id`. The full `TradeIntent` (including `bid/ask/mid/collateral/expected_premium/yield_pct`) is persisted in `intent_payload`. Operator and Kai (chat) can answer "why was X picked / rejected on tick Y" with one SQL row, not a Telegram grep. | T-6.1.0 .. T-6.1.8 |
 
 ---
 
@@ -276,6 +278,340 @@ Acceptance: dedicated section in the backtest report showing the IV − RV distr
 After T-6.3 results land, propose three parameter sets (`risk_on`, `neutral`, `risk_off`) per the walk-forward findings. Migrate sleeve_config to support per-regime overrides if needed.
 
 Acceptance: new migration adding `*_risk_on`, `*_neutral`, `*_risk_off` columns where the data shows regime-fragile parameters. Strategy worker reads the right column for the active regime each tick.
+
+---
+
+### Phase 6.1: Structured decision audit (independent of Phase 6 backtest, ship as one focused session)
+
+**Goal.** Persist every per-symbol-per-tick decision (selected or skipped) to a queryable Postgres table, with a structured `reason`. Expand `intent_payload` to capture the full `TradeIntent` (currently `bid/ask/mid/collateral/expected_premium/yield_pct/score` are computed and discarded). Wire `tick_id` between `tick_decisions` and `orders` so every entry joins back to its decision context. Add a Kai chat tool to query decision history.
+
+**Why.** Closes G-14 (decision auditability). The data already exists in-memory inside `BuildDiagnostics`; this phase is plumbing, not new logic. The 2026-05-02 diagnostic conversation surfaced that "why did the bot enter SNAP" required reconstructing rationale from the live position rather than reading a stored decision row. That gap is closed by this phase.
+
+**Scope discipline.** This phase does **not** change selection behaviour. No new filters, no new caps, no ranker change. It only adds persistence and a read tool. If you find yourself editing the funnel logic, stop and split the change.
+
+**Out of scope.** Greeks aggregation (T-7.1), per-name aggregation in `system_pulse` (deferred to Phase 7.x), dashboard UI (Phase 5+).
+
+#### T-6.1.0: Migration `022_tick_decisions.sql` (PREREQUISITE)
+File: new `src/kai_trader/db/migrations/022_tick_decisions.sql`.
+
+Schema (idempotent; the migration runner enforces filename order):
+
+```sql
+-- Migration 022: per-symbol-per-tick decision audit.
+-- Every tick records one row per symbol the candidate funnel considered,
+-- whether the symbol was selected or skipped (and why). Closes G-14.
+-- Discovered necessary during the 2026-05-02 diagnostic session: the
+-- BuildDiagnostics object computed these per-symbol outcomes every tick
+-- but they were rendered into a Telegram heartbeat string and discarded.
+
+create table if not exists tick_decisions (
+  id uuid primary key default gen_random_uuid(),
+  tick_id uuid not null,
+  tick_at timestamptz not null,
+  sleeve text not null,
+  symbol text not null,
+  outcome text not null check (outcome in (
+    'selected',
+    'skipped_sleeve_inactive',
+    'skipped_earnings',
+    'skipped_earnings_unknown',
+    'skipped_iv_rv_floor',
+    'skipped_contract_ceiling',
+    'skipped_per_name_cap',
+    'skipped_cooldown',
+    'skipped_no_qualifying_strike',
+    'skipped_per_tick_cap',
+    'skipped_per_day_cap',
+    'skipped_total_cap_exhausted'
+  )),
+  reason jsonb not null default '{}'::jsonb,
+  selected_option_symbol text,
+  selected_strike numeric(12,4),
+  created_at timestamptz default now() not null
+);
+
+create index if not exists idx_tick_decisions_tick_id on tick_decisions(tick_id);
+create index if not exists idx_tick_decisions_symbol_at on tick_decisions(symbol, tick_at desc);
+create index if not exists idx_tick_decisions_outcome_at on tick_decisions(outcome, tick_at desc);
+create index if not exists idx_tick_decisions_tick_at on tick_decisions(tick_at desc);
+```
+
+Acceptance: `uv run python scripts/apply_migrations.py` succeeds. `select count(*) from tick_decisions` returns 0. Re-running the script is a no-op (`schema_migrations` row exists). The `kai_chat_ro` role automatically inherits `select` via `default privileges` set by `scripts/create_chat_ro_role.py:60-65`.
+
+#### T-6.1.1: Migration `023_orders_tick_id.sql`
+File: new `src/kai_trader/db/migrations/023_orders_tick_id.sql`.
+
+```sql
+-- Migration 023: link orders rows to the tick that produced them.
+-- Existing rows get NULL (no backfill); only entries from worker.py
+-- after this migration carry tick_id. The join "what other symbols
+-- did the bot consider on the same tick that produced this order"
+-- becomes one query.
+
+alter table orders add column if not exists tick_id uuid;
+create index if not exists idx_orders_tick_id on orders(tick_id) where tick_id is not null;
+```
+
+Acceptance: column exists; existing rows have `tick_id is null`; future entries (after T-6.1.5) populate it.
+
+#### T-6.1.2: `SymbolDecision` dataclass + outcome enum + helper
+File: `src/kai_trader/strategy/candidates.py`.
+
+Add near the top of the file (after the existing imports, before `SleeveDiagnostics`):
+
+```python
+# Outcome tags. Mirror the migration 022 CHECK constraint exactly.
+OUTCOME_SELECTED = "selected"
+OUTCOME_SKIPPED_SLEEVE_INACTIVE = "skipped_sleeve_inactive"
+OUTCOME_SKIPPED_EARNINGS = "skipped_earnings"
+OUTCOME_SKIPPED_EARNINGS_UNKNOWN = "skipped_earnings_unknown"
+OUTCOME_SKIPPED_IV_RV_FLOOR = "skipped_iv_rv_floor"
+OUTCOME_SKIPPED_CONTRACT_CEILING = "skipped_contract_ceiling"
+OUTCOME_SKIPPED_PER_NAME_CAP = "skipped_per_name_cap"
+OUTCOME_SKIPPED_COOLDOWN = "skipped_cooldown"
+OUTCOME_SKIPPED_NO_QUALIFYING_STRIKE = "skipped_no_qualifying_strike"
+OUTCOME_SKIPPED_PER_TICK_CAP = "skipped_per_tick_cap"
+OUTCOME_SKIPPED_PER_DAY_CAP = "skipped_per_day_cap"
+OUTCOME_SKIPPED_TOTAL_CAP_EXHAUSTED = "skipped_total_cap_exhausted"
+
+ALL_OUTCOMES: frozenset[str] = frozenset({
+    OUTCOME_SELECTED,
+    OUTCOME_SKIPPED_SLEEVE_INACTIVE,
+    OUTCOME_SKIPPED_EARNINGS,
+    OUTCOME_SKIPPED_EARNINGS_UNKNOWN,
+    OUTCOME_SKIPPED_IV_RV_FLOOR,
+    OUTCOME_SKIPPED_CONTRACT_CEILING,
+    OUTCOME_SKIPPED_PER_NAME_CAP,
+    OUTCOME_SKIPPED_COOLDOWN,
+    OUTCOME_SKIPPED_NO_QUALIFYING_STRIKE,
+    OUTCOME_SKIPPED_PER_TICK_CAP,
+    OUTCOME_SKIPPED_PER_DAY_CAP,
+    OUTCOME_SKIPPED_TOTAL_CAP_EXHAUSTED,
+})
+
+
+@dataclass(frozen=True)
+class SymbolDecision:
+    """One per-symbol outcome from the candidate funnel for a single tick.
+
+    Persisted to the ``tick_decisions`` table by the worker. The
+    ``reason`` dict is structured per outcome (see T-6.1.3 schema).
+    """
+
+    sleeve: str
+    symbol: str
+    outcome: str
+    reason: dict[str, Any]
+    selected_option_symbol: str | None = None
+    selected_strike: Decimal | None = None
+```
+
+Add to `BuildDiagnostics`:
+
+```python
+@dataclass
+class BuildDiagnostics:
+    sleeves: list[SleeveDiagnostics]
+    decisions: list[SymbolDecision] = field(default_factory=list)
+    # ... existing fields preserved
+```
+
+Acceptance: `from kai_trader.strategy.candidates import SymbolDecision, ALL_OUTCOMES, OUTCOME_SELECTED` succeeds. `len(ALL_OUTCOMES) == 12`. `BuildDiagnostics().decisions == []`.
+
+#### T-6.1.3: Wire `SymbolDecision` through every filter branch
+File: `src/kai_trader/strategy/candidates.py`, primarily inside `build_intents_with_diagnostics`.
+
+For each existing place where the funnel skips a symbol or selects one, append a matching `SymbolDecision` to `diagnostics.decisions`. **Do not remove the existing counters** (the heartbeat reader uses them); only **add** the structured decision.
+
+Required reason payloads per outcome:
+
+| Outcome | Required `reason` keys | Optional |
+|---|---|---|
+| `selected` | `target_delta, actual_delta, strike, qty, bid, ask, mid, collateral, expected_premium, yield_pct, sleeve_remaining_after` | `score` (if ranker emits one) |
+| `skipped_sleeve_inactive` | `sleeve_enabled, regime` | |
+| `skipped_earnings` | `days_to_earnings, dte_min, dte_max` | |
+| `skipped_earnings_unknown` | `lookup_error` (str) | |
+| `skipped_iv_rv_floor` | `iv30, rv30, ratio, floor` | |
+| `skipped_contract_ceiling` | `existing_qty, max_per_symbol, would_be_qty` | |
+| `skipped_per_name_cap` | `existing_collateral, candidate_collateral, total_after, equity, cap_pct, cap_dollars` | |
+| `skipped_cooldown` | `ticks_since_last_entry, cooldown_ticks` | |
+| `skipped_no_qualifying_strike` | `target_delta, dte_min, dte_max, n_puts_in_chain, n_puts_with_delta_in_band` | |
+| `skipped_per_tick_cap` | `candidate_collateral, deployed_this_tick, cap_pct, cap_dollars` | |
+| `skipped_per_day_cap` | `candidate_collateral, deployed_today, cap_pct, cap_dollars` | |
+| `skipped_total_cap_exhausted` | `deployed_total, cap_dollars, candidate_collateral` | |
+
+All numeric values: serialise `Decimal` to `str` (jsonb stores them as strings; this matches the existing `intent_payload` convention).
+
+Acceptance: new test file `tests/test_candidates_decisions.py` exercises each branch and asserts (a) one `SymbolDecision` per branch with the right `outcome`, (b) every required `reason` key present, (c) `len(diagnostics.decisions) == n_symbols_considered` after a multi-symbol tick.
+
+#### T-6.1.4: `tick_decisions` DB helpers
+File: new `src/kai_trader/db/tick_decisions.py`.
+
+```python
+"""Persistence and read helpers for the tick_decisions audit table.
+
+One row per (tick_id, symbol). Written in batch by the strategy
+worker at the end of each tick (T-6.1.5). Read by the chat layer
+(T-6.1.7) and by ad-hoc operator queries.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
+from uuid import UUID
+
+import asyncpg
+
+from kai_trader.db.client import get_pool
+from kai_trader.strategy.candidates import SymbolDecision
+
+
+@dataclass(frozen=True)
+class TickDecisionRow:
+    id: UUID
+    tick_id: UUID
+    tick_at: datetime
+    sleeve: str
+    symbol: str
+    outcome: str
+    reason: dict[str, Any]
+    selected_option_symbol: str | None
+    selected_strike: Decimal | None
+
+
+async def record_tick_decisions(
+    tick_id: UUID,
+    tick_at: datetime,
+    decisions: list[SymbolDecision],
+) -> int:
+    """Batch-insert decisions for one tick. Returns row count."""
+    if not decisions:
+        return 0
+    pool = await get_pool()
+    rows = [
+        (
+            tick_id,
+            tick_at,
+            d.sleeve,
+            d.symbol,
+            d.outcome,
+            json.dumps(d.reason, default=str),
+            d.selected_option_symbol,
+            d.selected_strike,
+        )
+        for d in decisions
+    ]
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """
+            insert into tick_decisions
+              (tick_id, tick_at, sleeve, symbol, outcome, reason,
+               selected_option_symbol, selected_strike)
+            values ($1, $2, $3, $4, $5, $6, $7, $8)
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+async def recent_tick_decisions(
+    *,
+    symbol: str | None = None,
+    since: datetime | None = None,
+    outcome: str | None = None,
+    limit: int = 200,
+) -> list[TickDecisionRow]:
+    """Read decisions matching filters, newest first. Caps at ``limit``."""
+    # ... query construction with parameterised filters; reject ``limit``
+    #     above 1000; raise ValueError if outcome not in ALL_OUTCOMES.
+```
+
+Acceptance: round-trip test in `tests/test_db_tick_decisions.py` inserts 10 decisions across 2 ticks, reads them back filtered by `symbol`, `outcome`, `since`, asserts ordering and that `limit=5` returns 5.
+
+#### T-6.1.5: Wire `worker.py` to generate `tick_id`, batch-write decisions, pass to `record_intent`
+File: `src/kai_trader/strategy/worker.py`.
+
+At the top of each tick:
+
+```python
+from uuid import uuid4
+from datetime import datetime, UTC
+
+tick_id = uuid4()
+tick_at = datetime.now(UTC)
+```
+
+After `build_intents_with_diagnostics` returns, before any submit calls:
+
+```python
+await record_tick_decisions(tick_id, tick_at, diagnostics.decisions)
+```
+
+For every `record_intent` call, pass `tick_id=tick_id` (requires T-6.1.6). Order of writes matters: decisions land first, then orders that reference them. If the decisions write fails, log a warning and continue with submit (decisions are audit, not gating; never block trading on audit failure).
+
+Acceptance: extend `tests/test_strategy_worker_e2e.py` (or the existing e2e file) with a tick that considers 5 symbols, asserts `select count(*) from tick_decisions where tick_id = $1` returns 5. Assert that any `orders` row created on that tick has matching `tick_id`.
+
+#### T-6.1.6: Expand `intent_payload` to full `TradeIntent` + accept `tick_id`
+File: `src/kai_trader/db/orders.py`.
+
+Change `record_intent` signature to accept `tick_id: UUID | None = None` and write it. Replace the partial intent serialisation with the full dataclass:
+
+```python
+import dataclasses
+# ...
+intent_payload = {
+    k: (str(v) if isinstance(v, Decimal) else v if not isinstance(v, date) else v.isoformat())
+    for k, v in dataclasses.asdict(intent).items()
+}
+# include all TradeIntent fields: sleeve, symbol, option_symbol,
+# strike, expiration, target_delta, actual_delta, bid, ask, mid,
+# qty, collateral, expected_premium, yield_pct
+```
+
+Update the `Order` dataclass and `_row_to_order` accordingly.
+
+Acceptance: extend `tests/test_orders.py` to assert that after `record_intent`, the round-tripped `intent_payload` contains all 14 `TradeIntent` field names. `tick_id` round-trips unchanged.
+
+#### T-6.1.7: New chat tool `query_tick_decisions` + system prompt addendum
+Files: `src/kai_trader/chat/tools.py`, `src/kai_trader/chat/system_prompt.py`, `tests/test_chat_tools.py`, `tests/test_chat_accuracy.py`.
+
+Add a tool tagged `HISTORY` (per the W-1..W-9 chat accuracy convention). Args: `symbol: str | None`, `since_iso: str | None` (default 7d ago), `outcome: str | None`. Caps at 200 rows; returns `_meta.truncated` per the existing readonly result convention (see `db/readonly.py:ReadOnlyResult`).
+
+Tool schema:
+```python
+{
+    "name": "query_tick_decisions",
+    "description": "HISTORY tool. Read per-symbol per-tick decision rows from tick_decisions. Use this to answer 'why did/didn't we enter X' or 'what was rejected on tick Y' questions. Returns at most 200 rows; check _meta.truncated.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string"},
+            "since_iso": {"type": "string", "description": "ISO-8601 UTC. Default: 7 days ago."},
+            "outcome": {"type": "string", "enum": [...]},  # use ALL_OUTCOMES
+        },
+        "required": [],
+    },
+}
+```
+
+System prompt addendum (append a single sentence to the `# Live vs history` section's HISTORY list): `"- query_tick_decisions: per-symbol per-tick funnel outcomes (selected or skipped, with structured reason)."`
+
+Acceptance: `tests/test_chat_tools.py` covers (a) the tool roundtrip, (b) limit cap, (c) outcome filter validation. `tests/test_chat_accuracy.py:_REQUIRED_PROMPT_RULES` adds a key for `query_tick_decisions` mention; the test suite confirms the addendum is present. `_REQUIRED_TOOL_TAGS` (or equivalent) covers the new tool with tag `HISTORY`.
+
+#### T-6.1.8: e2e smoke + regression
+File: extend `tests/test_e2e_strategy_pipeline.py` (or the existing e2e smoke).
+
+A single tick with 5 watchlist symbols (mock chain fetcher seeds 2 selected, 3 skipped for varying reasons) results in:
+- 5 `tick_decisions` rows with the same `tick_id`.
+- 2 `orders` rows with the same `tick_id`.
+- `orders.tick_id` matches `tick_decisions.tick_id`.
+- `intent_payload` for each order contains all 14 `TradeIntent` fields.
+
+Acceptance: e2e green. `uv run pytest --no-cov` reports 0 failures.
 
 ---
 
