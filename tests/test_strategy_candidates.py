@@ -672,8 +672,8 @@ async def test_diagnostics_flag_cap_rejection() -> None:
 # ------------- earnings blackout filter (Phase 5d) -------------
 
 
-async def test_earnings_filter_skips_symbol_in_blackout() -> None:
-    """When the filter returns True for a symbol, skip it; chain is never fetched."""
+async def test_earnings_status_skips_symbol_in_blackout() -> None:
+    """When the status provider reports in_window for a symbol, skip it; the chain is never fetched."""
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
@@ -683,8 +683,8 @@ async def test_earnings_filter_skips_symbol_in_blackout() -> None:
         chain_calls.append(symbol)
         return [_put(strike=50, delta=-0.30, expiration=expiry, underlying=symbol)]
 
-    async def earnings_filter(symbol: str, _today: date, _dte_max: int) -> bool:
-        return symbol == "BLACKOUT"
+    async def earnings_status(symbol: str, _today: date, _dte_max: int) -> str:
+        return "in_window" if symbol == "BLACKOUT" else "outside_window"
 
     intents, diag = await build_intents_with_diagnostics(
         regime=_regime("risk_on"),
@@ -692,7 +692,7 @@ async def test_earnings_filter_skips_symbol_in_blackout() -> None:
         account=_account(),
         chain_fetcher=fetcher,
         today=today,
-        earnings_filter=earnings_filter,
+        earnings_status=earnings_status,
     )
     assert chain_calls == ["OK"]
     assert len(intents) == 1
@@ -700,10 +700,11 @@ async def test_earnings_filter_skips_symbol_in_blackout() -> None:
     sleeve = diag.sleeves[0]
     assert sleeve.symbols_skipped_for_earnings == 1
     assert sleeve.earnings_blackout_symbols == ("BLACKOUT",)
+    assert sleeve.symbols_skipped_for_earnings_unknown == 0
 
 
-async def test_earnings_filter_disabled_per_sleeve() -> None:
-    """A sleeve with earnings_blackout_enabled=False ignores the filter."""
+async def test_earnings_status_disabled_per_sleeve() -> None:
+    """A sleeve with earnings_blackout_enabled=False ignores the status provider."""
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
@@ -713,8 +714,8 @@ async def test_earnings_filter_disabled_per_sleeve() -> None:
         chain_calls.append(symbol)
         return [_put(strike=50, delta=-0.30, expiration=expiry)]
 
-    async def always_blackout(_s: str, _t: date, _d: int) -> bool:
-        return True
+    async def always_blackout(_s: str, _t: date, _d: int) -> str:
+        return "in_window"
 
     sleeve_off = _sleeve("opportunistic", whitelist=["NVDA"])
     # rebuild with earnings_blackout_enabled=False
@@ -741,32 +742,68 @@ async def test_earnings_filter_disabled_per_sleeve() -> None:
         account=_account(),
         chain_fetcher=fetcher,
         today=today,
-        earnings_filter=always_blackout,
+        earnings_status=always_blackout,
     )
     assert chain_calls == ["NVDA"]
     assert len(intents) == 1
 
 
-async def test_earnings_filter_failure_falls_open() -> None:
-    """A filter exception must not block trading - log and proceed."""
+async def test_earnings_status_failure_skips_fail_closed() -> None:
+    """W-1 fail-closed: an exception from the status provider must skip the symbol.
+
+    Phase 5d's behaviour was to log and proceed (fail-open); that is unsafe
+    for live capital because a yfinance outage during earnings season would
+    let the strategy write CSPs across reporting names. The new posture
+    treats any exception as 'unknown' and skips the candidate.
+    """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
     async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
         return [_put(strike=50, delta=-0.30, expiration=expiry)]
 
-    async def boom(_s: str, _t: date, _d: int) -> bool:
+    async def boom(_s: str, _t: date, _d: int) -> str:
         raise RuntimeError("yfinance down")
 
-    intents, _diag = await build_intents_with_diagnostics(
+    intents, diag = await build_intents_with_diagnostics(
         regime=_regime("risk_on"),
         sleeves=[_sleeve("index_core", whitelist=["AMZN"])],
         account=_account(),
         chain_fetcher=fetcher,
         today=today,
-        earnings_filter=boom,
+        earnings_status=boom,
     )
-    assert len(intents) == 1
+    assert intents == []
+    sleeve = diag.sleeves[0]
+    assert sleeve.symbols_skipped_for_earnings == 1
+    assert sleeve.symbols_skipped_for_earnings_unknown == 1
+    assert sleeve.earnings_unknown_symbols == ("AMZN",)
+
+
+async def test_earnings_status_unknown_increments_unknown_counter() -> None:
+    """When the status is 'unknown', skip the symbol and count it as unknown."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_put(strike=50, delta=-0.30, expiration=expiry)]
+
+    async def status_unknown(_s: str, _t: date, _d: int) -> str:
+        return "unknown"
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["AMZN", "AAPL"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+        earnings_status=status_unknown,
+    )
+    assert intents == []
+    sleeve = diag.sleeves[0]
+    assert sleeve.symbols_skipped_for_earnings == 2
+    assert sleeve.symbols_skipped_for_earnings_unknown == 2
+    assert sleeve.earnings_unknown_symbols == ("AMZN", "AAPL")
 
 
 async def test_earnings_warning_surfaces_in_diagnostics() -> None:
@@ -775,8 +812,8 @@ async def test_earnings_warning_surfaces_in_diagnostics() -> None:
     async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
         return []
 
-    async def all_blackout(_s: str, _t: date, _d: int) -> bool:
-        return True
+    async def all_blackout(_s: str, _t: date, _d: int) -> str:
+        return "in_window"
 
     intents, diag = await build_intents_with_diagnostics(
         regime=_regime("risk_on"),
@@ -784,11 +821,33 @@ async def test_earnings_warning_surfaces_in_diagnostics() -> None:
         account=_account(),
         chain_fetcher=fetcher,
         today=today,
-        earnings_filter=all_blackout,
+        earnings_status=all_blackout,
     )
     assert intents == []
     warnings = diag.warning_lines()
     assert any("earnings blackout" in w for w in warnings)
+
+
+async def test_earnings_unknown_warning_includes_fail_closed_breakdown() -> None:
+    """When some skips are unknown, the warning surfaces the fail-closed count."""
+    today = date(2026, 4, 27)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return []
+
+    async def mixed_status(symbol: str, _t: date, _d: int) -> str:
+        return "unknown" if symbol in {"A", "B"} else "in_window"
+
+    _intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["A", "B", "C"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+        earnings_status=mixed_status,
+    )
+    warnings = diag.warning_lines()
+    assert any("2 unknown, fail-closed" in w for w in warnings)
 
 
 # ------------- collateral accounting (Phase 5e) -------------

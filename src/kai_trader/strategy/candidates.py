@@ -21,6 +21,7 @@ from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
 from kai_trader.broker.options_data import OptionContract, parse_occ_symbol
 from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.logging import get_logger
+from kai_trader.strategy.earnings import EarningsStatus
 from kai_trader.strategy.regime import RegimeSnapshot
 
 ChainFetcher = Callable[[str, date | None], Awaitable[list[OptionContract]]]
@@ -74,6 +75,8 @@ class SleeveDiagnostic:
     per_symbol_cap_dollars: Decimal = Decimal("0")
     symbols_skipped_for_earnings: int = 0
     earnings_blackout_symbols: tuple[str, ...] = ()
+    symbols_skipped_for_earnings_unknown: int = 0
+    earnings_unknown_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -136,15 +139,23 @@ class BuildDiagnostics:
         total_skipped_earnings = sum(
             s.symbols_skipped_for_earnings for s in self.sleeves
         )
+        total_skipped_unknown = sum(
+            s.symbols_skipped_for_earnings_unknown for s in self.sleeves
+        )
         if total_skipped_earnings > 0:
             symbols = sorted({
                 sym for s in self.sleeves for sym in s.earnings_blackout_symbols
             })
             sample = ", ".join(symbols[:5])
             more = f" (+{len(symbols) - 5} more)" if len(symbols) > 5 else ""
+            unknown_note = (
+                f" ({total_skipped_unknown} unknown, fail-closed)"
+                if total_skipped_unknown > 0
+                else ""
+            )
             warnings.append(
                 f"{total_skipped_earnings} symbol(s) skipped for earnings "
-                f"blackout: {sample}{more}"
+                f"blackout{unknown_note}: {sample}{more}"
             )
         return warnings
 
@@ -372,7 +383,7 @@ def _score_candidate(contract: OptionContract, today: date) -> Decimal | None:
     return annualised_yield * spread_quality
 
 
-EarningsFilter = Callable[[str, date, int], Awaitable[bool]]
+EarningsStatusProvider = Callable[[str, date, int], Awaitable[EarningsStatus]]
 
 
 async def build_intents(
@@ -382,7 +393,7 @@ async def build_intents(
     chain_fetcher: ChainFetcher,
     *,
     today: date | None = None,
-    earnings_filter: EarningsFilter | None = None,
+    earnings_status: EarningsStatusProvider | None = None,
     existing_short_puts: list[PositionSnapshot] | None = None,
 ) -> list[TradeIntent]:
     """Walk active sleeves and produce intent rows up to the cap matrix.
@@ -396,7 +407,7 @@ async def build_intents(
         account=account,
         chain_fetcher=chain_fetcher,
         today=today,
-        earnings_filter=earnings_filter,
+        earnings_status=earnings_status,
         existing_short_puts=existing_short_puts,
     )
     return intents
@@ -409,7 +420,7 @@ async def build_intents_with_diagnostics(
     chain_fetcher: ChainFetcher,
     *,
     today: date | None = None,
-    earnings_filter: EarningsFilter | None = None,
+    earnings_status: EarningsStatusProvider | None = None,
     existing_short_puts: list[PositionSnapshot] | None = None,
 ) -> tuple[list[TradeIntent], BuildDiagnostics]:
     """Build intents and return the per-sleeve diagnostic counters alongside.
@@ -474,31 +485,38 @@ async def build_intents_with_diagnostics(
         intents_built_for_sleeve = 0
         candidates_cap_rejected = 0
         symbols_skipped_for_earnings = 0
+        symbols_skipped_for_earnings_unknown = 0
         earnings_blackout_symbols: list[str] = []
+        earnings_unknown_symbols: list[str] = []
 
         # Phase 1: walk the whitelist, fetch each chain, pick a strike.
         ranked: list[tuple[OptionContract, Decimal]] = []
         for symbol in sleeve.symbol_whitelist:
-            if earnings_filter is not None and sleeve.earnings_blackout_enabled:
+            if earnings_status is not None and sleeve.earnings_blackout_enabled:
+                status: EarningsStatus
                 try:
-                    blackout = await earnings_filter(
+                    status = await earnings_status(
                         symbol, today, sleeve.target_dte_max
                     )
                 except Exception as exc:
                     _log.warning(
-                        "strategy.earnings_filter.failed",
+                        "strategy.earnings_status.failed",
                         sleeve=sleeve.sleeve,
                         symbol=symbol,
                         error=str(exc),
                     )
-                    blackout = False
-                if blackout:
+                    status = "unknown"
+                if status != "outside_window":
                     symbols_skipped_for_earnings += 1
                     earnings_blackout_symbols.append(symbol)
+                    if status == "unknown":
+                        symbols_skipped_for_earnings_unknown += 1
+                        earnings_unknown_symbols.append(symbol)
                     _log.info(
                         "strategy.earnings.skipped",
                         sleeve=sleeve.sleeve,
                         symbol=symbol,
+                        status=status,
                     )
                     continue
             try:
@@ -596,6 +614,10 @@ async def build_intents_with_diagnostics(
                 per_symbol_cap_dollars=per_symbol_cap_dollars,
                 symbols_skipped_for_earnings=symbols_skipped_for_earnings,
                 earnings_blackout_symbols=tuple(earnings_blackout_symbols),
+                symbols_skipped_for_earnings_unknown=(
+                    symbols_skipped_for_earnings_unknown
+                ),
+                earnings_unknown_symbols=tuple(earnings_unknown_symbols),
             )
         )
 

@@ -47,9 +47,16 @@ async def test_get_next_earnings_caches_results(
     assert calls == 1
 
 
-async def test_get_next_earnings_fails_open_on_yfinance_error(
+async def test_get_next_earnings_returns_none_on_yfinance_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A raise inside the sync fetch is swallowed and surfaced as None.
+
+    The fail-closed policy is enforced by callers (is_earnings_in_window
+    treats None as "skip"). This function simply returns None so callers
+    can apply that policy uniformly.
+    """
+
     def _failing_fetch(symbol: str) -> date:
         raise RuntimeError("yfinance down")
 
@@ -101,10 +108,16 @@ async def test_is_earnings_in_window_false_when_after_window(
     assert await earnings.is_earnings_in_window("AMZN", today, dte_max=10) is False
 
 
-async def test_is_earnings_in_window_fails_open_when_unknown(
+async def test_is_earnings_in_window_skips_when_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When yfinance returns no upcoming row, treat as 'not in window'."""
+    """W-1 fail-closed: a None lookup result causes the symbol to be skipped.
+
+    The historical Phase 5d behaviour returned False here (fail-open). On
+    live capital that is unsafe: a yfinance outage during earnings season
+    would let the strategy write CSPs across reporting names. The current
+    posture skips on unknown.
+    """
 
     def _empty(symbol: str) -> None:
         return None
@@ -112,7 +125,83 @@ async def test_is_earnings_in_window_fails_open_when_unknown(
     monkeypatch.setattr(earnings, "_fetch_earnings_sync", _empty)
     assert (
         await earnings.is_earnings_in_window("AMZN", date(2026, 4, 27), dte_max=10)
-        is False
+        is True
+    )
+
+
+async def test_is_earnings_in_window_skips_when_lookup_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W-1 fail-closed: an exception during the sync fetch results in a skip."""
+
+    def _boom(symbol: str) -> date:
+        raise RuntimeError("yfinance down")
+
+    monkeypatch.setattr(earnings, "_fetch_earnings_sync", _boom)
+    assert (
+        await earnings.is_earnings_in_window("AAPL", date(2026, 4, 27), dte_max=7)
+        is True
+    )
+
+
+async def test_get_earnings_status_in_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    today = date(2026, 4, 27)
+    earn = today + timedelta(days=5)
+
+    def _fake_fetch(symbol: str) -> date:
+        return earn
+
+    monkeypatch.setattr(earnings, "_fetch_earnings_sync", _fake_fetch)
+    assert (
+        await earnings.get_earnings_status("MSFT", today, dte_max=10) == "in_window"
+    )
+
+
+async def test_get_earnings_status_outside_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    today = date(2026, 4, 27)
+    earn = today + timedelta(days=30)
+
+    def _fake_fetch(symbol: str) -> date:
+        return earn
+
+    monkeypatch.setattr(earnings, "_fetch_earnings_sync", _fake_fetch)
+    assert (
+        await earnings.get_earnings_status("MSFT", today, dte_max=10)
+        == "outside_window"
+    )
+
+
+async def test_get_earnings_status_unknown_on_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No upcoming row from yfinance is classified as unknown, not safe."""
+
+    def _empty(symbol: str) -> None:
+        return None
+
+    monkeypatch.setattr(earnings, "_fetch_earnings_sync", _empty)
+    assert (
+        await earnings.get_earnings_status("MSFT", date(2026, 4, 27), dte_max=10)
+        == "unknown"
+    )
+
+
+async def test_get_earnings_status_unknown_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception during fetch is classified as unknown."""
+
+    def _boom(symbol: str) -> date:
+        raise RuntimeError("yfinance down")
+
+    monkeypatch.setattr(earnings, "_fetch_earnings_sync", _boom)
+    assert (
+        await earnings.get_earnings_status("MSFT", date(2026, 4, 27), dte_max=10)
+        == "unknown"
     )
 
 
