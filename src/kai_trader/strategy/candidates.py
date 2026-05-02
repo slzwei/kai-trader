@@ -32,11 +32,19 @@ _log = get_logger(__name__)
 TOTAL_DEPLOYMENT_CAP_PCT = Decimal("0.70")  # max 70% of equity in CSP collateral
 MAX_CONTRACTS_PER_SYMBOL = 10  # hard ceiling regardless of sleeve headroom
 
-# Per-symbol concentration cap as a fraction of equity, scaled by account
-# size. Smaller accounts get a looser cap so a single CSP on a normal-priced
-# underlying (e.g. SPY at ~$580 strike = $58k collateral) can clear the
-# limit at all; large accounts tighten down for diversification. The total
-# deployment cap and the hard contract ceiling still bound risk.
+# W-3: hard 15% per-name notional ceiling. The historical per-symbol cap
+# was tiered (60% at small accounts, 15% at large) because at $50k equity
+# a single SPY contract would exceed a 15% cap and the strategy would never
+# write anything. The over-allocation incident on 2026-05-01 showed that
+# 60% of equity in a single low-priced name is also catastrophic: MARA
+# reached 51% of equity, SNAP 40%, in 20 minutes. Live capital cannot
+# tolerate either failure mode. The fix: cap every account at 15%
+# regardless of equity tier and accept that small paper accounts will pass
+# on names whose strikes exceed 15% of equity. The previous tier table is
+# kept as the inner cap so a future regime might tighten further (e.g. for
+# very large books) but no tier is ever permitted to exceed 15%.
+PER_NAME_NOTIONAL_CAP_PCT = Decimal("0.15")
+
 _PER_SYMBOL_CAP_TIERS: tuple[tuple[Decimal, Decimal], ...] = (
     (Decimal("50000"), Decimal("1.00")),
     (Decimal("150000"), Decimal("0.60")),
@@ -48,15 +56,17 @@ _PER_SYMBOL_CAP_FLOOR = Decimal("0.15")
 def per_symbol_cap_pct(equity: Decimal) -> Decimal:
     """Return the per-symbol cap fraction for the given equity.
 
-    Tiered so a $50k paper account can still take a single normal-priced
-    position while a $1M account stays diversified at 15%. The total
-    deployment cap (70%) and the per-symbol contract ceiling continue to
-    bound risk regardless of this value.
+    Always at most ``PER_NAME_NOTIONAL_CAP_PCT`` (15%). The internal tier
+    table is preserved for future tightening (e.g., 5% at very large
+    books) but the 15% ceiling is the live-capital guard rail and applies
+    regardless of equity tier. The over-allocation incident on
+    2026-05-01 showed that the historical 60% tier produced
+    catastrophic single-name concentration on low-priced underlyings.
     """
     for threshold, pct in _PER_SYMBOL_CAP_TIERS:
         if equity < threshold:
-            return pct
-    return _PER_SYMBOL_CAP_FLOOR
+            return min(pct, PER_NAME_NOTIONAL_CAP_PCT)
+    return min(_PER_SYMBOL_CAP_FLOOR, PER_NAME_NOTIONAL_CAP_PCT)
 
 
 @dataclass(frozen=True)
@@ -79,6 +89,8 @@ class SleeveDiagnostic:
     earnings_unknown_symbols: tuple[str, ...] = ()
     symbols_skipped_for_contract_ceiling: int = 0
     contract_ceiling_symbols: tuple[str, ...] = ()
+    symbols_skipped_for_per_name_dollar_cap: int = 0
+    per_name_dollar_cap_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -132,11 +144,32 @@ class BuildDiagnostics:
                 (s.per_symbol_cap_dollars for s in active if s.per_symbol_cap_dollars > 0),
                 default=Decimal("0"),
             )
-            warnings.append(
-                f"all {total_cap_rejected} candidate(s) rejected by per-symbol "
-                f"cap (~${cap_dollars:.0f}). Strikes too expensive for the "
-                f"current account size."
+            total_per_name_dollar_cap = sum(
+                s.symbols_skipped_for_per_name_dollar_cap for s in self.sleeves
             )
+            if total_per_name_dollar_cap > 0:
+                per_name_symbols = sorted({
+                    sym
+                    for s in self.sleeves
+                    for sym in s.per_name_dollar_cap_symbols
+                })
+                sample = ", ".join(per_name_symbols[:5])
+                more = (
+                    f" (+{len(per_name_symbols) - 5} more)"
+                    if len(per_name_symbols) > 5
+                    else ""
+                )
+                warnings.append(
+                    f"{total_per_name_dollar_cap} candidate(s) rejected by "
+                    f"per-name 15% notional cap (~${cap_dollars:.0f}): "
+                    f"{sample}{more}."
+                )
+            else:
+                warnings.append(
+                    f"all {total_cap_rejected} candidate(s) rejected by per-symbol "
+                    f"cap (~${cap_dollars:.0f}). Strikes too expensive for the "
+                    f"current account size."
+                )
             return warnings
         total_skipped_ceiling = sum(
             s.symbols_skipped_for_contract_ceiling for s in self.sleeves
@@ -544,9 +577,11 @@ async def build_intents_with_diagnostics(
         symbols_skipped_for_earnings = 0
         symbols_skipped_for_earnings_unknown = 0
         symbols_skipped_for_contract_ceiling = 0
+        symbols_skipped_for_per_name_dollar_cap = 0
         earnings_blackout_symbols: list[str] = []
         earnings_unknown_symbols: list[str] = []
         contract_ceiling_symbols: list[str] = []
+        per_name_dollar_cap_symbols: list[str] = []
 
         # Phase 1: walk the whitelist, fetch each chain, pick a strike.
         ranked: list[tuple[OptionContract, Decimal]] = []
@@ -656,6 +691,14 @@ async def build_intents_with_diagnostics(
             )
             if qty < 1:
                 candidates_cap_rejected += 1
+                # W-3: distinguish per-name dollar cap binding from
+                # sleeve/total binding so the operator can see which
+                # constraint is keeping the strategy idle.
+                per_contract_collateral = contract.strike * Decimal("100")
+                if per_symbol_remaining < per_contract_collateral:
+                    symbols_skipped_for_per_name_dollar_cap += 1
+                    if contract.underlying not in per_name_dollar_cap_symbols:
+                        per_name_dollar_cap_symbols.append(contract.underlying)
                 _log.info(
                     "strategy.sleeve.no_fit",
                     sleeve=sleeve.sleeve,
@@ -664,7 +707,7 @@ async def build_intents_with_diagnostics(
                     total_remaining=str(total_remaining),
                     per_symbol_cap=str(per_symbol_cap_dollars),
                     per_symbol_committed=str(committed_for_underlying),
-                    contract_collateral=str(contract.strike * Decimal("100")),
+                    contract_collateral=str(per_contract_collateral),
                 )
                 continue
 
@@ -699,6 +742,10 @@ async def build_intents_with_diagnostics(
                     symbols_skipped_for_contract_ceiling
                 ),
                 contract_ceiling_symbols=tuple(contract_ceiling_symbols),
+                symbols_skipped_for_per_name_dollar_cap=(
+                    symbols_skipped_for_per_name_dollar_cap
+                ),
+                per_name_dollar_cap_symbols=tuple(per_name_dollar_cap_symbols),
             )
         )
 
