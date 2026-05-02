@@ -46,6 +46,7 @@ from kai_trader.db.orders import (
     OrderStatus,
     has_failed_since,
     latest_submission_at_per_symbol,
+    mark_actual_delta,
     mark_status,
     mark_submitted,
     new_deployment_collateral_since,
@@ -80,6 +81,15 @@ from kai_trader.strategy.rolls import RollIntent, evaluate_rolls
 _log = get_logger(__name__)
 
 _TERMINAL_ALPACA_STATUSES = {"filled", "canceled", "expired", "rejected"}
+
+# W-9: post-fill delta verification. We compare the contract's live delta
+# at fill time to the target delta the strategy intended. A drift larger
+# than this tolerance fires a Telegram warning so the operator can decide
+# whether the position is still acceptable. 0.10 is conservative: the
+# regime targets sit at -0.30 / -0.40 / -0.50 across risk_on / neutral /
+# risk_off, and a 0.10 drift means the contract is materially closer to
+# the money than the rule book intended.
+DELTA_TOLERANCE = Decimal("0.10")
 
 
 def _format_open_positions_lines(
@@ -539,6 +549,7 @@ class StrategyWorker:
             action="open_short_put",
             intent_payload=intent_payload,
             gating_decision=gating_decision,
+            target_delta=intent.target_delta,
         )
 
         result: SubmitResult = await submit_short_put(
@@ -762,8 +773,17 @@ class StrategyWorker:
         return "failed"
 
     async def _reconcile_pending(self) -> int:
-        """Check Alpaca for status updates on any non-terminal orders."""
+        """Check Alpaca for status updates on any non-terminal orders.
+
+        W-9: when a row transitions to ``filled`` we additionally fetch
+        the contract's live delta from the chain, persist it as
+        ``actual_delta`` on the orders row, and emit a single
+        ``priority='warning'`` Telegram notification per tick batching
+        every fill whose delta drifted more than ``DELTA_TOLERANCE``
+        from the recorded target.
+        """
         rows: list[OrderRow] = await pending_orders()
+        out_of_band: list[tuple[OrderRow, Decimal, Decimal]] = []
         for row in rows:
             if row.alpaca_order_id is None:
                 continue
@@ -787,7 +807,94 @@ class StrategyWorker:
                 filled_at=snap.filled_at,
                 filled_avg_price=snap.filled_avg_price,
             )
+            if mapped == "filled" and row.action == "open_short_put":
+                breach = await self._record_post_fill_delta(row)
+                if breach is not None:
+                    out_of_band.append(breach)
+        if out_of_band:
+            await self._notify_delta_breaches(out_of_band)
         return len(rows)
+
+    async def _record_post_fill_delta(
+        self, row: OrderRow
+    ) -> tuple[OrderRow, Decimal, Decimal] | None:
+        """Persist actual_delta from the chain and flag drift > tolerance.
+
+        Returns ``(row, target, actual)`` when the breach should be
+        notified, otherwise ``None``. Failures fail-open: a missing
+        chain or unparseable symbol logs a warning and returns ``None``
+        so a transient data-feed issue does not flood the operator.
+        """
+        if row.target_delta is None:
+            return None
+        try:
+            underlying, expiration, _opt_type, _strike = parse_occ_symbol(
+                row.option_symbol
+            )
+        except ValueError:
+            return None
+        try:
+            chain = await get_chain(underlying, expiration)
+        except Exception as exc:
+            _log.warning(
+                "strategy.post_fill_delta.fetch_failed",
+                row_id=row.id,
+                symbol=row.option_symbol,
+                error=str(exc),
+            )
+            return None
+        actual: Decimal | None = None
+        for contract in chain:
+            if contract.symbol == row.option_symbol and contract.delta is not None:
+                actual = contract.delta
+                break
+        if actual is None:
+            return None
+        try:
+            await mark_actual_delta(row.id, actual)
+        except Exception as exc:
+            _log.warning(
+                "strategy.post_fill_delta.persist_failed",
+                row_id=row.id,
+                error=str(exc),
+            )
+        if abs(actual - row.target_delta) > DELTA_TOLERANCE:
+            return (row, row.target_delta, actual)
+        return None
+
+    async def _notify_delta_breaches(
+        self,
+        breaches: list[tuple[OrderRow, Decimal, Decimal]],
+    ) -> None:
+        """Enqueue one Telegram alert summarising every drifted fill.
+
+        The notification table accepts ``info | alert | critical``; W-9
+        chooses ``alert`` because the situation is informational-but-
+        notable rather than urgent. The notification metadata carries
+        the row ids and the tolerance so post-hoc audit queries can
+        re-derive the breach set without reparsing the message body.
+        """
+        lines = ["Post-fill delta drift detected (W-9):"]
+        for row, target, actual in breaches:
+            lines.append(
+                f"- {row.option_symbol} target {target:.2f} "
+                f"actual {actual:.2f} drift {abs(actual - target):.2f}"
+            )
+        try:
+            await enqueue(
+                message="\n".join(lines),
+                priority="alert",
+                metadata={
+                    "kind": "post_fill_delta_drift",
+                    "tolerance": str(DELTA_TOLERANCE),
+                    "rows": [row.id for row, _, _ in breaches],
+                },
+            )
+        except Exception as exc:
+            _log.warning(
+                "strategy.post_fill_delta.notify_failed",
+                error=str(exc),
+            )
 
 
 def _map_alpaca_status(alpaca_status: str) -> OrderStatus:

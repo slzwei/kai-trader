@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -194,6 +195,9 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     # fail-opens and tests focused on other paths are unaffected. Tests
     # that exercise the IV/RV filter can override.
     compute_realized_vol_30d = AsyncMock(return_value=None)
+    # W-9: post-fill delta persistence. Default no-op so reconciliation
+    # tests focused on other paths are unaffected.
+    mark_actual_delta = AsyncMock()
 
     monkeypatch.setattr(worker_module, "enqueue", enqueue)
     monkeypatch.setattr(worker_module, "get_account", get_account)
@@ -236,6 +240,7 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     monkeypatch.setattr(
         worker_module, "compute_realized_vol_30d", compute_realized_vol_30d
     )
+    monkeypatch.setattr(worker_module, "mark_actual_delta", mark_actual_delta)
     return locals()
 
 
@@ -989,3 +994,243 @@ async def test_tick_summary_includes_open_positions(
     assert "Open shorts:" in summary
     assert "AMZN P250 x1" in summary
     assert "Committed:" in summary
+
+
+# ------------- W-9 post-fill delta verification -------------
+
+
+def _pending_row_with_target(target_delta: Decimal) -> OrderRow:
+    """Builder for a filled-on-reconcile row with a target_delta set."""
+    return OrderRow(
+        id="row-w9",
+        created_at=datetime(2026, 4, 27, tzinfo=UTC),
+        sleeve="index_core",
+        symbol="SPY",
+        option_symbol="SPY260505P00050000",
+        action="open_short_put",
+        intent_payload={"strike": "50"},
+        alpaca_order_id="alpaca-w9",
+        status="submitted",
+        gating_decision=None,
+        submitted_at=datetime(2026, 4, 27, tzinfo=UTC),
+        filled_at=None,
+        filled_avg_price=None,
+        error_text=None,
+        target_delta=target_delta,
+    )
+
+
+async def test_post_fill_delta_no_warning_when_within_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """W-9 acceptance: target -0.40, actual -0.45 → no warning (within 0.10)."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["pending_orders"].return_value = [
+        _pending_row_with_target(Decimal("-0.40"))
+    ]
+    chain_with_actual = [
+        OptionContract(
+            symbol="SPY260505P00050000",
+            underlying="SPY",
+            option_type="put",
+            strike=Decimal("50"),
+            expiration=date(2026, 5, 5),
+            bid=Decimal("1.10"),
+            ask=Decimal("1.20"),
+            last=Decimal("1.15"),
+            delta=Decimal("-0.45"),  # within 0.10 of target
+            gamma=Decimal("0.01"),
+            theta=Decimal("-0.05"),
+            vega=Decimal("0.10"),
+            implied_volatility=Decimal("0.20"),
+        )
+    ]
+    _patch_dependencies["get_chain"].return_value = chain_with_actual
+
+    await worker_module.StrategyWorker().tick()
+
+    # actual_delta should be persisted on the row.
+    _patch_dependencies["mark_actual_delta"].assert_awaited()
+    # No warning notification enqueued for delta drift.
+    enqueue_calls = _patch_dependencies["enqueue"].await_args_list
+    drift_calls = [
+        c for c in enqueue_calls
+        if c.kwargs.get("metadata", {}).get("kind") == "post_fill_delta_drift"
+    ]
+    assert drift_calls == []
+
+
+async def test_post_fill_delta_warns_when_outside_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """W-9 acceptance: target -0.40, actual -0.55 → warning enqueued (drift 0.15 > 0.10)."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["pending_orders"].return_value = [
+        _pending_row_with_target(Decimal("-0.40"))
+    ]
+    chain_with_actual = [
+        OptionContract(
+            symbol="SPY260505P00050000",
+            underlying="SPY",
+            option_type="put",
+            strike=Decimal("50"),
+            expiration=date(2026, 5, 5),
+            bid=Decimal("1.10"),
+            ask=Decimal("1.20"),
+            last=Decimal("1.15"),
+            delta=Decimal("-0.55"),  # 0.15 drift, outside tolerance
+            gamma=Decimal("0.01"),
+            theta=Decimal("-0.05"),
+            vega=Decimal("0.10"),
+            implied_volatility=Decimal("0.20"),
+        )
+    ]
+    _patch_dependencies["get_chain"].return_value = chain_with_actual
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["mark_actual_delta"].assert_awaited()
+    enqueue_calls = _patch_dependencies["enqueue"].await_args_list
+    drift_calls = [
+        c for c in enqueue_calls
+        if c.kwargs.get("metadata", {}).get("kind") == "post_fill_delta_drift"
+    ]
+    assert len(drift_calls) == 1
+    msg = drift_calls[0].kwargs["message"]
+    assert "Post-fill delta drift" in msg
+    assert "SPY260505P00050000" in msg
+
+
+async def test_post_fill_delta_skips_when_target_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """W-9: rows without target_delta (legacy data) skip the post-fill check silently."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    legacy_row = OrderRow(
+        id="row-legacy",
+        created_at=datetime(2026, 4, 27, tzinfo=UTC),
+        sleeve="index_core",
+        symbol="SPY",
+        option_symbol="SPY260505P00050000",
+        action="open_short_put",
+        intent_payload={"strike": "50"},
+        alpaca_order_id="alpaca-legacy",
+        status="submitted",
+        gating_decision=None,
+        submitted_at=datetime(2026, 4, 27, tzinfo=UTC),
+        filled_at=None,
+        filled_avg_price=None,
+        error_text=None,
+        target_delta=None,
+    )
+    _patch_dependencies["pending_orders"].return_value = [legacy_row]
+
+    await worker_module.StrategyWorker().tick()
+
+    # No actual_delta persisted because target was missing.
+    _patch_dependencies["mark_actual_delta"].assert_not_awaited()
+    enqueue_calls = _patch_dependencies["enqueue"].await_args_list
+    drift_calls = [
+        c for c in enqueue_calls
+        if c.kwargs.get("metadata", {}).get("kind") == "post_fill_delta_drift"
+    ]
+    assert drift_calls == []
+
+
+async def test_post_fill_delta_batches_multiple_breaches(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """W-9: multiple drifted fills in one tick batch into a single notification."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    row_a = OrderRow(
+        id="row-a",
+        created_at=datetime(2026, 4, 27, tzinfo=UTC),
+        sleeve="index_core",
+        symbol="SPY",
+        option_symbol="SPY260505P00050000",
+        action="open_short_put",
+        intent_payload={"strike": "50"},
+        alpaca_order_id="alpaca-a",
+        status="submitted",
+        gating_decision=None,
+        submitted_at=datetime(2026, 4, 27, tzinfo=UTC),
+        filled_at=None,
+        filled_avg_price=None,
+        error_text=None,
+        target_delta=Decimal("-0.40"),
+    )
+    row_b = OrderRow(
+        id="row-b",
+        created_at=datetime(2026, 4, 27, tzinfo=UTC),
+        sleeve="index_core",
+        symbol="QQQ",
+        option_symbol="QQQ260505P00040000",
+        action="open_short_put",
+        intent_payload={"strike": "40"},
+        alpaca_order_id="alpaca-b",
+        status="submitted",
+        gating_decision=None,
+        submitted_at=datetime(2026, 4, 27, tzinfo=UTC),
+        filled_at=None,
+        filled_avg_price=None,
+        error_text=None,
+        target_delta=Decimal("-0.30"),
+    )
+    _patch_dependencies["pending_orders"].return_value = [row_a, row_b]
+
+    chain_a = [
+        OptionContract(
+            symbol="SPY260505P00050000", underlying="SPY", option_type="put",
+            strike=Decimal("50"), expiration=date(2026, 5, 5),
+            bid=Decimal("1.10"), ask=Decimal("1.20"), last=None,
+            delta=Decimal("-0.55"), gamma=None, theta=None, vega=None,
+            implied_volatility=None,
+        )
+    ]
+    chain_b = [
+        OptionContract(
+            symbol="QQQ260505P00040000", underlying="QQQ", option_type="put",
+            strike=Decimal("40"), expiration=date(2026, 5, 5),
+            bid=Decimal("0.80"), ask=Decimal("0.90"), last=None,
+            delta=Decimal("-0.50"), gamma=None, theta=None, vega=None,
+            implied_volatility=None,
+        )
+    ]
+
+    async def fake_chain(symbol: str, _exp: Any) -> list[OptionContract]:
+        if symbol == "SPY":
+            return chain_a
+        if symbol == "QQQ":
+            return chain_b
+        return []
+
+    _patch_dependencies["get_chain"].side_effect = fake_chain
+
+    await worker_module.StrategyWorker().tick()
+
+    enqueue_calls = _patch_dependencies["enqueue"].await_args_list
+    drift_calls = [
+        c for c in enqueue_calls
+        if c.kwargs.get("metadata", {}).get("kind") == "post_fill_delta_drift"
+    ]
+    # One notification batching both breaches.
+    assert len(drift_calls) == 1
+    msg = drift_calls[0].kwargs["message"]
+    assert "SPY260505P00050000" in msg
+    assert "QQQ260505P00040000" in msg

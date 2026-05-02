@@ -304,3 +304,46 @@ async def test_latest_submission_at_per_symbol_empty_when_no_rows() -> None:
         )
 
     assert result == {}
+
+
+# ------------- W-9 helpers -------------
+
+
+async def test_record_intent_writes_target_delta() -> None:
+    pool = _fake_pool()
+    pool._conn.fetchrow = AsyncMock(return_value={"id": "row-uuid"})
+
+    with patch(
+        "kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)
+    ):
+        row_id = await orders.record_intent(
+            sleeve="index_core",
+            symbol="SPY",
+            option_symbol="SPY260505P00050000",
+            action="open_short_put",
+            intent_payload={"strike": "50"},
+            gating_decision=None,
+            target_delta=Decimal("-0.40"),
+        )
+
+    assert row_id == "row-uuid"
+    args, _ = pool._conn.fetchrow.await_args
+    sql = args[0]
+    assert "target_delta" in sql
+    assert args[8] == Decimal("-0.40")
+
+
+async def test_mark_actual_delta_writes_value() -> None:
+    pool = _fake_pool()
+    pool._conn.execute = AsyncMock(return_value="UPDATE 1")
+
+    with patch(
+        "kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)
+    ):
+        await orders.mark_actual_delta("row-1", Decimal("-0.45"))
+
+    args, _ = pool._conn.execute.await_args
+    sql = args[0]
+    assert "actual_delta" in sql
+    assert args[1] == "row-1"
+    assert args[2] == Decimal("-0.45")

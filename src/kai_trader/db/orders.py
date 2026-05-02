@@ -52,6 +52,8 @@ class OrderRow:
     filled_at: datetime | None
     filled_avg_price: Decimal | None
     error_text: str | None
+    target_delta: Decimal | None = None
+    actual_delta: Decimal | None = None
 
 
 def _row_to_order(row: dict[str, Any]) -> OrderRow:
@@ -76,6 +78,8 @@ def _row_to_order(row: dict[str, Any]) -> OrderRow:
         filled_at=row["filled_at"],
         filled_avg_price=row["filled_avg_price"],
         error_text=row["error_text"],
+        target_delta=row.get("target_delta"),
+        actual_delta=row.get("actual_delta"),
     )
 
 
@@ -88,16 +92,23 @@ async def record_intent(
     intent_payload: dict[str, Any],
     gating_decision: dict[str, Any] | None,
     status: OrderStatus = "pending",
+    target_delta: Decimal | None = None,
 ) -> str:
-    """Insert a new order row at status ``pending`` (default). Return uuid."""
+    """Insert a new order row at status ``pending`` (default). Return uuid.
+
+    W-9: ``target_delta`` is the regime's target delta for the put leg
+    (e.g. -0.40 in risk_on, -0.30 in neutral). Stored alongside the
+    full intent_payload so a queryable post-fill delta check can
+    compare it against the actual filled delta.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             insert into orders
                 (sleeve, symbol, option_symbol, action, intent_payload,
-                 status, gating_decision)
-            values ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb)
+                 status, gating_decision, target_delta)
+            values ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8)
             returning id
             """,
             sleeve,
@@ -107,8 +118,24 @@ async def record_intent(
             json.dumps(intent_payload),
             status,
             json.dumps(gating_decision) if gating_decision is not None else None,
+            target_delta,
         )
     return str(row["id"])
+
+
+async def mark_actual_delta(row_id: str, actual_delta: Decimal) -> None:
+    """Persist the live delta observed at fill time. W-9 post-fill check."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            update orders
+               set actual_delta = $2
+             where id = $1
+            """,
+            row_id,
+            actual_delta,
+        )
 
 
 async def mark_submitted(
