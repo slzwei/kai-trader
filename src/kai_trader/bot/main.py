@@ -49,6 +49,10 @@ from kai_trader.db.readonly import close_readonly_pool
 from kai_trader.events.dispatcher import EventDispatcher, build_owner_send
 from kai_trader.logging import configure_logging, get_logger
 from kai_trader.notifications.worker import NotificationWorker
+from kai_trader.observability.memory_profile import (
+    MemoryProfileWorker,
+    start_tracemalloc,
+)
 from kai_trader.strategy.worker import StrategyWorker
 from kai_trader.streams.trading_stream import TradingStreamWorker
 
@@ -56,6 +60,7 @@ _worker: NotificationWorker | None = None
 _strategy_worker: StrategyWorker | None = None
 _event_dispatcher: EventDispatcher | None = None
 _trading_stream: TradingStreamWorker | None = None
+_memory_profile_worker: MemoryProfileWorker | None = None
 
 
 def build_application(settings: Settings) -> Application:  # type: ignore[type-arg]
@@ -109,6 +114,14 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
 async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     """Prime DB pool, then spin up notification + strategy + event + stream workers."""
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
+    global _memory_profile_worker
+
+    # W-7: enable allocation tracking before the bot starts opening
+    # connections so the snapshot worker captures every long-lived
+    # object that survives boot. Profiling is permanently on and
+    # cheap (one structured log line every hour).
+    start_tracemalloc()
+
     await get_pool()
 
     settings = get_settings()
@@ -143,9 +156,16 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     _trading_stream = TradingStreamWorker(settings=settings)
     await _trading_stream.start()
 
+    _memory_profile_worker = MemoryProfileWorker()
+    await _memory_profile_worker.start()
+
 
 async def _shutdown(_app: Application) -> None:  # type: ignore[type-arg]
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
+    global _memory_profile_worker
+    if _memory_profile_worker is not None:
+        await _memory_profile_worker.stop()
+        _memory_profile_worker = None
     if _trading_stream is not None:
         await _trading_stream.stop()
         _trading_stream = None
