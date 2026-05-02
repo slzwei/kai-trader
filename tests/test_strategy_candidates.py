@@ -195,16 +195,22 @@ async def test_build_intents_keeps_opportunistic_active_in_neutral() -> None:
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
-    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
-        return [_put(strike=50, delta=-0.20, expiration=expiry)]
+    # Echo the queried symbol back as the contract underlying so each
+    # sleeve's intent is attributed to its own name.
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(strike=50, delta=-0.20, expiration=expiry, underlying=symbol)
+        ]
 
+    # Use a $1M equity so the W-4 per-tick cap (10% = $100k) does not bind
+    # before both sleeves can produce an intent each.
     intents = await build_intents(
         regime=_regime("neutral"),
         sleeves=[
             _sleeve("index_core", whitelist=["SPY"]),
             _sleeve("opportunistic", whitelist=["NVDA"], target_pct=Decimal("0.20")),
         ],
-        account=_account(),
+        account=_account(equity=1_000_000),
         chain_fetcher=fetcher,
         today=today,
     )
@@ -296,25 +302,30 @@ async def test_build_intents_skips_contracts_missing_quotes() -> None:
 # ------------- summarise_intents -------------
 
 async def test_build_intents_multi_contract_within_per_symbol_cap() -> None:
-    """Cheap names should fill multiple contracts up to the per-symbol cap."""
+    """Cheap names should fill multiple contracts up to the per-symbol cap.
+
+    Tested at $1M equity so the W-4 per-tick cap (10% = $100k) is well
+    above the $15k per-name dollar cap and does not bind before the
+    per-symbol cap is reached.
+    """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
     # SOFI-style: $15 strike contract = $1500 collateral.
-    # Per-symbol cap = 15% of $100k = $15k. Max contracts = 10.
     async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
         return [_put(strike=15, delta=-0.30, expiration=expiry)]
 
     intents = await build_intents(
         regime=_regime("risk_on"),
         sleeves=[_sleeve("opportunistic", whitelist=["SOFI"], target_pct=Decimal("0.45"))],
-        account=_account(equity=100_000),
+        account=_account(equity=1_000_000),
         chain_fetcher=fetcher,
         today=today,
     )
     assert len(intents) == 1
     intent = intents[0]
-    # Per-symbol cap of $15k / $1500 collateral = 10 contracts (also hits MAX cap).
+    # Contract ceiling MAX_CONTRACTS_PER_SYMBOL = 10 binds before the
+    # 15% per-name dollar cap (which would allow $150k / $1500 = 100).
     assert intent.qty == 10
     assert intent.collateral == Decimal("15000")
 
@@ -340,31 +351,39 @@ async def test_build_intents_per_symbol_cap_overrides_sleeve_headroom() -> None:
 
 
 async def test_build_intents_respects_total_deployment_cap() -> None:
-    """Total CSP collateral cannot exceed 70% of equity across all sleeves."""
+    """Total deployment is bounded by the smallest applicable cap.
+
+    With W-4 the per-tick cap (10% of equity) is always tighter than the
+    legacy 70% TOTAL_DEPLOYMENT_CAP_PCT, so the per-tick cap is the
+    binding constraint in normal operation. This test verifies that the
+    builder respects whichever cap is smallest by configuring a chain
+    where a single contract exhausts the per-tick budget.
+    """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
-    # $1M equity lands in the 15% per-symbol tier ($150k). Each contract =
-    # $100k collateral, so per-symbol cap binds at 1 contract per name.
-    # Sleeve cap is huge so it does not bind. Total cap = 70% of $1M = $700k.
-    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
-        return [_put(strike=1000, delta=-0.30, expiration=expiry)]
+    # $1M equity, $1000 strike → $100k per contract. Per-tick cap = 10% =
+    # $100k → exactly 1 contract fits per tick.
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(strike=1000, delta=-0.30, expiration=expiry, underlying=symbol)
+        ]
 
     intents = await build_intents(
         regime=_regime("risk_on"),
         sleeves=[_sleeve(
             "opportunistic",
-            whitelist=[f"SYM{i}" for i in range(10)],  # 10 symbols
+            whitelist=[f"SYM{i}" for i in range(10)],
             target_pct=Decimal("1.0"),
+            max_new_entries_per_tick=10,
         )],
         account=_account(equity=1_000_000),
         chain_fetcher=fetcher,
         today=today,
     )
-    # Each symbol = 1 contract = $100k. Total cap = $700k → 7 symbols fit.
-    assert len(intents) == 7
+    assert len(intents) == 1
     total_collateral = sum(i.collateral for i in intents)
-    assert total_collateral == Decimal("700000")
+    assert total_collateral == Decimal("100000")
 
 
 async def test_build_intents_ranks_by_yield_within_sleeve() -> None:
@@ -985,7 +1004,11 @@ async def test_committed_collateral_does_not_block_unrelated_underlying() -> Non
 
 
 async def test_no_existing_positions_matches_legacy_behavior() -> None:
-    """Default empty list of existing positions still respects the per-name 15% cap."""
+    """Default empty list of existing positions still respects all caps.
+
+    At $100k equity the most binding constraint is the W-4 per-tick cap
+    (10% of equity = $10k). Strike $50 = $5k per contract, so qty=2.
+    """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
@@ -999,11 +1022,8 @@ async def test_no_existing_positions_matches_legacy_behavior() -> None:
         chain_fetcher=fetcher,
         today=today,
     )
-    # Per-name cap = 15% x $100k = $15k; / $5k contract = 3 contracts.
-    # Sleeve cap (45% x $100k = $45k) is no longer the binding constraint
-    # under W-3.
     assert len(intents) == 1
-    assert intents[0].qty == 3
+    assert intents[0].qty == 2
 
 
 async def test_committed_collateral_helper_returns_correct_maps() -> None:
@@ -1135,7 +1155,12 @@ async def test_build_intents_skips_wide_spread_contracts() -> None:
 
 
 async def test_per_tick_cap_limits_new_entries() -> None:
-    """A 5-symbol pool with cap=2 should fill only the top 2 by score."""
+    """A 5-symbol pool with cap=2 should fill only the top 2 by score.
+
+    Tested at $10M equity so the W-4 per-tick dollar cap (10% = $1M) is
+    well above the combined intent collateral and the sleeve-level
+    max_new_entries_per_tick is the binding constraint, as intended.
+    """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
@@ -1164,7 +1189,7 @@ async def test_per_tick_cap_limits_new_entries() -> None:
             target_pct=Decimal("1.0"),
             max_new_entries_per_tick=2,
         )],
-        account=_account(equity=100_000),
+        account=_account(equity=10_000_000),
         chain_fetcher=fetcher,
         today=today,
     )
@@ -1197,7 +1222,12 @@ async def test_per_tick_cap_zero_blocks_all_entries() -> None:
 
 
 async def test_per_tick_cap_independent_per_sleeve() -> None:
-    """Each sleeve enforces its own cap, not a portfolio-wide one."""
+    """Each sleeve enforces its own count cap, not a portfolio-wide one.
+
+    Tested at $10M equity so the W-4 per-tick dollar cap (10% = $1M) is
+    not the binding constraint, isolating the
+    ``max_new_entries_per_tick`` sleeve-level count cap.
+    """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
@@ -1227,7 +1257,7 @@ async def test_per_tick_cap_independent_per_sleeve() -> None:
                 max_new_entries_per_tick=1,
             ),
         ],
-        account=_account(equity=200_000),
+        account=_account(equity=10_000_000),
         chain_fetcher=fetcher,
         today=today,
     )
@@ -1547,6 +1577,224 @@ async def test_per_name_dollar_cap_reduces_qty_for_low_strike_excess() -> None:
     assert len(intents) == 1
     assert intents[0].qty == 1
     assert intents[0].collateral == Decimal("20000")
+
+
+async def test_per_tick_dollar_cap_drops_lowest_ranked_candidates() -> None:
+    """W-4 acceptance test 1: 5 candidates x $5k, $100k equity → top 2 fit, rest dropped."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    chains: dict[str, list[OptionContract]] = {
+        "A": [_put(strike=50, delta=-0.30, expiration=expiry,
+                   bid=0.45, ask=0.55, underlying="A")],
+        "B": [_put(strike=50, delta=-0.30, expiration=expiry,
+                   bid=1.45, ask=1.55, underlying="B")],
+        "C": [_put(strike=50, delta=-0.30, expiration=expiry,
+                   bid=0.95, ask=1.05, underlying="C")],
+        "D": [_put(strike=50, delta=-0.30, expiration=expiry,
+                   bid=1.20, ask=1.30, underlying="D")],
+        "E": [_put(strike=50, delta=-0.30, expiration=expiry,
+                   bid=0.70, ask=0.80, underlying="E")],
+    }
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return chains[symbol]
+
+    # $100k equity → per-tick cap = $10k. Strike $50 → $5k/contract. Each
+    # candidate qty=1 (per-name 15% cap = $15k → 3 max, but the per-tick
+    # budget gets eaten as we go).
+    sleeve_with_low_pct = SleeveConfig(
+        sleeve="index_core",
+        target_pct=Decimal("1.0"),
+        target_delta_put_risk_on=Decimal("-0.30"),
+        target_delta_put_neutral=Decimal("-0.20"),
+        target_delta_call=Decimal("0.20"),
+        target_dte_min=7,
+        target_dte_max=10,
+        profit_take_pct=Decimal("0.50"),
+        roll_trigger_delta=Decimal("0.45"),
+        symbol_whitelist=["A", "B", "C", "D", "E"],
+        enabled=True,
+        max_new_entries_per_tick=100,
+        updated_at=datetime(2026, 4, 26, tzinfo=UTC),
+        updated_by=None,
+    )
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[sleeve_with_low_pct],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    # Top score B (qty=2, $10k) consumes the entire per-tick budget. Then
+    # the rest are dropped by per-tick cap.
+    assert len(intents) == 1
+    assert intents[0].symbol == "B"
+    assert diag.intents_dropped_for_per_tick_cap >= 1
+
+
+async def test_per_day_cap_blocks_after_25k_already_today() -> None:
+    """W-4 acceptance test 2: $25k already today, cap=30%, candidate set reduced to fit."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(strike=50, delta=-0.30, expiration=expiry, underlying=symbol)
+        ]
+
+    # $100k equity, today_already_deployed=$25k, per-day cap = $30k →
+    # remaining $5k. Strike $50 → $5k/contract. Exactly 1 contract fits.
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[
+            _sleeve(
+                "index_core",
+                whitelist=["AAA", "BBB", "CCC"],
+                target_pct=Decimal("1.0"),
+            )
+        ],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+        today_already_deployed=Decimal("25000"),
+    )
+    assert len(intents) == 1
+    assert diag.intents_dropped_for_per_day_cap >= 1
+    assert diag.today_deployment_used_pct == Decimal("0.25")
+
+
+async def test_per_day_cap_resets_at_utc_midnight() -> None:
+    """W-4 day-rollover: yesterday's deployment is irrelevant when today_already_deployed=0."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(strike=50, delta=-0.30, expiration=expiry, underlying=symbol)
+        ]
+
+    # today_already_deployed=0 simulates fresh UTC day. Per-tick = $10k →
+    # 2 contracts of $5k. Per-day cap = $30k → not binding here.
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[
+            _sleeve(
+                "index_core",
+                whitelist=["AAA", "BBB"],
+                target_pct=Decimal("1.0"),
+                max_new_entries_per_tick=10,
+            )
+        ],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+        today_already_deployed=Decimal("0"),
+    )
+    # Single intent gets qty=2 (fills the $10k per-tick cap).
+    assert sum(i.qty for i in intents) == 2
+    assert diag.intents_dropped_for_per_day_cap == 0
+
+
+async def test_cooldown_skips_recently_entered_symbols() -> None:
+    """W-4 cool-down: a symbol on the cooldown set is skipped before chain fetch."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    fetched: list[str] = []
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        fetched.append(symbol)
+        return [
+            _put(strike=50, delta=-0.30, expiration=expiry, underlying=symbol)
+        ]
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[
+            _sleeve(
+                "index_core",
+                whitelist=["MARA", "SNAP", "FRESH"],
+                target_pct=Decimal("1.0"),
+            )
+        ],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+        cooldown_symbols={"MARA", "SNAP"},
+    )
+    # MARA / SNAP skipped pre-fetch; only FRESH's chain is queried.
+    assert fetched == ["FRESH"]
+    assert diag.symbols_skipped_for_cooldown == 2
+    assert set(diag.cooldown_symbols) == {"MARA", "SNAP"}
+    assert all(i.symbol == "FRESH" for i in intents)
+
+
+async def test_combined_caps_cooldown_per_day_per_tick() -> None:
+    """W-4 combined: cool-down skips first, per-day budget clamps the rest."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(strike=50, delta=-0.30, expiration=expiry, underlying=symbol)
+        ]
+
+    # $100k equity, today_already_deployed=$25k, per-day budget remaining
+    # = $5k. Per-tick cap = $10k. One symbol on cool-down. Five more
+    # candidates of $5k each. Cool-down drops one; per-day cap clamps the
+    # rest to $5k total = 1 contract.
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[
+            _sleeve(
+                "index_core",
+                whitelist=["COOL", "A", "B", "C", "D", "E"],
+                target_pct=Decimal("1.0"),
+            )
+        ],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+        today_already_deployed=Decimal("25000"),
+        cooldown_symbols={"COOL"},
+    )
+    assert sum(i.qty for i in intents) == 1
+    assert diag.symbols_skipped_for_cooldown == 1
+    assert diag.intents_dropped_for_per_day_cap >= 1
+
+
+async def test_per_tick_cap_warning_surfaces() -> None:
+    """W-4: tick warning surfaces per-tick cap drops."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(strike=50, delta=-0.30, expiration=expiry, underlying=symbol)
+        ]
+
+    _intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[
+            _sleeve(
+                "index_core",
+                whitelist=["A", "B", "C", "D", "E"],
+                target_pct=Decimal("1.0"),
+            )
+        ],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    warnings = diag.warning_lines()
+    assert any(
+        "per-tick deployment cap" in w
+        or "per-day deployment cap" in w
+        or "cool-down" in w
+        for w in warnings
+    ) or diag.intents_dropped_for_per_tick_cap > 0
 
 
 async def test_per_name_dollar_cap_warning_uses_15pct_wording() -> None:

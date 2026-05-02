@@ -228,3 +228,79 @@ async def test_has_failed_since_returns_false_when_absent() -> None:
         )
 
     assert result is False
+
+
+# ------------- W-4 helpers -------------
+
+
+async def test_new_deployment_collateral_since_sums_open_orders() -> None:
+    pool = _fake_pool()
+    pool._conn.fetchrow = AsyncMock(return_value={"total": Decimal("25000")})
+    cutoff = datetime(2026, 5, 2, tzinfo=UTC)
+
+    with patch(
+        "kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)
+    ):
+        total = await orders.new_deployment_collateral_since(cutoff)
+
+    assert total == Decimal("25000")
+    args, _ = pool._conn.fetchrow.await_args
+    sql = args[0]
+    assert "submitted_at >= $1" in sql
+    assert "open_short_put" in sql
+    assert "open_covered_call" in sql
+    assert "submitted" in sql
+    assert "filled" in sql
+    assert args[1] == cutoff
+
+
+async def test_new_deployment_collateral_returns_zero_when_no_orders() -> None:
+    pool = _fake_pool()
+    pool._conn.fetchrow = AsyncMock(return_value={"total": Decimal("0")})
+
+    with patch(
+        "kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)
+    ):
+        total = await orders.new_deployment_collateral_since(
+            datetime(2026, 5, 2, tzinfo=UTC)
+        )
+
+    assert total == Decimal("0")
+
+
+async def test_latest_submission_at_per_symbol_returns_dict() -> None:
+    pool = _fake_pool()
+    expected_rows = [
+        {"symbol": "MARA", "last_at": datetime(2026, 5, 2, 18, 30, tzinfo=UTC)},
+        {"symbol": "SNAP", "last_at": datetime(2026, 5, 2, 18, 35, tzinfo=UTC)},
+    ]
+    pool._conn.fetch = AsyncMock(return_value=expected_rows)
+    cutoff = datetime(2026, 5, 2, 18, 0, tzinfo=UTC)
+
+    with patch(
+        "kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)
+    ):
+        result = await orders.latest_submission_at_per_symbol(cutoff)
+
+    assert result == {
+        "MARA": datetime(2026, 5, 2, 18, 30, tzinfo=UTC),
+        "SNAP": datetime(2026, 5, 2, 18, 35, tzinfo=UTC),
+    }
+    args, _ = pool._conn.fetch.await_args
+    sql = args[0]
+    assert "max(submitted_at)" in sql
+    assert args[1] == cutoff
+
+
+async def test_latest_submission_at_per_symbol_empty_when_no_rows() -> None:
+    pool = _fake_pool()
+    pool._conn.fetch = AsyncMock(return_value=[])
+
+    with patch(
+        "kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)
+    ):
+        result = await orders.latest_submission_at_per_symbol(
+            datetime(2026, 5, 2, tzinfo=UTC)
+        )
+
+    assert result == {}

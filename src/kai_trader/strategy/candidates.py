@@ -32,6 +32,26 @@ _log = get_logger(__name__)
 TOTAL_DEPLOYMENT_CAP_PCT = Decimal("0.70")  # max 70% of equity in CSP collateral
 MAX_CONTRACTS_PER_SYMBOL = 10  # hard ceiling regardless of sleeve headroom
 
+# W-4: deployment velocity guard rails. The over-allocation incident on
+# 2026-05-01 took the book from 0% to 96% of the deployment cap in 20
+# minutes (4 ticks at 5-min cadence) by repeatedly stacking the same two
+# names. Three reinforcing controls:
+#
+#   * PER_TICK_DEPLOYMENT_CAP_PCT: total new collateral committed in any
+#     single tick is capped at 10% of equity. Blocks single-tick blow-out.
+#   * PER_DAY_NEW_DEPLOYMENT_PCT: cumulative new collateral since UTC
+#     midnight is capped at 30% of equity. Blocks 4-hour blow-out across
+#     many ticks even when each individual tick is under the per-tick cap.
+#   * COOLDOWN_TICKS: a symbol entered (filled or submitted) in the last 6
+#     ticks (default = 30 minutes at 5-min cadence) is excluded from
+#     candidate selection. Forces the strategy to diversify across the
+#     pool rather than greedy-stacking the same top-scored names.
+PER_TICK_DEPLOYMENT_CAP_PCT = Decimal("0.10")
+PER_DAY_NEW_DEPLOYMENT_PCT = Decimal("0.30")
+COOLDOWN_TICKS = 6
+TICK_INTERVAL_MINUTES = 5
+COOLDOWN_MINUTES = COOLDOWN_TICKS * TICK_INTERVAL_MINUTES
+
 # W-3: hard 15% per-name notional ceiling. The historical per-symbol cap
 # was tiered (60% at small accounts, 15% at large) because at $50k equity
 # a single SPY contract would exceed a 15% cap and the strategy would never
@@ -103,15 +123,46 @@ class BuildDiagnostics:
     """
 
     sleeves: list[SleeveDiagnostic]
+    intents_dropped_for_per_tick_cap: int = 0
+    intents_dropped_for_per_day_cap: int = 0
+    symbols_skipped_for_cooldown: int = 0
+    cooldown_symbols: tuple[str, ...] = ()
+    today_deployment_used_pct: Decimal = Decimal("0")
+    today_deployment_remaining_usd: Decimal = Decimal("0")
+    per_tick_cap_remaining_usd: Decimal = Decimal("0")
 
     def warning_lines(self) -> list[str]:
         active = [
             s for s in self.sleeves
             if s.chains_fetched > 0 or s.symbols_skipped_for_earnings > 0
         ]
-        if not active:
-            return []
         warnings: list[str] = []
+        # Tick-level cap surfaces (visible whether or not a sleeve fetched
+        # chains, because they may have suppressed candidates pre-fetch).
+        if self.symbols_skipped_for_cooldown > 0:
+            cd_symbols = sorted(self.cooldown_symbols)
+            sample = ", ".join(cd_symbols[:5])
+            more = (
+                f" (+{len(cd_symbols) - 5} more)" if len(cd_symbols) > 5 else ""
+            )
+            warnings.append(
+                f"{self.symbols_skipped_for_cooldown} symbol(s) on cool-down: "
+                f"{sample}{more}"
+            )
+        if self.intents_dropped_for_per_tick_cap > 0:
+            warnings.append(
+                f"{self.intents_dropped_for_per_tick_cap} intent(s) dropped by "
+                f"per-tick deployment cap (10% of equity)."
+            )
+        if self.intents_dropped_for_per_day_cap > 0:
+            warnings.append(
+                f"{self.intents_dropped_for_per_day_cap} intent(s) dropped by "
+                f"per-day deployment cap "
+                f"({self.today_deployment_used_pct:.0%} of equity used today, "
+                f"${self.today_deployment_remaining_usd:.0f} remaining)."
+            )
+        if not active:
+            return warnings
         total_puts = sum(s.puts_seen for s in active)
         total_with_delta = sum(s.puts_with_delta for s in active)
         total_in_band = sum(s.puts_in_dte_band for s in active)
@@ -120,7 +171,10 @@ class BuildDiagnostics:
         total_cap_rejected = sum(s.candidates_cap_rejected for s in active)
         total_chains = sum(s.chains_fetched for s in active)
         if total_intents > 0:
-            return []
+            # Keep the tick-level cap notes (cool-down / per-tick / per-day)
+            # even when other intents made it through, so the operator can
+            # see when caps were partially binding.
+            return warnings
         if total_puts > 0 and total_with_delta == 0:
             warnings.append(
                 f"options feed missing greeks ({total_puts} puts across "
@@ -484,6 +538,8 @@ async def build_intents(
     today: date | None = None,
     earnings_status: EarningsStatusProvider | None = None,
     existing_short_puts: list[PositionSnapshot] | None = None,
+    today_already_deployed: Decimal | None = None,
+    cooldown_symbols: set[str] | None = None,
 ) -> list[TradeIntent]:
     """Walk active sleeves and produce intent rows up to the cap matrix.
 
@@ -498,6 +554,8 @@ async def build_intents(
         today=today,
         earnings_status=earnings_status,
         existing_short_puts=existing_short_puts,
+        today_already_deployed=today_already_deployed,
+        cooldown_symbols=cooldown_symbols,
     )
     return intents
 
@@ -511,6 +569,8 @@ async def build_intents_with_diagnostics(
     today: date | None = None,
     earnings_status: EarningsStatusProvider | None = None,
     existing_short_puts: list[PositionSnapshot] | None = None,
+    today_already_deployed: Decimal | None = None,
+    cooldown_symbols: set[str] | None = None,
 ) -> tuple[list[TradeIntent], BuildDiagnostics]:
     """Build intents and return the per-sleeve diagnostic counters alongside.
 
@@ -536,6 +596,22 @@ async def build_intents_with_diagnostics(
     per_symbol_cap_dollars = equity * per_symbol_cap_pct(equity)
     intents: list[TradeIntent] = []
     sleeve_diags: list[SleeveDiagnostic] = []
+
+    # W-4 tick-level guard rails. These are global across sleeves so a
+    # multi-sleeve config still respects the per-tick and per-day caps.
+    today_already = today_already_deployed or Decimal("0")
+    per_tick_remaining = equity * PER_TICK_DEPLOYMENT_CAP_PCT
+    per_day_remaining = max(
+        equity * PER_DAY_NEW_DEPLOYMENT_PCT - today_already, Decimal("0")
+    )
+    today_used_pct = (
+        today_already / equity if equity > 0 else Decimal("0")
+    )
+    cooldown_set = cooldown_symbols or set()
+    intents_dropped_per_tick = 0
+    intents_dropped_per_day = 0
+    symbols_skipped_for_cooldown_count = 0
+    cooldown_skipped_symbols: list[str] = []
 
     for sleeve in sleeves:
         if not _is_sleeve_active(sleeve, regime.regime):
@@ -586,6 +662,20 @@ async def build_intents_with_diagnostics(
         # Phase 1: walk the whitelist, fetch each chain, pick a strike.
         ranked: list[tuple[OptionContract, Decimal]] = []
         for symbol in sleeve.symbol_whitelist:
+            if symbol in cooldown_set:
+                # W-4: a symbol entered (filled or submitted) inside the
+                # cool-down window is excluded from candidate selection so
+                # the greedy ranker cannot keep stacking the same top-scored
+                # name tick after tick.
+                symbols_skipped_for_cooldown_count += 1
+                if symbol not in cooldown_skipped_symbols:
+                    cooldown_skipped_symbols.append(symbol)
+                _log.info(
+                    "strategy.cooldown.skipped",
+                    sleeve=sleeve.sleeve,
+                    symbol=symbol,
+                )
+                continue
             if earnings_status is not None and sleeve.earnings_blackout_enabled:
                 status: EarningsStatus
                 try:
@@ -711,11 +801,48 @@ async def build_intents_with_diagnostics(
                 )
                 continue
 
+            # W-4: enforce per-tick and per-day deployment caps. The
+            # per-name caps (W-2, W-3) above already reduced qty as
+            # needed; here we further reduce or drop the candidate when
+            # the global caps bind. Reduce-when-possible, drop-when-not so
+            # a partial intent gets through and the diagnostic counter
+            # captures the binding constraint.
+            per_contract_collateral = contract.strike * Decimal("100")
+            intent_collateral = per_contract_collateral * qty
+            if per_tick_remaining < per_contract_collateral:
+                intents_dropped_per_tick += 1
+                _log.info(
+                    "strategy.per_tick_cap.dropped",
+                    sleeve=sleeve.sleeve,
+                    symbol=contract.underlying,
+                    per_tick_remaining=str(per_tick_remaining),
+                )
+                continue
+            if intent_collateral > per_tick_remaining:
+                qty = int(per_tick_remaining // per_contract_collateral)
+                intent_collateral = per_contract_collateral * qty
+            if per_day_remaining < per_contract_collateral:
+                intents_dropped_per_day += 1
+                _log.info(
+                    "strategy.per_day_cap.dropped",
+                    sleeve=sleeve.sleeve,
+                    symbol=contract.underlying,
+                    per_day_remaining=str(per_day_remaining),
+                )
+                continue
+            if intent_collateral > per_day_remaining:
+                qty = int(per_day_remaining // per_contract_collateral)
+                intent_collateral = per_contract_collateral * qty
+            if qty < 1:
+                continue
+
             intent = _intent_from(sleeve, contract, target_delta, qty)
             if intent is None:
                 continue
             sleeve_remaining -= intent.collateral
             total_remaining -= intent.collateral
+            per_tick_remaining -= intent.collateral
+            per_day_remaining -= intent.collateral
             existing_contracts[contract.underlying] = existing_qty + intent.qty
             intents.append(intent)
             intents_built_for_sleeve += 1
@@ -749,7 +876,16 @@ async def build_intents_with_diagnostics(
             )
         )
 
-    return intents, BuildDiagnostics(sleeves=sleeve_diags)
+    return intents, BuildDiagnostics(
+        sleeves=sleeve_diags,
+        intents_dropped_for_per_tick_cap=intents_dropped_per_tick,
+        intents_dropped_for_per_day_cap=intents_dropped_per_day,
+        symbols_skipped_for_cooldown=symbols_skipped_for_cooldown_count,
+        cooldown_symbols=tuple(cooldown_skipped_symbols),
+        today_deployment_used_pct=today_used_pct,
+        today_deployment_remaining_usd=per_day_remaining,
+        per_tick_cap_remaining_usd=per_tick_remaining,
+    )
 
 
 def summarise_intents(intents: list[TradeIntent]) -> str:

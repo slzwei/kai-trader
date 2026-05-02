@@ -23,7 +23,7 @@ sizing logic lives in ``build_intents`` via the per-sleeve dollar cap.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from kai_trader.bot.formatting import bold, format_money, header, pre
@@ -45,8 +45,10 @@ from kai_trader.db.orders import (
     OrderRow,
     OrderStatus,
     has_failed_since,
+    latest_submission_at_per_symbol,
     mark_status,
     mark_submitted,
+    new_deployment_collateral_since,
     pending_orders,
     recent_orders,
     record_intent,
@@ -57,6 +59,7 @@ from kai_trader.logging import get_logger
 from kai_trader.notifications.producer import enqueue
 from kai_trader.strategy.assignment import detect_assignments, record_assignment
 from kai_trader.strategy.candidates import (
+    COOLDOWN_MINUTES,
     TOTAL_DEPLOYMENT_CAP_PCT,
     TradeIntent,
     build_intents_with_diagnostics,
@@ -237,6 +240,42 @@ class StrategyWorker:
             _log.warning("strategy.existing_shorts.fetch_failed", error=str(exc))
             existing_shorts = []
 
+        # W-4: feed the deployment-velocity caps and cool-down into the
+        # builder. today_already_deployed is the running daily total of
+        # new collateral committed since UTC midnight; cooldown_symbols
+        # are names entered (filled or submitted) within the cool-down
+        # window. Both come from the orders table; failures fail-open
+        # (zero deployment, empty cool-down) so a transient DB hiccup
+        # does not freeze the strategy.
+        now_utc = datetime.now(UTC)
+        today_utc_midnight = datetime.combine(
+            now_utc.date(), datetime.min.time(), tzinfo=UTC
+        )
+        try:
+            today_already_deployed = await new_deployment_collateral_since(
+                today_utc_midnight
+            )
+        except Exception as exc:
+            _log.warning(
+                "strategy.today_deployment.fetch_failed", error=str(exc)
+            )
+            today_already_deployed = Decimal("0")
+        cooldown_cutoff = now_utc - timedelta(minutes=COOLDOWN_MINUTES)
+        try:
+            recent_submissions = await latest_submission_at_per_symbol(
+                cooldown_cutoff
+            )
+        except Exception as exc:
+            _log.warning(
+                "strategy.cooldown_lookup.fetch_failed", error=str(exc)
+            )
+            recent_submissions = {}
+        cooldown_symbols = {
+            symbol
+            for symbol, last_at in recent_submissions.items()
+            if last_at >= cooldown_cutoff
+        }
+
         intents, diagnostics = await build_intents_with_diagnostics(
             regime=regime,
             sleeves=sleeves,
@@ -245,6 +284,8 @@ class StrategyWorker:
             today=today,
             earnings_status=get_earnings_status,
             existing_short_puts=existing_shorts,
+            today_already_deployed=today_already_deployed,
+            cooldown_symbols=cooldown_symbols,
         )
 
         submitted: list[str] = []

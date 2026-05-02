@@ -217,3 +217,70 @@ async def has_failed_since(
             since,
         )
     return row is not None
+
+
+async def new_deployment_collateral_since(since: datetime) -> Decimal:
+    """Sum collateral across new-entry orders submitted since ``since``.
+
+    W-4 uses this to enforce the per-day deployment cap. Counts both
+    short put openings and covered call openings because both lock
+    capital (cash for puts, shares for calls) and represent fresh
+    capital being put at risk on the day. Status filter restricts to
+    rows that actually went to the broker (submitted or filled), so a
+    skipped-by-flag attempt does not consume the daily budget.
+
+    Collateral is extracted from intent_payload via the JSONB operator;
+    for short puts, ``strike * 100 * qty``; for covered calls, the
+    per-contract collateral on a CC is shares (already held), so the
+    payload's ``collateral`` field is used when present, otherwise
+    falls back to ``strike * 100 * qty`` which approximates the
+    notional.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            select coalesce(sum(
+                coalesce(
+                    (intent_payload->>'collateral')::numeric,
+                    (intent_payload->>'strike')::numeric * 100 *
+                    (intent_payload->>'qty')::int
+                )
+            ), 0) as total
+              from orders
+             where submitted_at >= $1
+               and action in ('open_short_put', 'open_covered_call')
+               and status in ('submitted', 'filled')
+            """,
+            since,
+        )
+    total = row["total"] if row is not None else Decimal("0")
+    if isinstance(total, Decimal):
+        return total
+    return Decimal(str(total))
+
+
+async def latest_submission_at_per_symbol(
+    since: datetime,
+) -> dict[str, datetime]:
+    """Return the most recent ``submitted_at`` per underlying since ``since``.
+
+    W-4 uses this for the per-symbol cool-down. Excludes skipped and
+    failed rows because those did not actually open a position. The
+    caller is responsible for converting the returned timestamps into
+    a cool-down decision (e.g., is now - last < cool-down window?).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select symbol, max(submitted_at) as last_at
+              from orders
+             where submitted_at >= $1
+               and action in ('open_short_put', 'open_covered_call')
+               and status in ('submitted', 'filled')
+             group by symbol
+            """,
+            since,
+        )
+    return {row["symbol"]: row["last_at"] for row in rows}
