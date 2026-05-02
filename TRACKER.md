@@ -3,6 +3,111 @@
 Daily work log for Kai Trader. Append new entries at the top. One entry per
 working day, short bullets, no corporate polish.
 
+## 2026-05-02 . W-1..W-9: live-readiness defences
+
+Triggered by the over-allocation incident on 2026-05-01 (book moved from
+0% to 96% of deployment cap in 20 minutes, MARA stacked to 30 contracts,
+SNAP to 44, while the documented 10-contract ceiling silently failed).
+LIVE_TRADING_PLAN.md drafted; W-1 through W-9 shipped end-to-end this
+session.
+
+Shipped:
+
+- W-1 (`28869a6`). Earnings filter is fail-closed. New
+  `get_earnings_status` returns `in_window` / `outside_window` /
+  `unknown`; `is_earnings_in_window` returns True on anything other
+  than `outside_window`. Build pipeline gains
+  `symbols_skipped_for_earnings_unknown` so the operator can see when
+  the filter is actively defending against a yfinance outage versus a
+  confirmed earnings skip. Resolves F-3, G-2.
+- W-2 (`5ee55b0`). `MAX_CONTRACTS_PER_SYMBOL = 10` is now cumulative.
+  New `_existing_contract_counts` helper aggregates open short-put
+  qty per underlying; `_max_qty_for` accepts `existing_qty` and caps
+  at `max(0, 10 - existing_qty)`. New diagnostic
+  `symbols_skipped_for_contract_ceiling`. Resolves F-12, G-11
+  (partial).
+- W-3 (`98afd75`). New `PER_NAME_NOTIONAL_CAP_PCT = 0.15` hard
+  ceiling regardless of equity tier. The internal tier table stays
+  for future tightening but `min(tier, 0.15)` is the live-capital
+  guard rail. New diagnostic `symbols_skipped_for_per_name_dollar_cap`.
+  Resolves F-13, G-11 (full).
+- W-4 (`c0824a5`). Three reinforcing velocity controls. Per-tick
+  cap = 10% of equity (`PER_TICK_DEPLOYMENT_CAP_PCT`), per-day cap =
+  30% of equity (`PER_DAY_NEW_DEPLOYMENT_PCT`), per-symbol cool-down
+  = 6 ticks (≈ 30 minutes at 5-min cadence). Day total computed from
+  `orders.submitted_at >= today_utc_midnight` so day rollover is
+  natural. Two new DB helpers in `db/orders.py`:
+  `new_deployment_collateral_since` and `latest_submission_at_per_symbol`.
+  Five new diagnostics surface in the tick warning lines. Resolves
+  F-14, F-15, G-12.
+- W-5 (`0e01e09`). `/close` staged state moves from a process-local
+  dict to the new `pending_close` table (migration 020). Helpers in
+  `db/pending_close.py` (`stage`, `consume`, `cleanup_expired` with
+  partial index on active rows). The handler keeps an in-memory cache
+  for read latency but Postgres is the source of truth. Bot startup
+  runs `cleanup_expired` once. Resolves F-7, G-8 (partial).
+- W-6 (`312ef70`). The 5 failing `test_strategy_worker.py` tests
+  fixed. Three issues: hardcoded option expirations now compute
+  `today + timedelta(days=8)`, the autouse fixture mocks the new
+  external coros (`get_earnings_status`,
+  `new_deployment_collateral_since`, `latest_submission_at_per_symbol`,
+  `compute_realized_vol_30d`, `mark_actual_delta`), and the qty
+  assertion in `test_tick_submits_when_flags_green` updated to match
+  the new W-3 + W-4 binding (qty = 2, was 8). No skips, no deletions.
+  Suite reports 0 failures. Resolves F-5, G-6.
+- W-7 (`0004bfc`). Permanent tracemalloc snapshot loop. New
+  `observability/memory_profile.py` with `start_tracemalloc` and
+  `MemoryProfileWorker`; logs top 20 allocations once per hour as a
+  structured event. Volume is one log line per hour. Override interval
+  via `MEMORY_PROFILE_INTERVAL_SECONDS` (clamped to 30s minimum).
+  Operator action: read 48h of snapshots from Render, decide leak fix
+  vs Render plan upgrade. Resolves F-4 instrumentation; G-3 starts
+  the 14-day clean-run window after the leak/plan decision.
+- W-8 (`60e3b43`). Documented the multi-factor ranker
+  (annualised yield × spread quality, with a 30% spread cutoff as a
+  hard drop) in a top-of-function docstring. Added a hard
+  IV / RV30 ratio floor (`IV_RV_RATIO_MIN = 1.10`) via a new
+  `strategy/iv_rv.py` module: `compute_realized_vol_30d` from daily
+  bars, `passes_iv_rv_floor` predicate. Candidates whose IV is below
+  1.10x recent realized vol are dropped pre-scoring. New diagnostic
+  `symbols_skipped_for_iv_rv_floor`. Fail-open on missing data
+  (kill switch and per-name caps still apply). Resolves F-11
+  (partial; T-6.5 completes the historical edge check).
+- W-9 (`38ccac3`). Post-fill delta verification. Migration 021 adds
+  `target_delta` and `actual_delta` columns to `orders` (queryable,
+  indexed). `record_intent` accepts `target_delta`. The reconcile
+  path fetches the contract's live delta on fill, persists via
+  `mark_actual_delta`, and (if `abs(actual - target) > 0.10`) batches
+  every breach in the tick into a single `priority='alert'` Telegram
+  notification with metadata for post-hoc audit. Resolves F-16, G-13.
+- E2E smoke test (`fdbf6cf`). `scripts/e2e_smoke_test.py` drives
+  `build_intents_with_diagnostics` with a realistic scenario built
+  from the live paper state and asserts every W defence fires.
+  Useful for fast verification after future strategy changes.
+
+Test suite: 584 passing, 2 skipped (integration), coverage 89.27%.
+ruff and mypy --strict clean. The 5 known-failing strategy worker
+tests resolved by W-6.
+
+Hard gates closed: G-2 (W-1), G-6 (W-6), G-8 partial (W-5), G-11
+(W-2 + W-3), G-12 (W-4), G-13 (W-9). Still open: G-1 (Phase 6
+backtest), G-3 (14-day clean run after W-7), G-4 / G-5 (T-7.x), G-7
+(T-7.8), G-9 (T-8.4), G-10 (T-8.7).
+
+Live state captured during the e2e check (2026-05-02 paper):
+equity $100,937, open short puts MARA -30, SNAP -44, INTC -1; market
+closed (next open Mon 2026-05-04 09:30 ET). On the next live tick
+the W-2 contract ceiling will refuse further MARA / SNAP additions
+because both are above the 10-contract ceiling, the W-3 dollar cap
+will refuse INTC additions because the strike alone exceeds the 15%
+per-name cap remaining, and the new diagnostic counters will appear
+in the `/strategy_status` warning surface.
+
+Operator follow-ups outside session scope: confirm Render deploy of
+`fdbf6cf` is live (or re-run via Manual Deploy), confirm migrations
+020 and 021 applied (`schema_migrations` table), let tracemalloc
+snapshots accumulate for ~48h then decide leak vs plan upgrade.
+
 ## 2026-04-28 . Phase 5e: Collateral accounting fix
 
 Real bug surfaced once Phase 5a-d were running live: `Failed: 2
