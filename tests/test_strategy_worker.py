@@ -190,6 +190,10 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     # zero/empty so the test path proceeds as if no recent activity.
     new_deployment_collateral_since = AsyncMock(return_value=Decimal("0"))
     latest_submission_at_per_symbol = AsyncMock(return_value={})
+    # W-8: IV/RV filter. Default RV30 returns None so the filter
+    # fail-opens and tests focused on other paths are unaffected. Tests
+    # that exercise the IV/RV filter can override.
+    compute_realized_vol_30d = AsyncMock(return_value=None)
 
     monkeypatch.setattr(worker_module, "enqueue", enqueue)
     monkeypatch.setattr(worker_module, "get_account", get_account)
@@ -228,6 +232,9 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
         worker_module,
         "latest_submission_at_per_symbol",
         latest_submission_at_per_symbol,
+    )
+    monkeypatch.setattr(
+        worker_module, "compute_realized_vol_30d", compute_realized_vol_30d
     )
     return locals()
 

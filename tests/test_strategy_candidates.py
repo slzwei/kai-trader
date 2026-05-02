@@ -58,6 +58,7 @@ def _put(
     bid: float | None = 1.10,
     ask: float | None = 1.20,
     underlying: str = "SPY",
+    iv: float = 0.18,
 ) -> OptionContract:
     suffix = f"{int(strike * 1000):08d}"
     yymmdd = expiration.strftime("%y%m%d")
@@ -74,7 +75,7 @@ def _put(
         gamma=Decimal("0.01"),
         theta=Decimal("-0.05"),
         vega=Decimal("0.10"),
-        implied_volatility=Decimal("0.18"),
+        implied_volatility=Decimal(str(iv)),
     )
 
 
@@ -1577,6 +1578,107 @@ async def test_per_name_dollar_cap_reduces_qty_for_low_strike_excess() -> None:
     assert len(intents) == 1
     assert intents[0].qty == 1
     assert intents[0].collateral == Decimal("20000")
+
+
+async def test_iv_rv_filter_rejects_below_floor() -> None:
+    """W-8 acceptance: IV30=0.30, RV30=0.35 → ratio 0.857 → rejected."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(
+                strike=50,
+                delta=-0.30,
+                expiration=expiry,
+                underlying=symbol,
+                iv=0.30,
+            )
+        ]
+
+    async def rv30(_symbol: str) -> Decimal:
+        return Decimal("0.35")
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["BIG"], target_pct=Decimal("1.0"))],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+        rv30_provider=rv30,
+    )
+    assert intents == []
+    sleeve = diag.sleeves[0]
+    assert sleeve.symbols_skipped_for_iv_rv_floor == 1
+    assert sleeve.iv_rv_floor_symbols == ("BIG",)
+
+
+async def test_iv_rv_filter_passes_above_floor() -> None:
+    """W-8 acceptance: IV30=0.40, RV30=0.30 → ratio 1.33 → allowed."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(
+                strike=50,
+                delta=-0.30,
+                expiration=expiry,
+                underlying=symbol,
+                iv=0.40,
+            )
+        ]
+
+    async def rv30(_symbol: str) -> Decimal:
+        return Decimal("0.30")
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["BIG"], target_pct=Decimal("1.0"))],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+        rv30_provider=rv30,
+    )
+    assert len(intents) == 1
+    sleeve = diag.sleeves[0]
+    assert sleeve.symbols_skipped_for_iv_rv_floor == 0
+
+
+async def test_iv_rv_filter_warning_surfaces() -> None:
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(
+                strike=50,
+                delta=-0.30,
+                expiration=expiry,
+                underlying=symbol,
+                iv=0.20,
+            )
+        ]
+
+    async def rv30(_symbol: str) -> Decimal:
+        return Decimal("0.30")
+
+    _intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[
+            _sleeve(
+                "index_core",
+                whitelist=["A", "B", "C"],
+                target_pct=Decimal("1.0"),
+            )
+        ],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+        rv30_provider=rv30,
+    )
+    warnings = diag.warning_lines()
+    assert any("IV/RV 1.10 floor" in w for w in warnings)
 
 
 async def test_per_tick_dollar_cap_drops_lowest_ranked_candidates() -> None:

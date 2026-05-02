@@ -72,6 +72,7 @@ from kai_trader.strategy.covered_calls import (
 )
 from kai_trader.strategy.drawdown import check_and_trip as check_drawdown
 from kai_trader.strategy.earnings import get_earnings_status
+from kai_trader.strategy.iv_rv import compute_realized_vol_30d
 from kai_trader.strategy.profit_take import CloseIntent, evaluate_profit_takes
 from kai_trader.strategy.regime import RegimeSnapshot, compute_and_record
 from kai_trader.strategy.rolls import RollIntent, evaluate_rolls
@@ -286,6 +287,7 @@ class StrategyWorker:
             existing_short_puts=existing_shorts,
             today_already_deployed=today_already_deployed,
             cooldown_symbols=cooldown_symbols,
+            rv30_provider=compute_realized_vol_30d,
         )
 
         submitted: list[str] = []

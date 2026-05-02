@@ -22,6 +22,7 @@ from kai_trader.broker.options_data import OptionContract, parse_occ_symbol
 from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.logging import get_logger
 from kai_trader.strategy.earnings import EarningsStatus
+from kai_trader.strategy.iv_rv import IV_RV_RATIO_MIN, passes_iv_rv_floor
 from kai_trader.strategy.regime import RegimeSnapshot
 
 ChainFetcher = Callable[[str, date | None], Awaitable[list[OptionContract]]]
@@ -111,6 +112,8 @@ class SleeveDiagnostic:
     contract_ceiling_symbols: tuple[str, ...] = ()
     symbols_skipped_for_per_name_dollar_cap: int = 0
     per_name_dollar_cap_symbols: tuple[str, ...] = ()
+    symbols_skipped_for_iv_rv_floor: int = 0
+    iv_rv_floor_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -225,6 +228,23 @@ class BuildDiagnostics:
                     f"current account size."
                 )
             return warnings
+        total_skipped_iv_rv = sum(
+            s.symbols_skipped_for_iv_rv_floor for s in self.sleeves
+        )
+        if total_skipped_iv_rv > 0:
+            iv_rv_symbols = sorted({
+                sym for s in self.sleeves for sym in s.iv_rv_floor_symbols
+            })
+            sample = ", ".join(iv_rv_symbols[:5])
+            more = (
+                f" (+{len(iv_rv_symbols) - 5} more)"
+                if len(iv_rv_symbols) > 5
+                else ""
+            )
+            warnings.append(
+                f"{total_skipped_iv_rv} symbol(s) below IV/RV 1.10 floor: "
+                f"{sample}{more}"
+            )
         total_skipped_ceiling = sum(
             s.symbols_skipped_for_contract_ceiling for s in self.sleeves
         )
@@ -496,18 +516,41 @@ SPREAD_QUALITY_CUTOFF_PCT = Decimal("0.30")
 def _score_candidate(contract: OptionContract, today: date) -> Decimal | None:
     """Multi-factor ranking score for one candidate put. Higher is better.
 
-    ``score = annualised_yield * spread_quality``
+    Documented behaviour (W-8). The score combines two factors:
 
-    Annualised yield captures premium-per-dollar-locked, normalised across
-    DTEs so a 7-day and a 10-day candidate are comparable. Spread quality
-    is the liquidity proxy: tighter spread = better fill, wider spread
-    drops the score. Both factors are unit-Decimal quantities.
+    1. **Annualised yield** =
+       ``(mid / strike) * (365 / dte)``
+
+       Captures premium-per-dollar-of-collateral, normalised across DTEs
+       so a 7-day and a 10-day candidate are comparable. Strike is the
+       collateral proxy because CSPs lock ``strike * 100 * qty`` cash;
+       mid is the per-share premium captured when the contract opens.
+       A 7-day put paying $0.20 on a $50 strike yields
+       ``0.20 / 50 * 365 / 7 = 20.86%`` annualised; a 10-day put paying
+       $0.30 on the same strike yields ``0.30 / 50 * 365 / 10 = 21.9%``
+       so the longer-dated contract wins on yield alone, not on
+       headline premium.
+
+    2. **Spread quality** =
+       ``1 - (spread / mid) / SPREAD_QUALITY_CUTOFF_PCT``
+
+       A liquidity proxy. Spread is ``ask - bid``; spread/mid is the
+       fractional spread. The function returns ``None`` (drop entirely)
+       when ``spread >= 30%`` of mid, otherwise spread_quality scales
+       linearly from 1.0 at zero spread to 0.0 at the cutoff. Wide
+       spreads on the OPRA feed usually mean the order will not fill
+       at the bid, so the headline yield becomes fiction.
+
+    The composite score is the product. Higher annualised yield always
+    wins on tied spread quality; equal yield ties broken by tighter
+    spread. There is no IV-rank input today; the IV/RV pre-filter (in
+    ``iv_rv.passes_iv_rv_floor``) acts as a hard gate before scoring,
+    so candidates whose IV is not richer than recent realized vol
+    never reach this function.
 
     Returns ``None`` when the contract fails the minimum liquidity test
     (spread >= 30% of mid). The caller drops these so they never enter
     the greedy fill, regardless of how attractive the headline yield is.
-    A wide spread on the OPRA feed usually means an order won't fill at
-    the bid, so the headline number is fiction.
     """
     if contract.bid is None or contract.ask is None:
         return None
@@ -527,6 +570,7 @@ def _score_candidate(contract: OptionContract, today: date) -> Decimal | None:
 
 
 EarningsStatusProvider = Callable[[str, date, int], Awaitable[EarningsStatus]]
+RV30Provider = Callable[[str], Awaitable["Decimal | None"]]
 
 
 async def build_intents(
@@ -540,6 +584,7 @@ async def build_intents(
     existing_short_puts: list[PositionSnapshot] | None = None,
     today_already_deployed: Decimal | None = None,
     cooldown_symbols: set[str] | None = None,
+    rv30_provider: RV30Provider | None = None,
 ) -> list[TradeIntent]:
     """Walk active sleeves and produce intent rows up to the cap matrix.
 
@@ -556,6 +601,7 @@ async def build_intents(
         existing_short_puts=existing_short_puts,
         today_already_deployed=today_already_deployed,
         cooldown_symbols=cooldown_symbols,
+        rv30_provider=rv30_provider,
     )
     return intents
 
@@ -571,6 +617,7 @@ async def build_intents_with_diagnostics(
     existing_short_puts: list[PositionSnapshot] | None = None,
     today_already_deployed: Decimal | None = None,
     cooldown_symbols: set[str] | None = None,
+    rv30_provider: RV30Provider | None = None,
 ) -> tuple[list[TradeIntent], BuildDiagnostics]:
     """Build intents and return the per-sleeve diagnostic counters alongside.
 
@@ -654,10 +701,12 @@ async def build_intents_with_diagnostics(
         symbols_skipped_for_earnings_unknown = 0
         symbols_skipped_for_contract_ceiling = 0
         symbols_skipped_for_per_name_dollar_cap = 0
+        symbols_skipped_for_iv_rv_floor = 0
         earnings_blackout_symbols: list[str] = []
         earnings_unknown_symbols: list[str] = []
         contract_ceiling_symbols: list[str] = []
         per_name_dollar_cap_symbols: list[str] = []
+        iv_rv_floor_symbols: list[str] = []
 
         # Phase 1: walk the whitelist, fetch each chain, pick a strike.
         ranked: list[tuple[OptionContract, Decimal]] = []
@@ -731,6 +780,34 @@ async def build_intents_with_diagnostics(
             contract = select_put_strike(chain, target_delta, sleeve, today)
             if contract is None or contract.bid is None or contract.ask is None:
                 continue
+            # W-8: IV/RV floor. Skip the candidate if implied vol is not
+            # at least 1.10x recent realized vol; otherwise we are
+            # selling vol cheaper than the underlying has traded
+            # recently, which is the opposite of edge. Fail-open when
+            # either IV or RV is missing.
+            if rv30_provider is not None:
+                try:
+                    rv30 = await rv30_provider(contract.underlying)
+                except Exception as exc:
+                    _log.warning(
+                        "strategy.rv30_provider.failed",
+                        sleeve=sleeve.sleeve,
+                        symbol=contract.underlying,
+                        error=str(exc),
+                    )
+                    rv30 = None
+                if not passes_iv_rv_floor(contract, rv30, IV_RV_RATIO_MIN):
+                    symbols_skipped_for_iv_rv_floor += 1
+                    if contract.underlying not in iv_rv_floor_symbols:
+                        iv_rv_floor_symbols.append(contract.underlying)
+                    _log.info(
+                        "strategy.iv_rv.skipped",
+                        sleeve=sleeve.sleeve,
+                        symbol=contract.underlying,
+                        iv=str(contract.implied_volatility),
+                        rv30=str(rv30),
+                    )
+                    continue
             score = _score_candidate(contract, today)
             if score is None:
                 continue
@@ -873,6 +950,8 @@ async def build_intents_with_diagnostics(
                     symbols_skipped_for_per_name_dollar_cap
                 ),
                 per_name_dollar_cap_symbols=tuple(per_name_dollar_cap_symbols),
+                symbols_skipped_for_iv_rv_floor=symbols_skipped_for_iv_rv_floor,
+                iv_rv_floor_symbols=tuple(iv_rv_floor_symbols),
             )
         )
 
