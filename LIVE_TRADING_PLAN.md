@@ -150,7 +150,7 @@ These are the issues that surfaced during the live diagnostic. Each becomes a ha
 | **F-11** | Strategic | The multi-factor ranker referenced in `migration_018` claims to score by "annualised yield × spread quality" but it is unverified whether it actually scores on the variable that matters for an options seller: **IV / RV ratio**. If it does not, the strategy is harvesting time decay without conditioning on whether vol is rich. That is not edge; that is randomly selling premium. See T-6.1, T-6.5. |
 | **F-12** | Critical | `MAX_CONTRACTS_PER_SYMBOL = 10` at `candidates.py:32` is documented as a "hard ceiling regardless of sleeve headroom" but `_max_qty_for` (`candidates.py:317-336`) only applies it **per build call**, not against existing held contracts. **Observed live**: MARA reached 30 contracts (3 ticks × 10) and SNAP reached 40 contracts (4 ticks × 10), both 3-4× the intended ceiling. The constant exists to prevent exactly this; the implementation silently fails. See G-11, W-2. |
 | **F-13** | Critical | The per-symbol $ cap (`per_symbol_cap_pct` × equity, default 60% of equity at $100K-tier) is **strike-blind**. On SPY-class strikes (~$580) it reasonably bounds qty. On MARA at $11.50 strike it allows 52 contracts; on SNAP at $6 it allows 100. This is how 40% of equity wound up in one social-media stock and 51% in one crypto miner. See G-11, W-3. |
-| **F-14** | Critical | No per-tick total-deployment cap. **Observed**: 4 ticks across 20 minutes (18:22 to 18:42 UTC on May 1) took the book from 0% to 96% of the $70,683 deployment cap, leaving $2,500 of dry powder for any overnight regime change. A live system needs daily ramp limits, per-tick velocity caps, or both. See G-12, W-4. |
+| **F-14** | Critical | No per-tick total-deployment cap and no daily new-deployment cap. **Observed**: 4 ticks across 20 minutes (18:22 to 18:42 UTC on May 1) took the book from 0% to 96% of the $70,683 deployment cap, leaving $2,500 of dry powder for any overnight regime change. A live system needs both a per-tick velocity cap (prevents single-tick blow-out) and a daily ramp cap (prevents 4-hour blow-out across many ticks). See G-12, W-4. |
 | **F-15** | High | The greedy ranker keeps returning MARA P11.50 and SNAP P6 as top scores each tick (high annualised yield × tight spread). Phase 5e's collateral-aware cap math only blocks re-attempts when the per-symbol $ cap is fully consumed; below that, the same strikes accumulate. The ranker has no anti-recency penalty and no cool-down between entries on the same symbol. See G-12, W-4. |
 | **F-16** | Medium | Entry deltas are not verified post-fill. Target was -0.40 (risk_on) or -0.30 (neutral); `actual_delta` is stored only inside `orders.intent_payload` jsonb, not in a queryable column. **Without a post-fill check, a fill significantly outside the target band is invisible** until next tick's reconciliation, and even then only by inspecting position deltas. See G-13, W-9. |
 
@@ -173,7 +173,7 @@ These are not improvements; they are **defects** the system has today that would
 | **G-9: Two-channel critical alerting** | Telegram for routine. SMS or PagerDuty (or equivalent) for: kill_switch tripped, broker error rate > N/min, last-tick > 30 min ago, drawdown threshold hit. One channel = single point of failure. | T-8.4 |
 | **G-10: Operator runbooks committed** | `docs/runbooks/*.md` covering: bot won't start, broker 5xx for 5 min, last tick 1 hour ago, unexpected assignment, kill_switch stuck on, staged close lost. Each: symptoms, diagnosis, fix, prevention. | T-8.7 |
 | **G-11: Per-symbol caps enforced cumulatively** | `MAX_CONTRACTS_PER_SYMBOL` and the per-symbol $ cap both subtract existing held contracts/collateral before computing remaining headroom. A symbol at the contract ceiling cannot accumulate further on subsequent ticks. The $ cap is tightened to a strike-aware floor that does not balloon for low-priced underlyings. | W-2, W-3 |
-| **G-12: Deployment velocity capped + per-symbol cool-down** | Total new collateral deployed in any single tick is capped (default ≤ 10% of equity). A symbol entered in tick N is excluded from candidate selection for the next K ticks (default K = 6, ≈ 30 minutes at 5-min cadence). Greedy re-selection of the same strike is prevented by construction, not by chance. | W-4 |
+| **G-12: Deployment velocity capped (per tick + per day) + per-symbol cool-down** | Total new collateral deployed in any single tick is capped (default ≤ 10% of equity). Total new collateral deployed since UTC midnight is capped (default ≤ 30% of equity). A symbol entered in tick N is excluded from candidate selection for the next K ticks (default K = 6, ≈ 30 minutes at 5-min cadence). Greedy re-selection of the same strike, intra-day blow-out, and inter-tick stacking are all prevented by construction, not by chance. | W-4 |
 | **G-13: Post-fill delta within target band** | Every filled CSP records `actual_delta` in a queryable column (not just inside intent_payload). A post-fill check warns or kill-switches if `abs(actual_delta - target_delta) > tolerance` (default tolerance 0.10). Operator gets a Telegram notification within one tick of a fill that lands materially outside intent. | W-9 |
 
 ---
@@ -559,19 +559,26 @@ These are the tasks to do **first**, before any of the larger phase work. Each i
 - Commit message: `feat: enforce 15% per-name notional cap regardless of strike`.
 - Resolves: F-13, G-11 (full).
 
-### W-4: Per-tick deployment velocity cap + per-symbol cool-down (3-5 hours)
-- Files: `src/kai_trader/strategy/candidates.py`, possibly new `src/kai_trader/strategy/cooldown.py`, possibly `src/kai_trader/db/orders.py` for cool-down lookup.
-- Two related fixes:
+### W-4: Per-tick + per-day deployment caps and per-symbol cool-down (4-6 hours)
+- Files: `src/kai_trader/strategy/candidates.py`, possibly new `src/kai_trader/strategy/cooldown.py` and `src/kai_trader/strategy/deployment.py`, `src/kai_trader/db/orders.py` for cool-down and daily-deployment lookups.
+- Three related fixes:
   1. **Per-tick total-deployment cap.** Sum the total new collateral across all candidate intents in a single tick. Cap at `PER_TICK_DEPLOYMENT_CAP_PCT * equity` (default 0.10, i.e. 10% of equity). If the cap is exceeded, drop lowest-ranked candidates first until under.
-  2. **Per-symbol cool-down.** A symbol entered (filled or submitted) in the last `COOLDOWN_TICKS` ticks (default 6, ≈ 30 minutes at 5-min cadence) is excluded from candidate selection.
-- Cool-down lookup: query `orders` for the symbol's latest `submitted_at` and compare to now. Add an `orders` index on `(symbol, submitted_at desc)` if not present.
-- Diagnostic counters: `intents_dropped_for_velocity_cap`, `symbols_skipped_for_cooldown`. Surface in tick summary.
+  2. **Per-day new-deployment cap.** Sum new collateral committed since UTC midnight by querying `orders` for rows where `submitted_at >= today_utc_midnight` and `action in ('open_short_put', 'open_covered_call')` and `status in ('submitted', 'filled')`. Cap the running daily total at `PER_DAY_NEW_DEPLOYMENT_PCT * equity` (default 0.30, i.e. 30% of equity in new short premium per UTC day). If a candidate would push the day total over the cap, reduce qty (or drop candidate).
+  3. **Per-symbol cool-down.** A symbol entered (filled or submitted) in the last `COOLDOWN_TICKS` ticks (default 6, ≈ 30 minutes at 5-min cadence) is excluded from candidate selection.
+- Implementation notes:
+  - Compute today-deployment from `orders.submitted_at` (no new table needed — orders is the single source of truth). Add an `orders` index on `(submitted_at desc, action)` if query latency is poor; verify with `explain analyze` first before adding.
+  - Cool-down lookup: query `orders` for the symbol's latest `submitted_at` and compare to now. Same `orders.submitted_at` index works.
+  - Both the per-tick and per-day caps must be checked **after** the per-name caps (W-2, W-3) so a single name doesn't blow either velocity bucket.
+  - Day boundary is UTC midnight to keep the cap deterministic across timezones; the operator's weekly review should be timezone-aware separately.
+- Diagnostic counters: `intents_dropped_for_per_tick_cap`, `intents_dropped_for_per_day_cap`, `symbols_skipped_for_cooldown`. Surface in tick summary along with current `today_deployment_used_pct` and `today_deployment_remaining_usd`.
 - Tests:
-  - 5 candidates each $5K, equity $100K → cap 10% = $10K → top 2 candidates pass, rest dropped with `dropped_for_velocity_cap`.
-  - Symbol entered 3 ticks ago, cool-down = 6 ticks → skipped.
-  - Symbol entered 7 ticks ago, cool-down = 6 ticks → eligible.
-- Commit message: `feat: per-tick deployment cap and per-symbol cool-down`.
-- Resolves: F-14 (velocity), F-15 (greedy re-selection), G-12.
+  - **Per-tick cap**: 5 candidates each $5K, equity $100K → cap 10% = $10K → top 2 candidates pass, rest dropped with `intents_dropped_for_per_tick_cap`.
+  - **Per-day cap, fresh book**: equity $100K, no orders today → first tick allowed up to $10K (per-tick cap binds), but cumulative across the day cannot exceed $30K. Seed `orders` with $25K already committed today, candidate set worth $10K → only $5K allowed through.
+  - **Per-day cap, day rollover**: seed `orders` with $40K committed yesterday (before today UTC midnight). Today's first tick should see day total = 0, full $10K per-tick allowed, $30K per-day allowed.
+  - **Cool-down**: symbol entered 3 ticks ago, cool-down = 6 ticks → skipped. Symbol entered 7 ticks ago → eligible.
+  - **All three together**: equity $100K, $25K already today, 5 candidates each $5K, one is in cool-down. Cool-down candidate dropped first; per-day cap clamps the rest to $5K total = 1 candidate; per-tick cap is non-binding.
+- Commit message: `feat: per-tick and per-day deployment caps with per-symbol cool-down`.
+- Resolves: F-14 (velocity, both per-tick and per-day), F-15 (greedy re-selection), G-12.
 
 ### W-5: Persist `_pending` close state to Postgres (4-6 hours)
 - New migration `020_pending_close_state.sql`:
