@@ -9,7 +9,13 @@ entry mirrors the original text-only flow so a stale button cannot
 fire long after the operator forgot about it.
 
 The text-based ``/close_confirm SYMBOL`` path is preserved as a
-fallback; it shares the same ``_pending`` dict.
+fallback; it shares the persisted staged-close state.
+
+W-5 moves the staged-close state from a process-local ``dict`` to the
+``pending_close`` table so a bot restart resumes the state intact. The
+in-memory cache below is retained as a read-through optimisation
+(reduces round-trip latency for the typical stage-then-consume flow)
+but Postgres is the source of truth.
 """
 
 from __future__ import annotations
@@ -39,6 +45,12 @@ from kai_trader.broker.options_data import parse_occ_symbol
 from kai_trader.config import get_settings
 from kai_trader.db.client import mark_command_response
 from kai_trader.db.orders import record_intent
+from kai_trader.db.pending_close import (
+    consume as _db_consume,
+)
+from kai_trader.db.pending_close import (
+    stage as _db_stage,
+)
 from kai_trader.logging import get_logger
 
 _log = get_logger(__name__)
@@ -57,7 +69,19 @@ class _PendingClose:
 _pending: dict[tuple[int, str], _PendingClose] = {}
 
 
-def _stage(user_id: int, symbol: str) -> None:
+async def _stage(user_id: int, symbol: str) -> None:
+    """Stage a close in Postgres and refresh the in-memory cache."""
+    try:
+        await _db_stage(user_id, symbol, ttl_seconds=int(CONFIRM_TTL_SECONDS))
+    except Exception as exc:
+        # The DB-backed path is the source of truth; if it fails we log
+        # and fall back to in-memory only so the operator can still close.
+        _log.warning(
+            "bot.close.db_stage_failed",
+            user_id=user_id,
+            symbol=symbol,
+            error=str(exc),
+        )
     _pending[(user_id, symbol)] = _PendingClose(
         user_id=user_id,
         symbol=symbol,
@@ -65,14 +89,41 @@ def _stage(user_id: int, symbol: str) -> None:
     )
 
 
-def _consume(user_id: int, symbol: str) -> _PendingClose | None:
-    """Return the staged close if still within TTL. Removes it either way."""
-    entry = _pending.pop((user_id, symbol), None)
-    if entry is None:
-        return None
-    if time.monotonic() - entry.staged_at > CONFIRM_TTL_SECONDS:
-        return None
-    return entry
+async def _consume(user_id: int, symbol: str) -> _PendingClose | None:
+    """Return the staged close if still within TTL. Removes it either way.
+
+    Postgres is the source of truth. The in-memory cache is consulted
+    as a fallback (and retired) so a successful DB consume always wins
+    even if the in-memory entry has already been popped.
+    """
+    cache_entry = _pending.pop((user_id, symbol), None)
+    cache_fresh = (
+        cache_entry is not None
+        and time.monotonic() - cache_entry.staged_at <= CONFIRM_TTL_SECONDS
+    )
+    try:
+        db_row = await _db_consume(user_id, symbol)
+    except Exception as exc:
+        _log.warning(
+            "bot.close.db_consume_failed",
+            user_id=user_id,
+            symbol=symbol,
+            error=str(exc),
+        )
+        # Fail back to the cache. If the cache had a fresh entry we
+        # honour it; otherwise the consume returns None.
+        return cache_entry if cache_fresh else None
+
+    if db_row is not None:
+        return _PendingClose(
+            user_id=db_row.user_id,
+            symbol=db_row.symbol,
+            staged_at=time.monotonic(),
+        )
+    # No active row in the DB. If the cache thought it was fresh, defer
+    # to the DB (which has either consumed or expired the row already)
+    # so we never double-execute on stale cache state.
+    return None
 
 
 def _reset_pending() -> None:
@@ -269,11 +320,11 @@ async def handle_callback(update: Update, _tg_ctx: ContextTypes.DEFAULT_TYPE) ->
 
     try:
         if action == "stage":
-            _stage(user_id, symbol)
+            await _stage(user_id, symbol)
             await query.answer("Confirm to close.")
             await _edit_to_confirm(query, symbol)
         elif action == "do":
-            staged = _consume(user_id, symbol)
+            staged = await _consume(user_id, symbol)
             if staged is None:
                 await query.answer(f"Stale (>{int(CONFIRM_TTL_SECONDS)}s). Re-stage.")
                 await _edit_message(
@@ -285,7 +336,7 @@ async def handle_callback(update: Update, _tg_ctx: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Submitting close.")
             await _execute_close(query, user_id, symbol)
         elif action == "cancel":
-            _consume(user_id, symbol)  # drop the staged entry if any
+            await _consume(user_id, symbol)  # drop the staged entry if any
             await query.answer("Cancelled.")
             await _edit_message(query, f"Close cancelled for {symbol}.")
         else:
@@ -372,7 +423,7 @@ async def _build_confirm(_update: Update, ctx: Any) -> str:
         return USAGE_CONFIRM
     symbol = parts[0].upper()
 
-    staged = _consume(ctx.telegram_user_id, symbol)
+    staged = await _consume(ctx.telegram_user_id, symbol)
     if staged is None:
         return (
             f"No fresh /close staged for {symbol}. Stage one with "

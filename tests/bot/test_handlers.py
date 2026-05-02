@@ -1332,11 +1332,65 @@ def _patch_close_audit(monkeypatch: pytest.MonkeyPatch) -> None:
     """The new handle_close bypasses run_command, so it imports
     mark_command_response and record_intent directly. Patch them
     at the close module so the global patched_db fixture (which
-    patches the _common.py copy) doesn't miss them."""
+    patches the _common.py copy) doesn't miss them.
+
+    Also patches the W-5 DB-backed pending_close helpers to no-ops so
+    tests that exercise the in-memory cache path do not require a
+    Postgres connection.
+    """
     from unittest.mock import AsyncMock
 
     monkeypatch.setattr(close_mod, "mark_command_response", AsyncMock())
     monkeypatch.setattr(close_mod, "record_intent", AsyncMock(return_value="audit"))
+    monkeypatch.setattr(close_mod, "_db_stage", AsyncMock(return_value=1))
+    monkeypatch.setattr(close_mod, "_db_consume", AsyncMock(return_value=None))
+
+
+async def _stage_in_cache_only(user_id: int, symbol: str) -> None:
+    """Drop a fresh entry into the in-memory cache without touching the DB.
+
+    Used by tests that previously called the synchronous ``_stage``
+    helper. After W-5, ``_stage`` is async and writes through to
+    Postgres; tests that just want the cache populated should use this
+    helper instead so the DB layer can stay mocked.
+    """
+    import time
+
+    close_mod._pending[(user_id, symbol)] = close_mod._PendingClose(
+        user_id=user_id,
+        symbol=symbol,
+        staged_at=time.monotonic(),
+    )
+
+
+def _patch_db_consume_returns_fresh(
+    monkeypatch: pytest.MonkeyPatch, user_id: int, symbol: str
+) -> None:
+    """Patch ``_db_consume`` to return a fresh StagedCloseRow for ``(user_id, symbol)``.
+
+    Tests that exercise the W-5 happy path (stage then consume) need
+    the DB-backed consume to behave as if a fresh row was found. Other
+    keys return None.
+    """
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock
+
+    from kai_trader.db.pending_close import StagedCloseRow
+
+    async def _consume_stub(uid: int, sym: str) -> StagedCloseRow | None:
+        if uid == user_id and sym == symbol:
+            return StagedCloseRow(
+                id=1,
+                user_id=user_id,
+                symbol=symbol,
+                staged_at=datetime.now(UTC),
+                ttl_seconds=30,
+                status="staged",
+                consumed_at=None,
+            )
+        return None
+
+    monkeypatch.setattr(close_mod, "_db_consume", AsyncMock(side_effect=_consume_stub))
 
 
 async def test_close_lists_equity_match_with_button(
@@ -1555,8 +1609,10 @@ async def test_close_callback_do_executes_close(
     from unittest.mock import AsyncMock, MagicMock
 
     close_mod._reset_pending()
+    _patch_close_audit(monkeypatch)
     occ = "AMZN260506P00250000"
-    close_mod._stage(42, occ)
+    await _stage_in_cache_only(42, occ)
+    _patch_db_consume_returns_fresh(monkeypatch, 42, occ)
 
     monkeypatch.setattr(
         close_mod,
@@ -1618,8 +1674,9 @@ async def test_close_callback_cancel_clears_and_edits(
     from unittest.mock import MagicMock
 
     close_mod._reset_pending()
+    _patch_close_audit(monkeypatch)
     occ = "AMZN260506P00250000"
-    close_mod._stage(42, occ)
+    await _stage_in_cache_only(42, occ)
     query = _callback_query(f"cls:cancel:{occ}")
     update = _callback_update(user_id=42, query=query)
 
@@ -1637,8 +1694,10 @@ async def test_close_callback_do_when_kill_switch_engaged(
     from unittest.mock import AsyncMock, MagicMock
 
     close_mod._reset_pending()
+    _patch_close_audit(monkeypatch)
     occ = "AMZN260506P00250000"
-    close_mod._stage(42, occ)
+    await _stage_in_cache_only(42, occ)
+    _patch_db_consume_returns_fresh(monkeypatch, 42, occ)
     monkeypatch.setattr(
         close_mod,
         "close_position",
@@ -1680,7 +1739,9 @@ async def test_close_confirm_executes_when_staged(
     from unittest.mock import AsyncMock
 
     close_mod._reset_pending()
-    close_mod._stage(42, "SPY")
+    _patch_close_audit(monkeypatch)
+    await _stage_in_cache_only(42, "SPY")
+    _patch_db_consume_returns_fresh(monkeypatch, 42, "SPY")
     monkeypatch.setattr(
         close_mod,
         "close_position",
@@ -1754,7 +1815,9 @@ async def test_close_confirm_position_not_found(
     from unittest.mock import AsyncMock
 
     close_mod._reset_pending()
-    close_mod._stage(42, "SPY")
+    _patch_close_audit(monkeypatch)
+    await _stage_in_cache_only(42, "SPY")
+    _patch_db_consume_returns_fresh(monkeypatch, 42, "SPY")
     monkeypatch.setattr(
         close_mod,
         "close_position",
@@ -1783,7 +1846,9 @@ async def test_close_confirm_kill_switch_path(
     from unittest.mock import AsyncMock
 
     close_mod._reset_pending()
-    close_mod._stage(42, "SPY")
+    _patch_close_audit(monkeypatch)
+    await _stage_in_cache_only(42, "SPY")
+    _patch_db_consume_returns_fresh(monkeypatch, 42, "SPY")
     monkeypatch.setattr(
         close_mod,
         "close_position",

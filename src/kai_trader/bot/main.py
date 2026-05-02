@@ -44,6 +44,7 @@ from kai_trader.bot.handlers import (
 from kai_trader.bot.handlers import help as help_handler
 from kai_trader.config import Settings, get_settings
 from kai_trader.db.client import close_pool, get_pool
+from kai_trader.db.pending_close import cleanup_expired as pending_close_cleanup_expired
 from kai_trader.db.readonly import close_readonly_pool
 from kai_trader.events.dispatcher import EventDispatcher, build_owner_send
 from kai_trader.logging import configure_logging, get_logger
@@ -112,6 +113,20 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
 
     settings = get_settings()
     owner_id = settings.telegram_owner_id
+
+    # W-5: clean any pending_close rows whose TTL elapsed while the bot
+    # was offline. Running this once on boot lets the next /close stage
+    # for the same key proceed without colliding with a leftover row.
+    try:
+        cleaned = await pending_close_cleanup_expired()
+        if cleaned:
+            get_logger("bot.main").info(
+                "bot.pending_close.cleaned", rows=cleaned
+            )
+    except Exception as exc:
+        get_logger("bot.main").warning(
+            "bot.pending_close.cleanup_failed", error=str(exc)
+        )
 
     async def _send_to_owner(message: str) -> None:
         await app.bot.send_message(chat_id=owner_id, text=message)
