@@ -74,13 +74,25 @@ def _sleeve() -> SleeveConfig:
     )
 
 
-def _put_contract() -> OptionContract:
+def _put_contract(expiration: date | None = None) -> OptionContract:
+    """Build a SPY $50 put contract.
+
+    Phase 5e+ tests rely on the worker's runtime ``today`` derivation
+    (``datetime.now(UTC).date()``), so the expiration must be relative
+    to *now* rather than a hard-coded calendar date or the contract
+    will fall outside the sleeve's 7-10 DTE band any time the test
+    runs more than 10 days after a fixture's authored date. Default
+    expiration is today+8 days so the contract reliably matches the
+    sleeve DTE band the test asserts.
+    """
+    expiry = expiration or (datetime.now(UTC).date() + timedelta(days=8))
+    occ = f"SPY{expiry.strftime('%y%m%d')}P00050000"
     return OptionContract(
-        symbol="SPY260505P00050000",
+        symbol=occ,
         underlying="SPY",
         option_type="put",
         strike=Decimal("50"),
-        expiration=date(2026, 5, 5),
+        expiration=expiry,
         bid=Decimal("1.10"),
         ask=Decimal("1.20"),
         last=Decimal("1.15"),
@@ -170,6 +182,14 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     ))
     evaluate_rolls = AsyncMock(return_value=[])
     record_assignment = AsyncMock(return_value="asg-row-id")
+    # W-1 fail-closed: tests want SPY-class names to fall through, so the
+    # default earnings status is outside_window (= safe to trade). Tests
+    # that exercise the blackout path can override.
+    get_earnings_status = AsyncMock(return_value="outside_window")
+    # W-4: deployment-velocity helpers are queried from the DB; default to
+    # zero/empty so the test path proceeds as if no recent activity.
+    new_deployment_collateral_since = AsyncMock(return_value=Decimal("0"))
+    latest_submission_at_per_symbol = AsyncMock(return_value={})
 
     monkeypatch.setattr(worker_module, "enqueue", enqueue)
     monkeypatch.setattr(worker_module, "get_account", get_account)
@@ -198,6 +218,17 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     monkeypatch.setattr(worker_module, "recent_orders", recent_orders)
     monkeypatch.setattr(worker_module, "has_failed_since", has_failed_since)
     monkeypatch.setattr(worker_module, "record_assignment", record_assignment)
+    monkeypatch.setattr(worker_module, "get_earnings_status", get_earnings_status)
+    monkeypatch.setattr(
+        worker_module,
+        "new_deployment_collateral_since",
+        new_deployment_collateral_since,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "latest_submission_at_per_symbol",
+        latest_submission_at_per_symbol,
+    )
     return locals()
 
 
@@ -265,9 +296,12 @@ async def test_tick_submits_when_flags_green(
     submit_args = _patch_dependencies["submit_short_put"].await_args
     # Limit price should be the contract bid.
     assert submit_args.kwargs["limit_price"] == Decimal("1.10")
-    # $100k equity lands in the 60% per-symbol tier ($60k), but the 40%
-    # sleeve cap binds first: $40k / $5000 collateral per contract = 8.
-    assert submit_args.kwargs["qty"] == 8
+    # $100k equity, per-tick deployment cap (W-4) = 10% = $10k.
+    # Strike $50 = $5000 per contract → 2 contracts fit before per-tick
+    # cap binds. The 15% per-name cap (W-3) would allow 3, the 40%
+    # sleeve cap would allow 8, and MAX_CONTRACTS_PER_SYMBOL caps at
+    # 10. Per-tick cap is the smallest binding constraint here.
+    assert submit_args.kwargs["qty"] == 2
 
 
 async def test_tick_skipped_intent_records_skipped_status(
@@ -568,13 +602,20 @@ async def test_tick_logs_held_rolls_without_executing(
 # ------------- Phase 5a: assignments + covered calls -------------
 
 
-def _call_contract(strike: float = 260, delta: float = 0.30) -> OptionContract:
+def _call_contract(
+    strike: float = 260,
+    delta: float = 0.30,
+    expiration: date | None = None,
+) -> OptionContract:
+    """AMZN call contract. Default expiry is today + 8 days for DTE-band match."""
+    expiry = expiration or (datetime.now(UTC).date() + timedelta(days=8))
+    occ = f"AMZN{expiry.strftime('%y%m%d')}C{int(strike * 1000):08d}"
     return OptionContract(
-        symbol=f"AMZN260505C{int(strike * 1000):08d}",
+        symbol=occ,
         underlying="AMZN",
         option_type="call",
         strike=Decimal(str(strike)),
-        expiration=date(2026, 5, 5),
+        expiration=expiry,
         bid=Decimal("1.10"),
         ask=Decimal("1.20"),
         last=None,
