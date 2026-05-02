@@ -86,9 +86,17 @@ async def test_grep_repo_rejects_empty_pattern() -> None:
 
 
 async def test_query_supabase_routes_to_readonly() -> None:
+    from kai_trader.db.readonly import ReadOnlyResult
+
+    fake = ReadOnlyResult(
+        rows=[{"id": 1, "value": Decimal("3.14")}],
+        available=1,
+        max_rows=200,
+        truncated=False,
+    )
     with patch(
         "kai_trader.chat.tools.run_readonly_select",
-        AsyncMock(return_value=[{"id": 1, "value": Decimal("3.14")}]),
+        AsyncMock(return_value=fake),
     ):
         out = await tools.dispatch(
             "query_supabase", {"sql": "select 1"}, proposed_by=42
@@ -96,6 +104,30 @@ async def test_query_supabase_routes_to_readonly() -> None:
     payload = json.loads(out)
     assert payload["row_count"] == 1
     assert payload["rows"][0]["value"] == "3.14"
+    assert payload["truncated"] is False
+    assert payload["max_rows"] == 200
+
+
+async def test_query_supabase_surfaces_truncation() -> None:
+    from kai_trader.db.readonly import ReadOnlyResult
+
+    fake = ReadOnlyResult(
+        rows=[{"id": i} for i in range(200)],
+        available=512,
+        max_rows=200,
+        truncated=True,
+    )
+    with patch(
+        "kai_trader.chat.tools.run_readonly_select",
+        AsyncMock(return_value=fake),
+    ):
+        out = await tools.dispatch(
+            "query_supabase", {"sql": "select id from x"}, proposed_by=42
+        )
+    payload = json.loads(out)
+    assert payload["truncated"] is True
+    assert payload["available"] == 512
+    assert payload["row_count"] == 200
 
 
 async def test_query_supabase_handles_query_error() -> None:
@@ -329,5 +361,159 @@ async def test_dispatch_unknown_tool_returns_error() -> None:
 
 def test_list_tool_names_in_declaration_order() -> None:
     names = tools.list_tool_names()
-    assert names[0] == "read_file"
+    assert names[0] == "system_pulse"
+    assert "read_file" in names
     assert "propose_change" in names
+
+
+# ----- _meta auto-stamp -----
+
+
+async def test_dispatch_stamps_meta_on_success(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    file_path = tmp_path / "x.txt"
+    file_path.write_text("hi")
+    monkeypatch.setattr(tools, "_REPO_ROOT", tmp_path)
+    out = await tools.dispatch("read_file", {"path": "x.txt"}, proposed_by=42)
+    payload = json.loads(out)
+    assert "_meta" in payload
+    assert "as_of_utc" in payload["_meta"]
+    assert "as_of_sgt" in payload["_meta"]
+    # SGT string must include the SGT/+08 marker so Kai can verify TZ.
+    assert "SGT" in payload["_meta"]["as_of_sgt"] or "+08" in payload["_meta"]["as_of_sgt"]
+
+
+async def test_dispatch_stamps_meta_on_error() -> None:
+    out = await tools.dispatch("nope", {}, proposed_by=42)
+    payload = json.loads(out)
+    assert "error" in payload
+    assert "_meta" in payload  # errors are still stamped
+
+
+# ----- system_pulse -----
+
+
+async def test_system_pulse_aggregates_live_state() -> None:
+    """Happy path: every section returns its block."""
+    from datetime import UTC, datetime
+    from decimal import Decimal as D
+
+    from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
+    from kai_trader.db.readonly import ReadOnlyResult
+
+    snap = AccountSnapshot(
+        equity=D("100000"),
+        last_equity=D("99000"),
+        cash=D("100000"),
+        buying_power=D("400000"),
+        portfolio_value=D("100000"),
+        day_pl=D("0"),
+        status="ACTIVE",
+        paper=True,
+    )
+    short_put = PositionSnapshot(
+        symbol="AMZN260506P00250000",
+        qty=D("-2"),
+        side="short",
+        avg_entry_price=D("4.50"),
+        current_price=D("4.60"),
+        market_value=D("-920"),
+        unrealized_pl=D("-20"),
+        unrealized_intraday_pl=D("-20"),
+    )
+
+    now = datetime.now(UTC)
+
+    async def fake_query(sql: str, *, max_rows: int = 200) -> ReadOnlyResult:
+        if "Strategy Tick" in sql:
+            return ReadOnlyResult(
+                rows=[{"created_at": now, "message": "Strategy Tick body"}],
+                available=1, max_rows=max_rows, truncated=False,
+            )
+        if "status = 'filled'" in sql:
+            return ReadOnlyResult(
+                rows=[{
+                    "created_at": now,
+                    "sleeve": "stable_large_cap",
+                    "symbol": "AMZN",
+                    "option_symbol": "AMZN260506P00250000",
+                    "action": "open_short_put",
+                    "error_text": None,
+                }],
+                available=1, max_rows=max_rows, truncated=False,
+            )
+        if "status = 'failed'" in sql:
+            return ReadOnlyResult(rows=[], available=0, max_rows=max_rows, truncated=False)
+        if "count(*)" in sql:
+            return ReadOnlyResult(
+                rows=[{"failures": 0, "distinct_contracts": 0}],
+                available=1, max_rows=max_rows, truncated=False,
+            )
+        return ReadOnlyResult(rows=[], available=0, max_rows=max_rows, truncated=False)
+
+    with patch(
+        "kai_trader.chat.tools.get_all_flags",
+        AsyncMock(return_value={"trading_enabled": True, "new_entries_enabled": True, "kill_switch": False}),
+    ), patch(
+        "kai_trader.chat.tools.get_account",
+        AsyncMock(return_value=snap),
+    ), patch(
+        "kai_trader.chat.tools.list_short_option_positions",
+        AsyncMock(return_value=[short_put]),
+    ), patch(
+        "kai_trader.chat.tools.run_readonly_select",
+        AsyncMock(side_effect=fake_query),
+    ):
+        out = await tools.dispatch("system_pulse", {}, proposed_by=42)
+    payload = json.loads(out)
+
+    assert payload["flags"]["kill_switch"] is False
+    assert payload["account"]["equity"] == "100000"
+    assert payload["shorts"]["open_short_puts"][0]["underlying"] == "AMZN"
+    # qty=2, strike=250 -> 50000 collateral, cap = 0.7 * 100000 = 70000
+    assert payload["shorts"]["cap"]["committed_usd"] == "50000"
+    assert payload["shorts"]["cap"]["total_cap_usd"] == "70000.00"
+    assert payload["latest_strategy_tick"]["present"] is True
+    assert payload["latest_strategy_tick"]["sent_at"]["age_seconds"] >= 0
+    assert payload["latest_filled_order"]["present"] is True
+    assert payload["latest_failed_order"]["present"] is False
+    assert payload["failure_window"]["failures"] == 0
+    assert "_meta" in payload
+
+
+async def test_system_pulse_isolates_failures() -> None:
+    """An Alpaca outage should not blank the DB sections."""
+    from kai_trader.db.readonly import ReadOnlyResult
+
+    async def fake_query(sql: str, *, max_rows: int = 200) -> ReadOnlyResult:
+        return ReadOnlyResult(rows=[], available=0, max_rows=max_rows, truncated=False)
+
+    with patch(
+        "kai_trader.chat.tools.get_all_flags",
+        AsyncMock(return_value={"trading_enabled": True, "new_entries_enabled": True, "kill_switch": False}),
+    ), patch(
+        "kai_trader.chat.tools.get_account",
+        AsyncMock(side_effect=RuntimeError("alpaca down")),
+    ), patch(
+        "kai_trader.chat.tools.list_short_option_positions",
+        AsyncMock(side_effect=RuntimeError("alpaca down")),
+    ), patch(
+        "kai_trader.chat.tools.run_readonly_select",
+        AsyncMock(side_effect=fake_query),
+    ):
+        out = await tools.dispatch("system_pulse", {}, proposed_by=42)
+    payload = json.loads(out)
+    # Live sections report errors, DB sections still answer.
+    assert "error" in payload["account"]
+    assert "error" in payload["shorts"]
+    assert payload["flags"]["kill_switch"] is False
+    assert payload["latest_strategy_tick"] == {"present": False}
+    assert payload["failure_window"]["failures"] == 0
+
+
+def test_format_age_buckets() -> None:
+    assert tools._format_age(45) == "45s ago"
+    assert tools._format_age(120) == "2m ago"
+    assert tools._format_age(3600) == "60m ago"
+    assert tools._format_age(72_000) == "20.0h ago"
+    assert tools._format_age(200_000) == "2.3d ago"
+    assert tools._format_age(-5) == "in the future"

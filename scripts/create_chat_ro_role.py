@@ -64,6 +64,12 @@ async def run() -> None:
             "alter default privileges in schema public "
             "grant select on tables to kai_chat_ro"
         )
+        # Several tables (notifications, system_flags, bot_commands, positions)
+        # ship with RLS enabled and no policies, which makes a SELECT grant
+        # silently return zero rows. BYPASSRLS lets the read-only role see
+        # the rows it was granted access to. The role still has SELECT only;
+        # bypassing RLS does not unlock writes.
+        await conn.execute("alter role kai_chat_ro bypassrls")
         log.info("chat_ro.bootstrapped", role="kai_chat_ro")
     finally:
         await conn.close()

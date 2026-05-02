@@ -13,6 +13,7 @@ so callers fail closed rather than silently fall back to the service role.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
@@ -30,6 +31,22 @@ class ReadOnlyConfigError(RuntimeError):
 
 class ReadOnlyQueryError(ValueError):
     """Raised when a query is rejected by the SQL safety check."""
+
+
+@dataclass(frozen=True)
+class ReadOnlyResult:
+    """Outcome of a read-only SELECT.
+
+    ``available`` is the row count returned by Postgres before the
+    ``max_rows`` cap was applied; ``truncated`` is true iff that count
+    exceeded ``max_rows``. The chat layer surfaces both so Kai never
+    silently treats a 200-row page as an exhaustive answer.
+    """
+
+    rows: list[dict[str, Any]]
+    available: int
+    max_rows: int
+    truncated: bool
 
 
 # A query is allowed when, after stripping leading SQL comments and
@@ -108,7 +125,7 @@ async def run_readonly_select(
     *,
     max_rows: int = 200,
     timeout_s: int = 10,
-) -> list[dict[str, Any]]:
+) -> ReadOnlyResult:
     """Run a single SELECT/WITH statement and return up to ``max_rows`` rows.
 
     Raises :class:`ReadOnlyQueryError` if the statement looks like anything
@@ -122,10 +139,17 @@ async def run_readonly_select(
             await conn.execute(f"set local statement_timeout = {timeout_s * 1000}")
             records = await conn.fetch(sql)
     rows = [dict(r) for r in records[:max_rows]]
-    if len(records) > max_rows:
+    available = len(records)
+    truncated = available > max_rows
+    if truncated:
         _log.info(
             "db.readonly.row_cap_hit",
             returned=len(rows),
-            available=len(records),
+            available=available,
         )
-    return rows
+    return ReadOnlyResult(
+        rows=rows,
+        available=available,
+        max_rows=max_rows,
+        truncated=truncated,
+    )

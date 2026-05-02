@@ -91,6 +91,35 @@ def _is_stale_connection(error_str: str) -> bool:
     return any(hint in error_str for hint in _STALE_CONNECTION_HINTS)
 
 
+# Map known Alpaca APIError codes (https://docs.alpaca.markets/docs/error-codes)
+# to short, queryable reason strings. Anything not listed here falls back to
+# the generic ``submit_exception`` so the unknown error still gets surfaced
+# with full text via ``SubmitResult.error``.
+_ALPACA_ERROR_CODE_REASONS: dict[int, str] = {
+    40310000: "insufficient_options_buying_power",
+    40310001: "insufficient_buying_power",
+    40010001: "invalid_order_request",
+    42210000: "wash_trade_blocked",
+}
+
+
+def _classify_submit_error(exc: BaseException) -> str:
+    """Return a typed reason string for a known APIError code, else generic.
+
+    Lets the orders table show a readable reason like
+    ``insufficient_options_buying_power`` instead of the catch-all
+    ``submit_exception`` for the common Alpaca rejections we have
+    observed. Unknown codes still fall through to ``submit_exception``
+    and the full ``str(exc)`` is preserved on ``SubmitResult.error``.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        mapped = _ALPACA_ERROR_CODE_REASONS.get(code)
+        if mapped is not None:
+            return mapped
+    return "submit_exception"
+
+
 async def _call_alpaca_with_retry(method_name: str, *args: Any, **kwargs: Any) -> Any:
     """Run a sync TradingClient method via to_thread, retry once on stale conn.
 
@@ -311,12 +340,18 @@ async def submit_short_put(
     try:
         order = await _call_alpaca_with_retry("submit_order", request)
     except Exception as exc:
-        _log.error("alpaca.submit.failed", option_symbol=option_symbol, error=str(exc))
+        reason = _classify_submit_error(exc)
+        _log.error(
+            "alpaca.submit.failed",
+            option_symbol=option_symbol,
+            reason=reason,
+            error=str(exc),
+        )
         return SubmitResult(
             submitted=False,
             alpaca_order_id=None,
             order_status=None,
-            reason="submit_exception",
+            reason=reason,
             flags=flags,
             error=str(exc),
         )
@@ -409,12 +444,18 @@ async def submit_short_call(
     try:
         order = await _call_alpaca_with_retry("submit_order", request)
     except Exception as exc:
-        _log.error("alpaca.submit_call.failed", option_symbol=option_symbol, error=str(exc))
+        reason = _classify_submit_error(exc)
+        _log.error(
+            "alpaca.submit_call.failed",
+            option_symbol=option_symbol,
+            reason=reason,
+            error=str(exc),
+        )
         return SubmitResult(
             submitted=False,
             alpaca_order_id=None,
             order_status=None,
-            reason="submit_exception",
+            reason=reason,
             flags=flags,
             error=str(exc),
         )
@@ -567,12 +608,18 @@ async def submit_buy_to_close(
     try:
         order = await _call_alpaca_with_retry("submit_order", request)
     except Exception as exc:
-        _log.error("alpaca.btc.failed", option_symbol=option_symbol, error=str(exc))
+        reason = _classify_submit_error(exc)
+        _log.error(
+            "alpaca.btc.failed",
+            option_symbol=option_symbol,
+            reason=reason,
+            error=str(exc),
+        )
         return SubmitResult(
             submitted=False,
             alpaca_order_id=None,
             order_status=None,
-            reason="submit_exception",
+            reason=reason,
             flags=flags,
             error=str(exc),
         )

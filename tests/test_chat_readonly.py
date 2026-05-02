@@ -80,8 +80,24 @@ async def test_run_readonly_select_caps_rows() -> None:
         "kai_trader.db.readonly.asyncpg.create_pool",
         AsyncMock(return_value=pool),
     ):
-        rows = await readonly.run_readonly_select("select id from foo", max_rows=3)
-    assert rows == [{"id": 0}, {"id": 1}, {"id": 2}]
+        result = await readonly.run_readonly_select("select id from foo", max_rows=3)
+    assert result.rows == [{"id": 0}, {"id": 1}, {"id": 2}]
+    assert result.available == 5
+    assert result.max_rows == 3
+    assert result.truncated is True
+
+
+async def test_run_readonly_select_truncated_false_when_under_cap() -> None:
+    pool = _fake_ro_pool()
+    pool._conn.fetch = AsyncMock(return_value=[{"id": 1}, {"id": 2}])
+    with patch(
+        "kai_trader.db.readonly.asyncpg.create_pool",
+        AsyncMock(return_value=pool),
+    ):
+        result = await readonly.run_readonly_select("select id from foo", max_rows=10)
+    assert result.rows == [{"id": 1}, {"id": 2}]
+    assert result.available == 2
+    assert result.truncated is False
 
 
 async def test_run_readonly_select_rejects_dml() -> None:

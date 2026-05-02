@@ -358,6 +358,54 @@ async def test_submit_short_put_handles_alpaca_exception(
     assert result.error == "alpaca down"
 
 
+async def test_submit_short_put_classifies_known_error_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An APIError carrying a known code should map to a typed reason."""
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    class _FakeAPIError(Exception):
+        def __init__(self, code: int, message: str) -> None:
+            super().__init__(message)
+            self.code = code
+
+    fake = MagicMock()
+    fake.submit_order.side_effect = _FakeAPIError(
+        40310000, "insufficient options buying power"
+    )
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={
+            "kill_switch": False, "trading_enabled": True,
+            "new_entries_enabled": True,
+        }),
+    )
+
+    result = await broker.submit_short_put(
+        option_symbol="AMZN260501P00250000",
+        qty=1,
+        limit_price=Decimal("4.55"),
+    )
+
+    assert result.submitted is False
+    assert result.reason == "insufficient_options_buying_power"
+    assert result.error == "insufficient options buying power"
+
+
+async def test_classify_submit_error_falls_back_to_generic() -> None:
+    """Unknown error codes (and exceptions without `code`) stay generic."""
+    class _FakeAPIError(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__("???")
+            self.code = code
+
+    assert broker._classify_submit_error(_FakeAPIError(99999999)) == "submit_exception"
+    assert broker._classify_submit_error(RuntimeError("boom")) == "submit_exception"
+
+
 async def test_close_position_refused_when_kill_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
