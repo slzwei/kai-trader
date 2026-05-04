@@ -41,8 +41,16 @@ _log = get_logger(__name__)
 
 _CACHE_TTL = timedelta(hours=24)
 _cache: dict[str, tuple[date | None, datetime]] = {}
+_quote_type_cache: dict[str, tuple[str | None, datetime]] = {}
 
 EarningsStatus = Literal["in_window", "outside_window", "unknown"]
+
+# Instrument types that never report earnings. yfinance returns these
+# strings in fast_info.quote_type. For any of them the earnings filter
+# must short-circuit to "outside_window"; treating "no upcoming row" as
+# "unknown" then fail-closing was silently freezing every ETF in the
+# whitelist.
+_NO_EARNINGS_TYPES = frozenset({"ETF", "INDEX", "MUTUALFUND", "CURRENCY"})
 
 
 def _now() -> datetime:
@@ -52,6 +60,7 @@ def _now() -> datetime:
 def reset_cache() -> None:
     """Drop every cached lookup. Tests use this between cases."""
     _cache.clear()
+    _quote_type_cache.clear()
 
 
 def _fetch_earnings_sync(symbol: str) -> date | None:
@@ -77,6 +86,50 @@ def _fetch_earnings_sync(symbol: str) -> date | None:
     if not upcoming:
         return None
     return min(upcoming)
+
+
+def _fetch_quote_type_sync(symbol: str) -> str | None:
+    """Synchronous yfinance fast_info lookup for the instrument's quote type.
+
+    Returns the upper-cased quote type string (e.g. "ETF", "EQUITY") or
+    ``None`` when yfinance does not provide one. Errors propagate so
+    ImportError continues to surface loudly per the W-1 contract.
+    """
+    ticker = yf.Ticker(symbol)
+    fast = ticker.fast_info
+    qt = fast.get("quoteType") if hasattr(fast, "get") else None
+    if qt is None:
+        return None
+    return str(qt).upper()
+
+
+async def _has_no_earnings_instrument(symbol: str) -> bool:
+    """True when ``symbol`` is an instrument type that never reports earnings.
+
+    ETFs, indexes, mutual funds, and currencies have no earnings calendar,
+    so the fail-closed posture must not treat them as "unknown" skips.
+    Conservative on lookup failure: returns False so the regular earnings
+    path runs and fail-closed still applies to genuine equities.
+    """
+    upper = symbol.upper()
+    cached = _quote_type_cache.get(upper)
+    if cached is not None:
+        qt, fetched_at = cached
+        if _now() - fetched_at < _CACHE_TTL:
+            return qt in _NO_EARNINGS_TYPES
+    try:
+        qt = await asyncio.to_thread(_fetch_quote_type_sync, upper)
+    except ImportError:
+        raise
+    except Exception as exc:
+        _log.warning(
+            "strategy.earnings.quote_type_failed",
+            symbol=upper,
+            error=str(exc),
+        )
+        qt = None
+    _quote_type_cache[upper] = (qt, _now())
+    return qt in _NO_EARNINGS_TYPES
 
 
 async def get_next_earnings_date(symbol: str) -> date | None:
@@ -131,7 +184,14 @@ async def get_earnings_status(
     window. That distinction matters during data-feed outages: a flood
     of "unknown" skips is a sign the filter is defending us, not a sign
     the strategy is broken.
+
+    ETFs and similar non-earnings instruments short-circuit to
+    "outside_window": they never report earnings, so treating an empty
+    yfinance lookup as "unknown" was a false positive that silently
+    blocked them under the fail-closed policy.
     """
+    if await _has_no_earnings_instrument(symbol):
+        return "outside_window"
     earnings = await get_next_earnings_date(symbol)
     if earnings is None:
         return "unknown"

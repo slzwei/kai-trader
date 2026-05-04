@@ -226,6 +226,93 @@ async def test_get_earnings_status_unknown_on_error(
     )
 
 
+async def test_etf_short_circuits_to_outside_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ETFs have no earnings; the filter must not treat the empty lookup as
+    'unknown' and silently skip them under fail-closed.
+
+    Without this short-circuit, every ETF in the whitelist (SPY, EEM, GDX,
+    SLV, XLF, XLE, etc.) was being filtered out on every tick, which is
+    exactly what surfaced once lxml landed and yfinance started returning
+    real data.
+    """
+    earnings_calls = 0
+
+    def _quote_type(symbol: str) -> str:
+        return "ETF"
+
+    def _earnings(symbol: str) -> date:
+        nonlocal earnings_calls
+        earnings_calls += 1
+        return date(2026, 5, 5)
+
+    monkeypatch.setattr(earnings, "_fetch_quote_type_sync", _quote_type)
+    monkeypatch.setattr(earnings, "_fetch_earnings_sync", _earnings)
+    status = await earnings.get_earnings_status(
+        "SPY", date(2026, 5, 4), dte_max=10
+    )
+    assert status == "outside_window"
+    assert earnings_calls == 0  # earnings lookup must be skipped entirely
+
+
+async def test_equity_does_not_short_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Equities must still go through the regular earnings path."""
+
+    def _quote_type(symbol: str) -> str:
+        return "EQUITY"
+
+    def _earnings(symbol: str) -> date:
+        return date(2026, 5, 8)
+
+    monkeypatch.setattr(earnings, "_fetch_quote_type_sync", _quote_type)
+    monkeypatch.setattr(earnings, "_fetch_earnings_sync", _earnings)
+    status = await earnings.get_earnings_status(
+        "INTC", date(2026, 5, 4), dte_max=10
+    )
+    assert status == "in_window"
+
+
+async def test_quote_type_failure_falls_through_to_earnings_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A yfinance hiccup on the quote-type call must not bypass fail-closed.
+
+    Conservative behaviour: if we can't confirm the symbol is an ETF, treat
+    it as a regular equity so the existing fail-closed path applies. This
+    means a transient outage cannot accidentally enable trading on a name
+    that would otherwise be skipped.
+    """
+
+    def _quote_type(symbol: str) -> str:
+        raise RuntimeError("yfinance hiccup")
+
+    def _earnings(symbol: str) -> None:
+        return None
+
+    monkeypatch.setattr(earnings, "_fetch_quote_type_sync", _quote_type)
+    monkeypatch.setattr(earnings, "_fetch_earnings_sync", _earnings)
+    status = await earnings.get_earnings_status(
+        "ZZZZ", date(2026, 5, 4), dte_max=10
+    )
+    assert status == "unknown"
+
+
+async def test_quote_type_lookup_propagates_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same contract as the earnings lookup: missing deps must fail loudly."""
+
+    def _quote_type(symbol: str) -> str:
+        raise ImportError("lxml")
+
+    monkeypatch.setattr(earnings, "_fetch_quote_type_sync", _quote_type)
+    with pytest.raises(ImportError):
+        await earnings._has_no_earnings_instrument("SPY")
+
+
 async def test_cache_ttl_expires(monkeypatch: pytest.MonkeyPatch) -> None:
     """After 24 hours the cache entry should refresh on the next lookup."""
     now = [datetime(2026, 4, 27, 0, 0, tzinfo=UTC)]
