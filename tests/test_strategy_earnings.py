@@ -47,6 +47,27 @@ async def test_get_next_earnings_caches_results(
     assert calls == 1
 
 
+async def test_get_next_earnings_propagates_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing transitive dep is a deploy bug, not a data-availability signal.
+
+    yfinance's earnings parser pulls in lxml at parse time. If lxml is not
+    installed, every call raises ImportError. Without an explicit re-raise,
+    that gets swallowed by the broad except below and every symbol becomes
+    "earnings unknown" under the fail-closed policy, silently freezing
+    new entries. We must surface ImportError so the operator sees the
+    real cause.
+    """
+
+    def _missing_dep(symbol: str) -> date:
+        raise ImportError("lxml")
+
+    monkeypatch.setattr(earnings, "_fetch_earnings_sync", _missing_dep)
+    with pytest.raises(ImportError):
+        await earnings.get_next_earnings_date("AMZN")
+
+
 async def test_get_next_earnings_returns_none_on_yfinance_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

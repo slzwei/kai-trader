@@ -17,6 +17,7 @@ dependencies = [
     "tzdata>=2024.1",
     "alpaca-py>=0.32,<1",
     "yfinance>=0.2.40,<1",
+    "lxml>=5.0,<7",
     "anthropic>=0.39,<1",
 ]
 

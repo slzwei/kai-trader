@@ -731,6 +731,11 @@ async def build_intents_with_diagnostics(
                     status = await earnings_status(
                         symbol, today, sleeve.target_dte_max
                     )
+                except ImportError:
+                    # Missing deploy dep (e.g. lxml) must not be hidden
+                    # as "unknown"; let it propagate so the tick fails
+                    # loudly rather than silently skipping every symbol.
+                    raise
                 except Exception as exc:
                     _log.warning(
                         "strategy.earnings_status.failed",

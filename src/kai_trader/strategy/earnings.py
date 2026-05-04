@@ -95,6 +95,12 @@ async def get_next_earnings_date(symbol: str) -> date | None:
             return d
     try:
         d = await asyncio.to_thread(_fetch_earnings_sync, upper)
+    except ImportError:
+        # A missing dependency (e.g. lxml, which yfinance needs to parse
+        # the earnings page) is a deploy bug, not a data-availability
+        # signal. Re-raise so it surfaces loudly instead of silently
+        # fail-closing every symbol on every tick.
+        raise
     except Exception as exc:
         _log.warning(
             "strategy.earnings.fetch_failed",
