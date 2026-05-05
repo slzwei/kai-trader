@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, claude/kai-trader-phase-1-sHFJk]
+  push:
+    branches: [main, claude/kai-trader-phase-1-sHFJk]
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --extra dev --frozen
+
+      - name: Ruff
+        run: uv run ruff check src/ tests/
+
+      - name: mypy --strict
+        run: uv run mypy --strict src/
+
+      - name: pytest
+        run: uv run pytest -q
+
+  schema-integration:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: kai
+          POSTGRES_PASSWORD: kai
+          POSTGRES_DB: kai_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kai -d kai_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # Point the bot's get_pool at the local Postgres service.
+      DATABASE_URL: postgresql://kai:kai@localhost:5432/kai_test
+      DATABASE_URL_RO: postgresql://kai:kai@localhost:5432/kai_test
+      # Stub credentials so config.Settings imports cleanly. None of these
+      # talk to the real services in this job.
+      TELEGRAM_BOT_TOKEN: 1234:test
+      TELEGRAM_OWNER_ID: "0"
+      SUPABASE_URL: https://ci.supabase.co
+      SUPABASE_KEY: ci-stub-key
+      SUPABASE_DB_PASSWORD: ci-stub-password
+      ALPACA_API_KEY: PKCITESTKEYAAAAAAAAAA
+      ALPACA_SECRET_KEY: ci-stub-secret
+      ALPACA_PAPER: "true"
+      ANTHROPIC_API_KEY: ci-stub-anthropic
+      KAI_SCHEMA_INTEGRATION_TEST: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --extra dev --frozen
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            pg_isready -h localhost -p 5432 -U kai -d kai_test && break
+            sleep 1
+          done
+
+      - name: Apply migrations
+        run: uv run python scripts/apply_migrations.py
+
+      - name: Run schema integration tests
+        run: uv run pytest tests/test_schema_integration.py -v
