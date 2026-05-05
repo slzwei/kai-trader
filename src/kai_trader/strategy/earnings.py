@@ -66,23 +66,28 @@ def reset_cache() -> None:
 def _fetch_earnings_sync(symbol: str) -> date | None:
     """Synchronous yfinance lookup. Caller wraps in asyncio.to_thread.
 
-    Returns the next earnings date strictly after today, or None when
-    yfinance has no upcoming row. Errors propagate to the caller, which
-    is responsible for logging and the fail-closed default.
+    Uses ``Ticker.calendar`` (JSON quote-summary endpoint) rather than
+    ``get_earnings_dates`` (HTML reader-mode scrape). The calendar path
+    retains ~0.7 MB per symbol in curl_cffi response state vs ~9.4 MB
+    per symbol for the earnings-dates path. With 30+ whitelist symbols
+    that difference is the literal Render OOM gap.
+
+    Returns the next earnings date >= today, or None when yfinance has
+    no upcoming row. Errors propagate to the caller, which is
+    responsible for logging and the fail-closed default.
     """
     ticker = yf.Ticker(symbol)
-    df = ticker.get_earnings_dates(limit=4)
-    if df is None or len(df) == 0:
+    cal = ticker.calendar
+    if not cal or not isinstance(cal, dict):
+        return None
+    raw = cal.get("Earnings Date")
+    if not raw:
         return None
     today = _now().date()
     upcoming: list[date] = []
-    for idx in df.index:
-        try:
-            d = idx.date()
-        except AttributeError:
-            continue
-        if d >= today:
-            upcoming.append(d)
+    for entry in raw:
+        if isinstance(entry, date) and entry >= today:
+            upcoming.append(entry)
     if not upcoming:
         return None
     return min(upcoming)
