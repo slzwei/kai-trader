@@ -58,6 +58,7 @@ from kai_trader.db.sleeve_config import SleeveConfig, get_all_sleeves
 from kai_trader.db.system_flags import get_all_flags
 from kai_trader.logging import get_logger
 from kai_trader.notifications.producer import enqueue
+from kai_trader.observability.heartbeat import ping_heartbeat
 from kai_trader.strategy.assignment import detect_assignments, record_assignment
 from kai_trader.strategy.candidates import (
     COOLDOWN_MINUTES,
@@ -177,6 +178,11 @@ class StrategyWorker:
                 raise
             except Exception as exc:
                 _log.error("strategy.worker.tick_error", error=str(exc))
+            else:
+                # Out-of-band liveness ping. Only fires after a successful
+                # tick body, so a hang or tick error translates directly to
+                # a missed ping at the heartbeat target.
+                await ping_heartbeat()
             await self._wait_or_stop(self._poll_interval)
 
     async def _wait_or_stop(self, seconds: float) -> None:

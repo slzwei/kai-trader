@@ -85,6 +85,15 @@ class Settings(BaseSettings):
             "tool calls fail closed."
         ),
     )
+    heartbeat_url: SecretStr | None = Field(
+        default=None,
+        alias="HEARTBEAT_URL",
+        description=(
+            "Optional out-of-band liveness URL pinged after every successful "
+            "strategy tick. Use a service like healthchecks.io that emails "
+            "when pings stop. When unset, the heartbeat is a no-op."
+        ),
+    )
 
     env: Environment = Field(default="dev", alias="ENV")
     log_level: LogLevel = Field(default="INFO", alias="LOG_LEVEL")

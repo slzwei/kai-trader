@@ -166,6 +166,7 @@ kai-trader/
 | CHAT_MODEL            | no       | Override the chat model. Default `claude-sonnet-4-6`. |
 | DATABASE_URL_RO       | for chat | Read-only DSN for the chat tool layer. Authenticate as `kai_chat_ro`. Without it, `query_supabase` fails closed. |
 | KAI_CHAT_RO_PASSWORD  | bootstrap | Used by `scripts/create_chat_ro_role.py` to create or rotate the `kai_chat_ro` role. Not read at runtime by the bot. |
+| HEARTBEAT_URL         | no       | Out-of-band liveness URL pinged after every successful strategy tick (e.g. healthchecks.io). When unset, the heartbeat is a no-op. |
 
 ## Conventions
 
