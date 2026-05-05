@@ -83,7 +83,7 @@ async def test_help_lists_every_command(
         "/positions", "/flags", "/flag", "/kill", "/notify_test",
         "/quote", "/snapshot_now", "/history", "/chain",
         "/sleeves", "/regime", "/strategy_status",
-        "/trade_now", "/recent_trades", "/close", "/close_confirm",
+        "/trade_now", "/recent_trades", "/income", "/close", "/close_confirm",
     )
     for cmd in expected:
         assert cmd in text
