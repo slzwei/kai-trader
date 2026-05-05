@@ -20,7 +20,7 @@ from typing import Any
 
 from alpaca.data.enums import OptionsFeed
 from alpaca.data.historical import OptionHistoricalDataClient
-from alpaca.data.requests import OptionChainRequest
+from alpaca.data.requests import OptionChainRequest, OptionLatestQuoteRequest
 
 from kai_trader.config import Settings, get_settings
 from kai_trader.logging import get_logger
@@ -161,3 +161,45 @@ async def get_chain(
             _log.warning("options_data.parse_failed", symbol=symbol, error=str(exc))
     contracts.sort(key=lambda c: (c.expiration, c.strike, c.option_type))
     return contracts
+
+
+@dataclass(frozen=True)
+class OptionQuote:
+    """Latest bid/ask for a single OCC contract."""
+
+    symbol: str
+    bid: Decimal | None
+    ask: Decimal | None
+
+
+async def get_option_quotes(symbols: list[str]) -> dict[str, OptionQuote]:
+    """Fetch the latest quote for each OCC symbol in a single request.
+
+    Used by /income to compute mark-to-market on open short puts: the
+    buy-to-close cost is roughly ``ask * qty * 100``. Missing symbols
+    are simply omitted from the returned dict; callers should fall back
+    to "unknown" rather than treating absence as a quote of zero.
+    """
+    if not symbols:
+        return {}
+    client = _get_client()
+    request = OptionLatestQuoteRequest(
+        symbol_or_symbols=symbols,
+        feed=OptionsFeed.OPRA,
+    )
+    result = await asyncio.to_thread(client.get_option_latest_quote, request)
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            "Alpaca client returned non-dict quote payload; raw_data mode unsupported."
+        )
+    out: dict[str, OptionQuote] = {}
+    for symbol, quote in result.items():
+        try:
+            out[str(symbol)] = OptionQuote(
+                symbol=str(symbol),
+                bid=Decimal(str(getattr(quote, "bid_price", None) or 0)) or None,
+                ask=Decimal(str(getattr(quote, "ask_price", None) or 0)) or None,
+            )
+        except (TypeError, ValueError) as exc:
+            _log.warning("options_data.quote_parse_failed", symbol=symbol, error=str(exc))
+    return out

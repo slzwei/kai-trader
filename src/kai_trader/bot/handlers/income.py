@@ -47,7 +47,7 @@ from kai_trader.broker.alpaca import (
     get_fill_activities,
     list_short_option_positions,
 )
-from kai_trader.broker.options_data import parse_occ_symbol
+from kai_trader.broker.options_data import get_option_quotes, parse_occ_symbol
 from kai_trader.config import get_settings
 
 
@@ -161,15 +161,15 @@ async def _build(_update: Update, ctx: CommandContext) -> str:
         f"  All-time: {_format_money(all_pnl):<10} ({len(closed_trips)} round-trip{'' if len(closed_trips) == 1 else 's'})",
     ]
 
-    open_lines, open_credit_total = await _format_open_exposure(
+    open_lines, _open_credit_total, open_unrealized = await _format_open_exposure(
         open_fills_by_symbol, today=now.date()
     )
 
     summary_lines = [
         "Total cash captured (all-time):",
-        f"  Realized round-trips:  {_format_money(all_pnl)}",
-        f"  Open puts' credits:    {_format_money(open_credit_total)}",
-        f"  Sum:                   {_format_money(all_pnl + open_credit_total)}",
+        f"  Realized round-trips:        {_format_money(all_pnl)}",
+        f"  Unrealized on open puts:     {_format_money(open_unrealized)}",
+        f"  Net P&L if closed now:       {_format_money(all_pnl + open_unrealized)}",
     ]
 
     annualised_lines = _format_annualised(week_pnl, fills, now)
@@ -191,19 +191,34 @@ async def _build(_update: Update, ctx: CommandContext) -> str:
 async def _format_open_exposure(
     open_fills_by_symbol: dict[str, list[FillActivity]],
     today: date,
-) -> tuple[list[str], Decimal]:
-    """Render the open-positions block. Returns (lines, total_credit)."""
+) -> tuple[list[str], Decimal, Decimal]:
+    """Render the open-positions block.
+
+    Returns ``(lines, total_credit, total_unrealized_pnl)``.
+    Mark-to-market uses each contract's current ask: the buy-to-close
+    cost is ``ask * qty * 100``, and unrealized P&L is the credit
+    captured so far minus that close cost. If a quote is missing the
+    line falls back to credit-only and the total skips that position.
+    """
     try:
         positions = await list_short_option_positions()
     except Exception:
-        return ["Open exposure: (broker fetch failed; see logs)"], Decimal("0")
+        return ["Open exposure: (broker fetch failed; see logs)"], Decimal("0"), Decimal("0")
 
     if not positions:
-        return ["Open exposure: (no open shorts)"], Decimal("0")
+        return ["Open exposure: (no open shorts)"], Decimal("0"), Decimal("0")
+
+    open_symbols = [p.symbol for p in positions]
+    try:
+        quotes = await get_option_quotes(open_symbols)
+    except Exception:
+        quotes = {}
 
     lines = ["Open exposure:"]
     total_credit = Decimal("0")
+    total_unrealized = Decimal("0")
     total_collateral = Decimal("0")
+    quotes_complete = True
     for p in positions:
         try:
             underlying, expiration, _opt, strike = parse_occ_symbol(p.symbol)
@@ -217,15 +232,33 @@ async def _format_open_exposure(
         collateral = strike * Decimal("100") * Decimal(qty)
         total_credit += credit
         total_collateral += collateral
+
+        quote = quotes.get(p.symbol)
+        ask = quote.ask if quote is not None else None
+        if ask is not None:
+            close_cost = ask * Decimal(qty) * Decimal("100")
+            unrealized = credit - close_cost
+            total_unrealized += unrealized
+            mtm_str = (
+                f"close ~${ask}  unrealized {_format_money(unrealized)}"
+            )
+        else:
+            quotes_complete = False
+            mtm_str = "no quote"
+
         underlying_label = underlying[:6]
         lines.append(
             f"  {underlying_label:<6} P{strike} x{qty}  "
-            f"credit {_format_money(credit)}  expires {dte}d"
+            f"cred {_format_money(credit)}  {mtm_str}  {dte}d"
         )
-    lines.append("  " + "-" * 38)
+    lines.append("  " + "-" * 50)
     lines.append(f"  Max if all expire worthless: {_format_money(total_credit)}")
+    if quotes_complete:
+        lines.append(f"  Unrealized P&L right now:    {_format_money(total_unrealized)}")
+    else:
+        lines.append("  Unrealized P&L right now:    (some quotes missing)")
     lines.append(f"  Total collateral committed:  ${total_collateral:,.0f}")
-    return lines, total_credit
+    return lines, total_credit, total_unrealized
 
 
 def _format_annualised(
