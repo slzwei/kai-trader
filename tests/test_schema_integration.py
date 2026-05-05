@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -128,7 +129,11 @@ async def test_orders_full_lifecycle_round_trip(
         )
         assert isinstance(order_id, str) and len(order_id) > 0
 
-        await mark_submitted(order_id, alpaca_order_id="ci-smoke-alpaca-id")
+        await mark_submitted(
+            order_id,
+            alpaca_order_id="ci-smoke-alpaca-id",
+            submitted_at=datetime.now(UTC),
+        )
         await mark_actual_delta(order_id, Decimal("-0.31"))
         await mark_status(order_id, "filled", filled_avg_price=Decimal("0.42"))
 

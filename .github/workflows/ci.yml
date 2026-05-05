@@ -92,4 +92,8 @@ jobs:
         run: uv run python scripts/apply_migrations.py
 
       - name: Run schema integration tests
-        run: uv run pytest tests/test_schema_integration.py -v
+        # --no-cov: this job exercises a small DB slice; the unit job
+        # is the one that enforces coverage. Without --no-cov pytest's
+        # 80% gate fails on pure CI smoke that legitimately doesn't
+        # touch most of the codebase.
+        run: uv run pytest tests/test_schema_integration.py -v --no-cov
