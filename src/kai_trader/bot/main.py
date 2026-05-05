@@ -9,10 +9,12 @@ from __future__ import annotations
 import asyncio
 
 from telegram.constants import ParseMode
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     Defaults,
     MessageHandler,
     filters,
@@ -46,6 +48,7 @@ from kai_trader.config import Settings, get_settings
 from kai_trader.db.client import close_pool, get_pool
 from kai_trader.db.pending_close import cleanup_expired as pending_close_cleanup_expired
 from kai_trader.db.readonly import close_readonly_pool
+from kai_trader.db.schema_check import assert_schema_up_to_date
 from kai_trader.events.dispatcher import EventDispatcher, build_owner_send
 from kai_trader.logging import configure_logging, get_logger
 from kai_trader.notifications.worker import NotificationWorker
@@ -61,6 +64,26 @@ _strategy_worker: StrategyWorker | None = None
 _event_dispatcher: EventDispatcher | None = None
 _trading_stream: TradingStreamWorker | None = None
 _memory_profile_worker: MemoryProfileWorker | None = None
+
+
+async def _telegram_error_handler(
+    update: object, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Quiet the deploy-crossover Conflict noise; log everything else.
+
+    During a Render deploy crossover the new container starts polling
+    Telegram before the old one has been killed. The losing side gets a
+    409 Conflict on every getUpdates until Render reaps the old pod.
+    Without this handler PTB dumps the full traceback on every failed
+    poll, which buries real errors in the logs. The retry logic inside
+    PTB still runs; we just downgrade the noise.
+    """
+    err = context.error
+    log = get_logger("bot.main")
+    if isinstance(err, Conflict):
+        log.warning("telegram.poll.conflict", error=str(err))
+        return
+    log.exception("telegram.unhandled_error", exc_info=err)
 
 
 def build_application(settings: Settings) -> Application:  # type: ignore[type-arg]
@@ -108,6 +131,8 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CallbackQueryHandler(approval.handle, pattern=r"^pc:"))
     app.add_handler(CallbackQueryHandler(close.handle_callback, pattern=r"^cls:"))
 
+    app.add_error_handler(_telegram_error_handler)
+
     return app
 
 
@@ -122,7 +147,12 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     # cheap (one structured log line every hour).
     start_tracemalloc()
 
-    await get_pool()
+    pool = await get_pool()
+
+    # Refuse to start the workers if the live DB is missing any
+    # migration. Running with stale schema looks healthy but every tick
+    # SQL-errors silently; a real-money bot must fail loud.
+    await assert_schema_up_to_date(pool)
 
     settings = get_settings()
     owner_id = settings.telegram_owner_id
