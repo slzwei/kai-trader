@@ -12,7 +12,11 @@ thread via ``asyncio.to_thread`` so the bot's event loop stays responsive.
 from __future__ import annotations
 
 import asyncio
+import json
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -662,4 +666,132 @@ async def get_order_status(alpaca_order_id: str) -> OrderStatusSnapshot:
         submitted_at=order.submitted_at,
         cancelled_at=order.canceled_at,
         failed_at=order.failed_at,
+    )
+
+
+@dataclass(frozen=True)
+class FillActivity:
+    """A single trade-execution event from Alpaca's account activities feed.
+
+    Captures every fill the account ever sees, including manual trades the
+    operator placed via the Alpaca dashboard (which the bot's orders table
+    does not record). The truth source for realized cash flow.
+    """
+
+    transaction_time: datetime
+    symbol: str
+    side: str  # "buy" | "sell" | "buy_to_close" | "sell_short" etc.
+    qty: Decimal
+    price: Decimal
+    order_id: str | None
+    activity_id: str
+
+    @property
+    def is_option(self) -> bool:
+        """Heuristic: OCC option symbols are 15-21 chars with the date+P/C+strike pattern."""
+        s = self.symbol
+        return len(s) >= 15 and any(c in s for c in ("C", "P"))
+
+    @property
+    def signed_cash(self) -> Decimal:
+        """Signed dollars: + if cash arrived (sell), - if cash left (buy).
+
+        Options use the 100-share multiplier. Equities use 1.
+        """
+        multiplier = Decimal("100") if self.is_option else Decimal("1")
+        notional = self.price * self.qty * multiplier
+        # Alpaca uses several side strings. "sell" / "sell_short" => credit;
+        # anything else (buy, buy_to_cover, etc.) => debit.
+        if self.side.startswith("sell"):
+            return notional
+        return -notional
+
+
+def _alpaca_base_url(settings: Settings) -> str:
+    return (
+        "https://paper-api.alpaca.markets"
+        if settings.alpaca_paper
+        else "https://api.alpaca.markets"
+    )
+
+
+def _activities_request_sync(
+    base_url: str,
+    headers: dict[str, str],
+    params: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Synchronous GET against Alpaca's account/activities endpoint.
+
+    Caller wraps in asyncio.to_thread. Returns the parsed JSON list.
+    Pagination uses page_token; we fetch until the response is empty or
+    short. Activities API caps at 100 per page.
+    """
+    out: list[dict[str, Any]] = []
+    page_token: str | None = None
+    while True:
+        merged = dict(params)
+        if page_token:
+            merged["page_token"] = page_token
+        url = f"{base_url}/v2/account/activities/FILL?{urllib.parse.urlencode(merged)}"
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, list) or not data:
+            break
+        out.extend(data)
+        if len(data) < 100:
+            break
+        # Activities API returns newest first; the page_token is the id of
+        # the last (oldest) activity returned.
+        page_token = str(data[-1].get("id", ""))
+        if not page_token:
+            break
+    return out
+
+
+async def get_fill_activities(
+    *, after: datetime | None = None
+) -> list[FillActivity]:
+    """Return every FILL-type activity from the trading account.
+
+    Optionally bounded by ``after`` (inclusive). When unset, returns the
+    full history Alpaca retains (typically the lifetime of the account).
+    Each activity is a single fill, so a partially-filled order surfaces
+    as multiple activities.
+    """
+    settings = get_settings()
+    headers = {
+        "APCA-API-KEY-ID": settings.alpaca_api_key.get_secret_value(),
+        "APCA-API-SECRET-KEY": settings.alpaca_secret_key.get_secret_value(),
+        "Accept": "application/json",
+    }
+    params: dict[str, str] = {"page_size": "100"}
+    if after is not None:
+        params["after"] = after.isoformat()
+    raw = await asyncio.to_thread(
+        _activities_request_sync,
+        _alpaca_base_url(settings),
+        headers,
+        params,
+    )
+    out: list[FillActivity] = []
+    for r in raw:
+        try:
+            out.append(_parse_fill_activity(r))
+        except (KeyError, ValueError) as exc:
+            _log.warning("alpaca.activities.parse_failed", error=str(exc), raw=r)
+    return out
+
+
+def _parse_fill_activity(row: dict[str, Any]) -> FillActivity:
+    return FillActivity(
+        transaction_time=datetime.fromisoformat(
+            str(row["transaction_time"]).replace("Z", "+00:00")
+        ),
+        symbol=str(row["symbol"]),
+        side=str(row["side"]),
+        qty=Decimal(str(row["qty"])),
+        price=Decimal(str(row["price"])),
+        order_id=str(row["order_id"]) if row.get("order_id") else None,
+        activity_id=str(row["id"]),
     )
