@@ -42,15 +42,26 @@ async def apply_pending(pending: pending_changes_db.PendingChange) -> dict[str, 
 
 
 async def _apply_order(pending: pending_changes_db.PendingChange) -> dict[str, Any]:
-    outputs = {"stub": True, "note": "Order placement wires in a later phase."}
-    await record_decision(
-        kind="order",
-        inputs=pending.payload,
-        outputs=outputs,
-        reason=pending.reason,
+    """Refuse to apply an ``order`` proposal.
+
+    The chat layer (chat/tools._propose_change) rejects ``kind='order'``
+    at the entry point. This refusal is defence-in-depth for any
+    historical ``order`` row that sits in ``pending_changes`` from
+    before that gate landed. Approving one would otherwise update
+    ``decision_log`` and ``pending_changes.applied`` without ever
+    reaching the broker, leaving an audit trail that says "applied"
+    for an order that never went out. Failing loudly forces the
+    operator to use ``/trade_now``, ``/close``, or ``/flag`` instead.
+    """
+    _log.error(
+        "approvals.order.refused",
+        pending_id=pending.id,
+        payload=pending.payload,
     )
-    _log.info("approvals.order.stubbed", pending_id=pending.id)
-    return outputs
+    raise NotImplementedError(
+        "order proposals cannot be applied from chat: the broker path is "
+        "not wired through approvals. Use /trade_now, /close, or /flag."
+    )
 
 
 async def _apply_strategy_param(pending: pending_changes_db.PendingChange) -> dict[str, Any]:

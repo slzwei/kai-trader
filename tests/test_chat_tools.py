@@ -320,11 +320,29 @@ async def test_propose_change_rejects_bad_kind() -> None:
 async def test_propose_change_rejects_empty_reason() -> None:
     out = await tools.dispatch(
         "propose_change",
-        {"kind": "order", "payload": {}, "reason": ""},
+        {"kind": "strategy_param", "payload": {}, "reason": ""},
         proposed_by=42,
     )
     payload = json.loads(out)
     assert "reason" in payload["error"]
+
+
+async def test_propose_change_rejects_order_kind() -> None:
+    """B3: order proposals are rejected because the apply path is a stub.
+
+    The chat tool layer fails at the entry point so the operator never
+    sees an Approve button for a trade that can't actually go out.
+    """
+    out = await tools.dispatch(
+        "propose_change",
+        {"kind": "order", "payload": {"symbol": "SPY"}, "reason": "test"},
+        proposed_by=42,
+    )
+    payload = json.loads(out)
+    assert "order proposals are not accepted" in payload["error"]
+    # The operator-facing error must point at the slash commands so the
+    # next move is obvious.
+    assert "/trade_now" in payload["error"]
 
 
 async def test_propose_change_records_pending_and_event() -> None:
@@ -338,8 +356,8 @@ async def test_propose_change_records_pending_and_event() -> None:
         out = await tools.dispatch(
             "propose_change",
             {
-                "kind": "order",
-                "payload": {"symbol": "SPY"},
+                "kind": "strategy_param",
+                "payload": {"sleeve": "index_core", "field": "target_pct", "new_value": "0.5"},
                 "reason": "test",
             },
             proposed_by=42,
