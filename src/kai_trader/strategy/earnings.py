@@ -52,6 +52,26 @@ EarningsStatus = Literal["in_window", "outside_window", "unknown"]
 # whitelist.
 _NO_EARNINGS_TYPES = frozenset({"ETF", "INDEX", "MUTUALFUND", "CURRENCY"})
 
+# B5: hard-coded allowlist of symbols that never have earnings. The
+# fast_info.quote_type lookup is the primary detection, but a regional
+# yfinance hiccup can produce a transient None for a known ETF; under
+# the fail-closed earnings policy that briefly blacklists the symbol
+# until the 24-hour cache expires. This allowlist short-circuits the
+# yfinance call entirely for the names we already know are ETFs / not
+# corporate equities, so a yfinance outage cannot blackout these
+# symbols. Add new ETFs here as they enter any sleeve whitelist.
+_HARD_CODED_NON_EARNINGS_SYMBOLS = frozenset({
+    # Broad-market index ETFs.
+    "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "IVV",
+    # Sector / theme ETFs in the current pool.
+    "GDX", "SLV", "GLD", "XLF", "XLE", "XLK", "XLU", "XLV",
+    "XLI", "XLP", "XLY", "XLB", "XLRE", "XLC",
+    # Region / EM ETFs in the current pool.
+    "EEM", "EFA", "VWO", "FXI",
+    # Volatility / fixed income.
+    "VIXY", "TLT", "HYG", "LQD",
+})
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -115,8 +135,14 @@ async def _has_no_earnings_instrument(symbol: str) -> bool:
     so the fail-closed posture must not treat them as "unknown" skips.
     Conservative on lookup failure: returns False so the regular earnings
     path runs and fail-closed still applies to genuine equities.
+
+    B5: a hard-coded allowlist short-circuits the yfinance lookup so a
+    regional yfinance outage cannot blackout known ETFs for the duration
+    of the 24-hour quote-type cache.
     """
     upper = symbol.upper()
+    if upper in _HARD_CODED_NON_EARNINGS_SYMBOLS:
+        return True
     cached = _quote_type_cache.get(upper)
     if cached is not None:
         qt, fetched_at = cached

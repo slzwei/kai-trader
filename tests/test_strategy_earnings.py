@@ -303,14 +303,54 @@ async def test_quote_type_failure_falls_through_to_earnings_path(
 async def test_quote_type_lookup_propagates_import_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same contract as the earnings lookup: missing deps must fail loudly."""
+    """Same contract as the earnings lookup: missing deps must fail loudly.
+
+    B5 added a hard-coded ETF allowlist that short-circuits before
+    yfinance is called, so this test uses a symbol that is NOT on
+    the allowlist (an unknown ticker) to exercise the yfinance path.
+    """
 
     def _quote_type(symbol: str) -> str:
         raise ImportError("lxml")
 
     monkeypatch.setattr(earnings, "_fetch_quote_type_sync", _quote_type)
     with pytest.raises(ImportError):
-        await earnings._has_no_earnings_instrument("SPY")
+        await earnings._has_no_earnings_instrument("ZZZZ_NOT_ALLOWLISTED")
+
+
+async def test_hard_coded_allowlist_short_circuits_yfinance() -> None:
+    """B5: known ETFs bypass the yfinance lookup entirely.
+
+    The test does not patch any yfinance helper. If the allowlist
+    short-circuit is removed, the call falls through to the real
+    yfinance code in this test process, which would either raise or
+    block on the network.
+    """
+    earnings.reset_cache()
+    for symbol in ("SPY", "QQQ", "GDX", "SLV", "XLF", "XLE", "EEM"):
+        assert await earnings._has_no_earnings_instrument(symbol) is True
+
+
+async def test_hard_coded_allowlist_routes_status_to_outside_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B5: an ETF on the allowlist always classifies as 'outside_window'.
+
+    Even when both yfinance helpers raise, the allowlist short-circuit
+    delivers ``outside_window`` so the symbol is tradable.
+    """
+    earnings.reset_cache()
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("yfinance unreachable")
+
+    monkeypatch.setattr(earnings, "_fetch_quote_type_sync", _boom)
+    monkeypatch.setattr(earnings, "_fetch_earnings_sync", _boom)
+
+    status = await earnings.get_earnings_status(
+        "SPY", date(2026, 5, 4), dte_max=10
+    )
+    assert status == "outside_window"
 
 
 async def test_cache_ttl_expires(monkeypatch: pytest.MonkeyPatch) -> None:
