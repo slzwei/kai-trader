@@ -112,6 +112,41 @@ class _FakeLog:
         self.warnings.append((event, kwargs))
 
 
+def test_discover_rejects_duplicate_number_prefixes(tmp_path: Path) -> None:
+    """B8: two migration files sharing a number prefix must fail loudly.
+
+    The lex-sort apply order would silently run both, but the operator
+    later asking 'what is migration 020' has two answers. Renaming
+    before merge is the only safe fix.
+    """
+    script = _load_script()
+    (tmp_path / "001_a.sql").write_text("-- a")
+    (tmp_path / "001_b.sql").write_text("-- b")
+
+    original_dir = script.MIGRATIONS_DIR
+    script.MIGRATIONS_DIR = tmp_path
+    try:
+        with pytest.raises(RuntimeError, match="Duplicate migration number"):
+            script._discover_migrations()
+    finally:
+        script.MIGRATIONS_DIR = original_dir
+
+
+def test_discover_allows_skipped_numbers(tmp_path: Path) -> None:
+    """Gaps (e.g. 018 -> 020 with no 019) are fine; only duplicates are not."""
+    script = _load_script()
+    (tmp_path / "001_a.sql").write_text("-- a")
+    (tmp_path / "003_c.sql").write_text("-- c")
+
+    original_dir = script.MIGRATIONS_DIR
+    script.MIGRATIONS_DIR = tmp_path
+    try:
+        files = script._discover_migrations()
+    finally:
+        script.MIGRATIONS_DIR = original_dir
+    assert [p.name for p in files] == ["001_a.sql", "003_c.sql"]
+
+
 @pytest.mark.parametrize(
     "filename",
     ["001_system_flags.sql", "002_bot_commands.sql", "003_notifications.sql", "004_positions.sql"],
