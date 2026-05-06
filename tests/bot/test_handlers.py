@@ -376,14 +376,14 @@ async def test_positions_renders_each_holding(
 
     text = _last_reply(update)
     assert "AAPL" in text
-    assert "100" in text
-    assert "long" in text
-    assert "avg USD 150.00" in text
-    assert "mark USD 152.50" in text
+    assert "x100" in text
+    assert "shares" in text
+    assert "entry 150.00" in text
+    assert "mark 152.50" in text
     assert "pl +USD 250.00" in text
     # Missing price fields render as 'n/a' rather than crashing.
     assert "MSFT" in text
-    assert "mark n/a" in text
+    assert "mark   n/a" in text  # right-aligned
     assert "pl n/a" in text
 
 
@@ -1107,7 +1107,7 @@ async def test_strategy_status_renders_dryrun(
     assert "Market" in text and "open" in text
     assert "risk_on" in text
     assert "Kill switch" in text and "off" in text
-    assert "Dry-run preview" in text
+    assert "Dry-run only" in text
     assert "No candidate trades" in text
 
 
@@ -1232,11 +1232,13 @@ async def test_recent_trades_renders_orders(
 
     text = _last_reply(update)
     assert "Recent Trades" in text
-    assert "index_core/SPY" in text
+    assert "SPY" in text
+    assert "sold put" in text  # action label, layman form
+    assert "$500 put" in text  # parsed OCC contract
     assert "filled" in text
     assert "fill 1.25" in text
     assert "alpaca-u" in text
-    assert "skipped_by_flag" in text
+    assert "blocked" in text  # status label for skipped_by_flag
 
 
 async def test_recent_trades_empty_state(

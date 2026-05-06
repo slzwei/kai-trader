@@ -1,4 +1,10 @@
-"""/strategy_status handler: on-demand intent-list display."""
+"""/strategy_status handler: on-demand intent-list preview.
+
+This is a dry-run view of what the strategy would submit if it ticked
+right now. The visual style mirrors the periodic tick notification:
+section-bold headings, an Account block, and Notes for any diagnostic
+warnings. The Preview section replaces the tick's "This tick" body.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +16,7 @@ from telegram.ext import ContextTypes
 from kai_trader.bot.auth import CommandContext
 from kai_trader.bot.formatting import (
     bold,
+    format_money,
     format_sgt_timestamp,
     header,
     italic,
@@ -48,25 +55,35 @@ async def _build(_update: Update, _ctx: CommandContext) -> str:
 
     market_state = "open" if clock.is_open else "closed"
     kill_state = "ENGAGED" if flags.get("kill_switch", False) else "off"
-    meta_lines = [
-        f"{bold('Market')}: {market_state}",
-        f"{bold('Regime')}: {regime.regime} · VIX {regime.vix:.2f}",
-        f"{bold('Equity')}: USD {account.equity}",
-        f"{bold('Kill switch')}: {kill_state}",
+    trading_state = "on" if flags.get("trading_enabled", False) else "off"
+
+    sections: list[str] = []
+    subtitle = f"{ts} . {regime.regime} regime . VIX {regime.vix:.1f}"
+    sections.append(header("Strategy Status - Preview", subtitle))
+    sections.append(italic(
+        "Dry-run only. The worker submits on its own schedule."
+    ))
+
+    account_lines = [
+        f"Equity        {format_money(account.equity)}",
+        f"Market        {market_state}",
+        f"Trading       {trading_state}",
+        f"Kill switch   {kill_state}",
     ]
-    parts = [
-        header("Strategy Status", ts),
-        "\n".join(meta_lines),
-        italic("Dry-run preview. The worker submits on its own schedule."),
-        "",
-    ]
+    sections.append(bold("Account") + "\n" + pre("\n".join(account_lines)))
+
     if intents:
-        parts.append(pre(summarise_intents(intents)))
+        sections.append(bold("Preview") + "\n" + pre(summarise_intents(intents)))
     else:
-        parts.append(italic(summarise_intents(intents)))
-    for warning in diagnostics.warning_lines():
-        parts.append(italic(f"Warning: {warning}"))
-    return "\n".join(parts)
+        sections.append(
+            bold("Preview") + "\n" + italic(summarise_intents(intents))
+        )
+
+    warning_lines = diagnostics.warning_lines()
+    if warning_lines:
+        sections.append(bold("Notes") + "\n" + pre("\n".join(warning_lines)))
+
+    return "\n\n".join(sections)
 
 
 async def handle(update: Update, tg_ctx: ContextTypes.DEFAULT_TYPE) -> None:
