@@ -323,8 +323,16 @@ class StrategyWorker:
         # Covered-call leg: detect put assignments, then build and submit
         # CCs against any held shares. Assignment detection is idempotent;
         # CC build skips if regime is risk_off.
-        assignments_recorded = await self._handle_assignments()
+        # B10: fetch held equity once and pass into both consumers so we
+        # do not pay two Alpaca round trips for the same data.
+        try:
+            held_equity = await list_long_equity_positions()
+        except Exception as exc:
+            _log.warning("strategy.held_equity.fetch_failed", error=str(exc))
+            held_equity = []
+        assignments_recorded = await self._handle_assignments(held_equity)
         call_intents, call_diagnostics = await self._build_call_intents(
+            held=held_equity,
             sleeves=sleeves,
             regime=regime,
             today=today,
@@ -671,17 +679,18 @@ class StrategyWorker:
         await mark_status(row_id, "failed", error_text=_format_error_text(result))
         return "failed"
 
-    async def _handle_assignments(self) -> int:
+    async def _handle_assignments(
+        self, held: list[PositionSnapshot]
+    ) -> int:
         """Match held shares against recently-filled CSPs, audit any new ones.
 
         Returns the count of newly recorded assignment rows. Idempotent:
         previously-recorded assignments are not duplicated.
+
+        B10: ``held`` is fetched once at the tick level and passed in
+        rather than refetched here. The empty-input check below is the
+        natural early-exit when the operator holds no shares.
         """
-        try:
-            held = await list_long_equity_positions()
-        except Exception as exc:
-            _log.warning("strategy.assignments.fetch_failed", error=str(exc))
-            return 0
         if not held:
             return 0
         # Pull only filled-CSP and prior-assignment rows for the symbols
@@ -714,15 +723,16 @@ class StrategyWorker:
     async def _build_call_intents(
         self,
         *,
+        held: list[PositionSnapshot],
         sleeves: list[SleeveConfig],
         regime: RegimeSnapshot,
         today: date,
     ) -> tuple[list[CallIntent], CallBuildDiagnostics]:
-        try:
-            held = await list_long_equity_positions()
-        except Exception as exc:
-            _log.warning("strategy.cc.positions_fetch_failed", error=str(exc))
-            return [], CallBuildDiagnostics(sleeves=[])
+        """Build CC intents from already-fetched holdings.
+
+        B10: ``held`` arrives from the tick rather than being refetched
+        per-call. Empty input still produces an empty diagnostics object.
+        """
         return await build_call_intents(
             long_equity_positions=held,
             sleeves=sleeves,

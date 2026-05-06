@@ -14,6 +14,7 @@ operator has time to investigate before manual stop-out.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from kai_trader.bot.formatting import bold
@@ -77,9 +78,14 @@ async def check_and_trip(
     fires a critical-priority notification.
     """
     snapshots = await recent_snapshots(limit=200)
-    # Filter to the lookback window. recent_snapshots returns newest-first.
+    # Filter to the lookback window. The cutoff is anchored to NOW
+    # rather than to the most-recent snapshot's timestamp: if the bot
+    # was offline for a few days, anchoring to the latest snapshot
+    # would silently extend the lookback by the offline duration and
+    # the breaker would compare current equity against a high-water
+    # mark from outside the intended 7-day window.
     if snapshots:
-        cutoff = snapshots[0].captured_at.timestamp() - LOOKBACK_DAYS * 86400
+        cutoff = datetime.now(UTC).timestamp() - LOOKBACK_DAYS * 86400
         snapshots = [s for s in snapshots if s.captured_at.timestamp() >= cutoff]
 
     check = compute_drawdown(snapshots, current_equity)
