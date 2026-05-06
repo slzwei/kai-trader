@@ -57,6 +57,7 @@ from kai_trader.observability.memory_profile import (
     MemoryProfileWorker,
     start_tracemalloc,
 )
+from kai_trader.observability.snapshot_writer import SnapshotWorker
 from kai_trader.strategy.worker import StrategyWorker
 from kai_trader.streams.trading_stream import TradingStreamWorker
 
@@ -65,6 +66,7 @@ _strategy_worker: StrategyWorker | None = None
 _event_dispatcher: EventDispatcher | None = None
 _trading_stream: TradingStreamWorker | None = None
 _memory_profile_worker: MemoryProfileWorker | None = None
+_snapshot_worker: SnapshotWorker | None = None
 
 
 async def _telegram_error_handler(
@@ -141,7 +143,7 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
 async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     """Prime DB pool, then spin up notification + strategy + event + stream workers."""
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
-    global _memory_profile_worker
+    global _memory_profile_worker, _snapshot_worker
 
     # W-7: enable allocation tracking before the bot starts opening
     # connections so the snapshot worker captures every long-lived
@@ -191,10 +193,19 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     _memory_profile_worker = MemoryProfileWorker()
     await _memory_profile_worker.start()
 
+    # Periodic equity snapshot writer. Only persists rows during open
+    # market hours; the operator gets a continuous equity curve in the
+    # account_snapshots table without having to remember /snapshot_now.
+    _snapshot_worker = SnapshotWorker()
+    await _snapshot_worker.start()
+
 
 async def _shutdown(_app: Application) -> None:  # type: ignore[type-arg]
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
-    global _memory_profile_worker
+    global _memory_profile_worker, _snapshot_worker
+    if _snapshot_worker is not None:
+        await _snapshot_worker.stop()
+        _snapshot_worker = None
     if _memory_profile_worker is not None:
         await _memory_profile_worker.stop()
         _memory_profile_worker = None
