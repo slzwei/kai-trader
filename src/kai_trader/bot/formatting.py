@@ -12,7 +12,11 @@ from collections.abc import Iterable
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from html import escape as _html_escape
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from kai_trader.broker.alpaca import PositionSnapshot
 
 
 def now_in(tz_name: str) -> datetime:
@@ -126,3 +130,68 @@ def render_table(rows: Iterable[tuple[str, str]], *, key_width: int = 16) -> str
     money strings or other safe output.
     """
     return "\n".join(f"{label:<{key_width}}{value}" for label, value in rows)
+
+
+# Column widths for the position-row monospace table.
+# Tuned so common tickers (BAC, F, GM, NVDA, AVGO) and most strikes
+# ($11.5 through $500) align without wrap on a typical phone screen.
+_SYMBOL_WIDTH = 5
+_STRIKE_WIDTH = 7
+_TYPE_WIDTH = 5
+_QTY_WIDTH = 4
+
+
+def format_option_label(option_symbol: str, qty: Decimal | int) -> str:
+    """Render an OCC-encoded option as a fixed-width label.
+
+    Example: ``BAC260515P00054000``, qty -1 -> ``"BAC   $54     put   x1"``.
+
+    Widths are tuned so a column of these labels aligns inside a <pre>
+    block. Quantity is rendered as ``xN`` and uses the absolute value
+    (the sign is implied by the side, not shown in the label).
+
+    Raises ``ValueError`` (via parse_occ_symbol) when the symbol is not
+    a valid OCC string. Callers that may receive equity tickers should
+    catch this and render the equity row themselves.
+    """
+    from kai_trader.broker.options_data import parse_occ_symbol
+
+    underlying, _exp, opt_type, strike = parse_occ_symbol(option_symbol)
+    qty_int = int(abs(Decimal(qty)))
+    strike_text = f"${format_strike(strike)}"
+    return (
+        f"{underlying:<{_SYMBOL_WIDTH}}"
+        f"{strike_text:<{_STRIKE_WIDTH}}"
+        f"{opt_type:<{_TYPE_WIDTH}}"
+        f"x{qty_int:<{_QTY_WIDTH - 1}}"
+    )
+
+
+def format_equity_label(symbol: str, qty: Decimal | int) -> str:
+    """Render an equity holding using the same column widths as options."""
+    qty_int = int(abs(Decimal(qty)))
+    return (
+        f"{symbol:<{_SYMBOL_WIDTH}}"
+        f"{'shares':<{_STRIKE_WIDTH + _TYPE_WIDTH}}"
+        f"x{qty_int:<{_QTY_WIDTH - 1}}"
+    )
+
+
+def format_position_row(p: PositionSnapshot) -> str:
+    """One-line render of a position: label + entry + mark + P&L.
+
+    Falls back to an equity label when the symbol is not an OCC option.
+    Values that the broker reports as ``None`` show as ``n/a``.
+    """
+    try:
+        label = format_option_label(p.symbol, p.qty)
+    except ValueError:
+        label = format_equity_label(p.symbol, p.qty)
+    avg = f"{p.avg_entry_price:.2f}"
+    mark = f"{p.current_price:.2f}" if p.current_price is not None else "n/a"
+    pl = (
+        format_signed_money(p.unrealized_pl)
+        if p.unrealized_pl is not None
+        else "n/a"
+    )
+    return f"{label}  entry {avg:>5}  mark {mark:>5}  pl {pl}"
