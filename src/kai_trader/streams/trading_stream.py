@@ -246,7 +246,25 @@ class TradingStreamWorker:
         _log.info("streams.trading.connected", paper=cfg.alpaca_paper)
         # alpaca-py marks _run_forever as private but it is the official
         # async entrypoint; the public ``run`` is sync and would block.
-        await self._stream._run_forever()  # type: ignore[no-untyped-call]
+        # B7: detect explicitly when an SDK upgrade renames or removes
+        # this attribute so the operator sees a typed error instead of
+        # an attribute-error traceback. The pyproject pin keeps the
+        # blast radius small; this guard makes the failure mode loud
+        # if someone bumps the pin without noticing the rename.
+        run_forever = getattr(self._stream, "_run_forever", None)
+        if run_forever is None or not callable(run_forever):
+            _log.error(
+                "streams.trading.run_forever_missing",
+                detail=(
+                    "alpaca-py TradingStream._run_forever is missing or "
+                    "not callable. Likely an SDK upgrade renamed it. "
+                    "Pin pyproject back or update streams/trading_stream.py."
+                ),
+            )
+            raise RuntimeError(
+                "alpaca-py TradingStream._run_forever missing; SDK upgrade?"
+            )
+        await run_forever()
         self._connected = False
 
     async def _wait_backoff(self) -> None:

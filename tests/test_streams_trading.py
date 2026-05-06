@@ -249,6 +249,32 @@ async def test_run_loop_backs_off_on_failure(
     assert worker._consecutive_failures >= 1
 
 
+async def test_connect_raises_typed_error_when_run_forever_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B7: a future alpaca-py upgrade that renames _run_forever must fail loudly.
+
+    The trading stream depends on a private SDK entry point. If a minor
+    version bump removes or renames it, we want a typed RuntimeError
+    surfaced with a clear log line, not an AttributeError traceback that
+    looks like a generic crash.
+    """
+    fake_settings = MagicMock()
+    fake_settings.effective_alpaca_api_key = "key"
+    fake_settings.effective_alpaca_secret_key = "secret"
+    fake_settings.alpaca_paper = True
+
+    class _FakeStream:
+        def subscribe_trade_updates(self, _cb: Any) -> None:
+            return None
+        # Deliberately omit _run_forever to simulate the SDK rename.
+
+    monkeypatch.setattr(ts, "TradingStream", lambda **_kw: _FakeStream())
+    worker = ts.TradingStreamWorker(settings=fake_settings)
+    with pytest.raises(RuntimeError, match="_run_forever missing"):
+        await worker._connect_and_run()
+
+
 def test_worker_init_does_not_connect(monkeypatch: pytest.MonkeyPatch) -> None:
     """Constructor must not touch the network. start() does."""
     fake_settings = MagicMock()

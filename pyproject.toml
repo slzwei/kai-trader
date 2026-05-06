@@ -15,7 +15,11 @@ dependencies = [
     "python-dotenv>=1.0,<2",
     "structlog>=24.1,<26",
     "tzdata>=2024.1",
-    "alpaca-py>=0.32,<1",
+    # Pinned tightly because the trading_stream worker depends on the
+    # private TradingStream._run_forever entry point. A minor version
+    # bump can rename or remove that attribute and silently kill fill
+    # notifications. Bump the upper bound by hand after smoke-testing.
+    "alpaca-py>=0.32,<0.34",
     "yfinance>=0.2.40,<1",
     "lxml>=5.0,<7",
     "anthropic>=0.39,<1",
