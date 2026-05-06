@@ -31,6 +31,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/income", "realized cash flow, open exposure, and rough annualised pace"),
     ("/close", "stage a close on a held position; confirm with /close_confirm"),
     ("/close_confirm", "confirm a staged /close within 30 seconds"),
+    ("/dlq", "notifications stuck after retries, last 7 days"),
 ]
 
 
