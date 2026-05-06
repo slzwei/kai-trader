@@ -170,6 +170,9 @@ kai-trader/
 | ACCOUNT_SNAPSHOT_INTERVAL_SECONDS | no | Cadence for the periodic account-snapshot writer. Default 3600s. Floored at 60s to avoid self-rate-limiting Alpaca. |
 | DAILY_REPORT_UTC_TIME | no       | `HH:MM` UTC for the daily realized-P&L summary post. Default `23:55`. |
 | DAILY_REPORT_ENABLED  | no       | `true` (default) or `false` to suppress the daily summary entirely. |
+| WEEKLY_CHART_UTC_DAY  | no       | Weekday for the weekly equity chart, 0=Mon..6=Sun. Default `0`. |
+| WEEKLY_CHART_UTC_TIME | no       | `HH:MM` UTC for the weekly chart post. Default `00:00`. |
+| WEEKLY_CHART_ENABLED  | no       | `true` (default) or `false` to suppress the weekly chart entirely. |
 
 ## Conventions
 

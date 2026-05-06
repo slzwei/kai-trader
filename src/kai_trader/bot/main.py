@@ -54,6 +54,7 @@ from kai_trader.events.dispatcher import EventDispatcher, build_owner_send
 from kai_trader.logging import configure_logging, get_logger
 from kai_trader.notifications.worker import NotificationWorker
 from kai_trader.observability.daily_report import DailyReportWorker
+from kai_trader.observability.equity_chart import WeeklyEquityChartWorker
 from kai_trader.observability.memory_profile import (
     MemoryProfileWorker,
     start_tracemalloc,
@@ -69,6 +70,7 @@ _trading_stream: TradingStreamWorker | None = None
 _memory_profile_worker: MemoryProfileWorker | None = None
 _snapshot_worker: SnapshotWorker | None = None
 _daily_report_worker: DailyReportWorker | None = None
+_weekly_chart_worker: WeeklyEquityChartWorker | None = None
 
 
 async def _telegram_error_handler(
@@ -146,6 +148,7 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     """Prime DB pool, then spin up notification + strategy + event + stream workers."""
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
     global _memory_profile_worker, _snapshot_worker, _daily_report_worker
+    global _weekly_chart_worker
 
     # W-7: enable allocation tracking before the bot starts opening
     # connections so the snapshot worker captures every long-lived
@@ -207,10 +210,20 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     _daily_report_worker = DailyReportWorker()
     await _daily_report_worker.start()
 
+    # Weekly equity-curve summary auto-posted at the configured weekday
+    # and time (default Mon 00:00 UTC). Renders a Unicode sparkline plus
+    # start/end/min/max/% change from account_snapshots.
+    _weekly_chart_worker = WeeklyEquityChartWorker()
+    await _weekly_chart_worker.start()
+
 
 async def _shutdown(_app: Application) -> None:  # type: ignore[type-arg]
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
     global _memory_profile_worker, _snapshot_worker, _daily_report_worker
+    global _weekly_chart_worker
+    if _weekly_chart_worker is not None:
+        await _weekly_chart_worker.stop()
+        _weekly_chart_worker = None
     if _daily_report_worker is not None:
         await _daily_report_worker.stop()
         _daily_report_worker = None
