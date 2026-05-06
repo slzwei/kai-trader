@@ -39,12 +39,55 @@ def _checksum(sql: str) -> str:
     return hashlib.sha256(sql.encode("utf-8")).hexdigest()
 
 
+def _migration_number(path: Path) -> str | None:
+    """Extract the leading digit prefix of a migration filename.
+
+    ``014_pending_changes.sql`` -> ``"014"``. Returns ``None`` for files
+    that do not start with digits, which simply skips the duplicate
+    check rather than crashing on a future naming convention.
+    """
+    stem = path.stem
+    digits = ""
+    for ch in stem:
+        if not ch.isdigit():
+            break
+        digits += ch
+    return digits or None
+
+
 def _discover_migrations() -> list[Path]:
+    """Return migrations in sorted order; reject duplicate-number prefixes.
+
+    B8: filenames are sorted lexicographically and applied in that
+    order. Skipped numbers (e.g. 018 then 020 with no 019) are fine
+    because we apply by name, not by gap-free count. Duplicates are
+    NOT fine: two files starting with the same number prefix would
+    silently apply both in lex order, and a future operator's idea of
+    "the migration numbered 020" would be ambiguous. This guard fails
+    loudly so the duplicate gets renamed before it ships.
+    """
     if not MIGRATIONS_DIR.exists():
         raise FileNotFoundError(f"Migrations dir missing: {MIGRATIONS_DIR}")
     files = sorted(p for p in MIGRATIONS_DIR.iterdir() if p.suffix == ".sql")
     if not files:
         raise RuntimeError(f"No .sql files found in {MIGRATIONS_DIR}")
+    seen: dict[str, str] = {}
+    duplicates: list[tuple[str, str]] = []
+    for path in files:
+        number = _migration_number(path)
+        if number is None:
+            continue
+        if number in seen:
+            duplicates.append((seen[number], path.name))
+        else:
+            seen[number] = path.name
+    if duplicates:
+        lines = "\n".join(f"  - {a} and {b}" for a, b in duplicates)
+        raise RuntimeError(
+            "Duplicate migration number prefix(es) detected:\n"
+            f"{lines}\n"
+            "Rename the newer file with the next free number prefix."
+        )
     return files
 
 
