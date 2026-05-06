@@ -51,6 +51,36 @@ class Settings(BaseSettings):
 
     alpaca_api_key: SecretStr = Field(..., alias="ALPACA_API_KEY")
     alpaca_secret_key: SecretStr = Field(..., alias="ALPACA_SECRET_KEY")
+    alpaca_api_key_paper: SecretStr | None = Field(
+        default=None,
+        alias="ALPACA_API_KEY_PAPER",
+        description=(
+            "Optional explicit paper-key override. When set, the broker uses "
+            "this in paper mode instead of ALPACA_API_KEY. Lets the operator "
+            "keep both paper and live key pairs configured simultaneously "
+            "and toggle between them with the ALPACA_PAPER flag."
+        ),
+    )
+    alpaca_secret_key_paper: SecretStr | None = Field(
+        default=None,
+        alias="ALPACA_SECRET_KEY_PAPER",
+        description="Paired with ALPACA_API_KEY_PAPER. Optional.",
+    )
+    alpaca_api_key_live: SecretStr | None = Field(
+        default=None,
+        alias="ALPACA_API_KEY_LIVE",
+        description=(
+            "Live-trading API key. Required when ALPACA_PAPER=false. Paper "
+            "fallback is intentionally NOT used in live mode; sending paper "
+            "keys to the live endpoint just 401s and the failure is louder "
+            "as a configuration error than an auth error."
+        ),
+    )
+    alpaca_secret_key_live: SecretStr | None = Field(
+        default=None,
+        alias="ALPACA_SECRET_KEY_LIVE",
+        description="Paired with ALPACA_API_KEY_LIVE. Required in live mode.",
+    )
     alpaca_paper: bool = Field(
         default=True,
         alias="ALPACA_PAPER",
@@ -113,6 +143,47 @@ class Settings(BaseSettings):
                 f"SUPABASE_URL must be a *.supabase.co URL, got: {self.supabase_url}"
             )
         return host.split(".", 1)[0]
+
+    @property
+    def effective_alpaca_api_key(self) -> str:
+        """Resolve which Alpaca API key the broker should use right now.
+
+        Paper mode prefers ``ALPACA_API_KEY_PAPER`` and falls back to the
+        legacy ``ALPACA_API_KEY``. Live mode strictly requires
+        ``ALPACA_API_KEY_LIVE`` and refuses to fall back to the paper key,
+        because sending paper credentials at the live endpoint produces a
+        confusing 401 instead of a clear configuration error.
+        """
+        if self.alpaca_paper:
+            override = self.alpaca_api_key_paper
+            if override is not None and override.get_secret_value():
+                return override.get_secret_value()
+            return self.alpaca_api_key.get_secret_value()
+        live = self.alpaca_api_key_live
+        if live is None or not live.get_secret_value():
+            raise ValueError(
+                "ALPACA_PAPER=false but ALPACA_API_KEY_LIVE is unset. "
+                "Set the live API key explicitly; the paper key is not "
+                "used as a fallback in live mode."
+            )
+        return live.get_secret_value()
+
+    @property
+    def effective_alpaca_secret_key(self) -> str:
+        """Resolve the secret key paired with ``effective_alpaca_api_key``."""
+        if self.alpaca_paper:
+            override = self.alpaca_secret_key_paper
+            if override is not None and override.get_secret_value():
+                return override.get_secret_value()
+            return self.alpaca_secret_key.get_secret_value()
+        live = self.alpaca_secret_key_live
+        if live is None or not live.get_secret_value():
+            raise ValueError(
+                "ALPACA_PAPER=false but ALPACA_SECRET_KEY_LIVE is unset. "
+                "Set the live secret key explicitly; the paper secret is "
+                "not used as a fallback in live mode."
+            )
+        return live.get_secret_value()
 
     @property
     def database_url(self) -> str:

@@ -156,8 +156,12 @@ kai-trader/
 | SUPABASE_DB_PASSWORD  | yes      | Postgres password from Supabase dashboard.         |
 | SUPABASE_KEY          | no       | Service role JWT. Reserved for later phases.       |
 | DATABASE_URL          | no       | Full Postgres URL. Set on IPv4-only networks, use the Session pooler string from the Supabase dashboard. Overrides the computed direct host. |
-| ALPACA_API_KEY        | yes      | From the Alpaca dashboard. Paper keys start with PK. |
-| ALPACA_SECRET_KEY     | yes      | Paired with the API key. Shown once on key creation. |
+| ALPACA_API_KEY        | yes      | From the Alpaca dashboard. Paper keys start with PK. Used as the paper key fallback when ALPACA_API_KEY_PAPER is unset. |
+| ALPACA_SECRET_KEY     | yes      | Paired with the API key. Shown once on key creation. Used as the paper secret fallback. |
+| ALPACA_API_KEY_PAPER  | no       | Optional explicit paper key. Lets you keep both pairs configured and toggle with ALPACA_PAPER. |
+| ALPACA_SECRET_KEY_PAPER | no     | Paired with ALPACA_API_KEY_PAPER. |
+| ALPACA_API_KEY_LIVE   | for live | Live-trading API key. Required when ALPACA_PAPER=false. The paper key is intentionally NOT a fallback in live mode. |
+| ALPACA_SECRET_KEY_LIVE | for live | Paired with ALPACA_API_KEY_LIVE. Required in live mode. |
 | ALPACA_PAPER          | no       | `true` (default) routes to Alpaca paper. `false` switches to live, but live trades still require the trading-enabled flag. |
 | ENV                   | no       | `dev`, `staging`, or `prod`. Default `dev`.        |
 | LOG_LEVEL             | no       | `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default INFO. |

@@ -237,8 +237,8 @@ class TradingStreamWorker:
     async def _connect_and_run(self) -> None:
         cfg = self._settings
         self._stream = TradingStream(
-            api_key=cfg.alpaca_api_key.get_secret_value(),
-            secret_key=cfg.alpaca_secret_key.get_secret_value(),
+            api_key=cfg.effective_alpaca_api_key,
+            secret_key=cfg.effective_alpaca_secret_key,
             paper=cfg.alpaca_paper,
         )
         self._stream.subscribe_trade_updates(self._on_trade_update)

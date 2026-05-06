@@ -78,8 +78,8 @@ class DailyBar:
 
 def _build_client(cfg: Settings) -> StockHistoricalDataClient:
     return StockHistoricalDataClient(
-        api_key=cfg.alpaca_api_key.get_secret_value(),
-        secret_key=cfg.alpaca_secret_key.get_secret_value(),
+        api_key=cfg.effective_alpaca_api_key,
+        secret_key=cfg.effective_alpaca_secret_key,
     )
 
 

@@ -76,8 +76,8 @@ def parse_occ_symbol(symbol: str) -> tuple[str, date, str, Decimal]:
 
 def _build_client(cfg: Settings) -> OptionHistoricalDataClient:
     return OptionHistoricalDataClient(
-        api_key=cfg.alpaca_api_key.get_secret_value(),
-        secret_key=cfg.alpaca_secret_key.get_secret_value(),
+        api_key=cfg.effective_alpaca_api_key,
+        secret_key=cfg.effective_alpaca_secret_key,
     )
 
 

@@ -63,8 +63,8 @@ class PositionSnapshot:
 
 def _build_client(cfg: Settings) -> TradingClient:
     return TradingClient(
-        api_key=cfg.alpaca_api_key.get_secret_value(),
-        secret_key=cfg.alpaca_secret_key.get_secret_value(),
+        api_key=cfg.effective_alpaca_api_key,
+        secret_key=cfg.effective_alpaca_secret_key,
         paper=cfg.alpaca_paper,
     )
 
@@ -761,8 +761,8 @@ async def get_fill_activities(
     """
     settings = get_settings()
     headers = {
-        "APCA-API-KEY-ID": settings.alpaca_api_key.get_secret_value(),
-        "APCA-API-SECRET-KEY": settings.alpaca_secret_key.get_secret_value(),
+        "APCA-API-KEY-ID": settings.effective_alpaca_api_key,
+        "APCA-API-SECRET-KEY": settings.effective_alpaca_secret_key,
         "Accept": "application/json",
     }
     params: dict[str, str] = {"page_size": "100"}
