@@ -54,7 +54,10 @@ from kai_trader.events.dispatcher import EventDispatcher, build_owner_send
 from kai_trader.logging import configure_logging, get_logger
 from kai_trader.notifications.worker import NotificationWorker
 from kai_trader.observability.daily_report import DailyReportWorker
-from kai_trader.observability.dependency_probe import assert_dependencies_loadable
+from kai_trader.observability.dependency_probe import (
+    assert_alpaca_keys_resolvable,
+    assert_dependencies_loadable,
+)
 from kai_trader.observability.equity_chart import WeeklyEquityChartWorker
 from kai_trader.observability.memory_profile import (
     MemoryProfileWorker,
@@ -155,6 +158,13 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     # done this once already; surface that class of failure at boot
     # rather than at the first time the broken code path runs.
     assert_dependencies_loadable()
+
+    # Autonomy gap 1: surface a misconfigured live-key deploy at boot
+    # rather than several minutes later when the first broker call
+    # fails. Critical for the live cutover: ALPACA_PAPER=false without
+    # ALPACA_API_KEY_LIVE set would otherwise look healthy until the
+    # market opens.
+    assert_alpaca_keys_resolvable()
 
     # W-7: enable allocation tracking before the bot starts opening
     # connections so the snapshot worker captures every long-lived

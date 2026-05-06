@@ -131,3 +131,84 @@ def test_assert_records_passed_event_on_happy_path(
     pass_events = [c for c in captured if c["event"] == "dependency_probe.passed"]
     assert len(pass_events) == 1
     assert pass_events[0]["probed"] == 1
+
+
+# ------------- Autonomy gap 1: Alpaca key boot probe -------------
+
+
+def _make_settings(*, paper: bool, **overrides: object) -> object:
+    """Build a settings stub that mimics the resolver's behaviour."""
+
+    class _Stub:
+        alpaca_paper = paper
+
+        @property
+        def effective_alpaca_api_key(self) -> str:
+            value = overrides.get("api_key", "papk-real")
+            if isinstance(value, BaseException):
+                raise value
+            return str(value)
+
+        @property
+        def effective_alpaca_secret_key(self) -> str:
+            value = overrides.get("secret", "secret-real")
+            if isinstance(value, BaseException):
+                raise value
+            return str(value)
+
+    return _Stub()
+
+
+def test_alpaca_key_probe_passes_in_paper_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "kai_trader.config.get_settings",
+        lambda: _make_settings(paper=True),
+    )
+    # Should not raise.
+    dependency_probe.assert_alpaca_keys_resolvable()
+
+
+def test_alpaca_key_probe_passes_with_live_keys_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "kai_trader.config.get_settings",
+        lambda: _make_settings(
+            paper=False, api_key="live-key", secret="live-secret"
+        ),
+    )
+    dependency_probe.assert_alpaca_keys_resolvable()
+
+
+def test_alpaca_key_probe_raises_when_resolver_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live deploy without ALPACA_API_KEY_LIVE must not start polling."""
+    monkeypatch.setattr(
+        "kai_trader.config.get_settings",
+        lambda: _make_settings(
+            paper=False,
+            api_key=ValueError("ALPACA_PAPER=false but ALPACA_API_KEY_LIVE is unset"),
+        ),
+    )
+    with pytest.raises(
+        dependency_probe.AlpacaKeyConfigError,
+        match="ALPACA_API_KEY_LIVE is unset",
+    ):
+        dependency_probe.assert_alpaca_keys_resolvable()
+
+
+def test_alpaca_key_probe_raises_on_empty_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Belt-and-braces guard: empty string slipped through env loading."""
+    monkeypatch.setattr(
+        "kai_trader.config.get_settings",
+        lambda: _make_settings(paper=True, api_key=""),
+    )
+    with pytest.raises(
+        dependency_probe.AlpacaKeyConfigError, match="empty string"
+    ):
+        dependency_probe.assert_alpaca_keys_resolvable()
