@@ -53,6 +53,7 @@ from kai_trader.db.schema_check import assert_schema_up_to_date
 from kai_trader.events.dispatcher import EventDispatcher, build_owner_send
 from kai_trader.logging import configure_logging, get_logger
 from kai_trader.notifications.worker import NotificationWorker
+from kai_trader.observability.daily_report import DailyReportWorker
 from kai_trader.observability.memory_profile import (
     MemoryProfileWorker,
     start_tracemalloc,
@@ -67,6 +68,7 @@ _event_dispatcher: EventDispatcher | None = None
 _trading_stream: TradingStreamWorker | None = None
 _memory_profile_worker: MemoryProfileWorker | None = None
 _snapshot_worker: SnapshotWorker | None = None
+_daily_report_worker: DailyReportWorker | None = None
 
 
 async def _telegram_error_handler(
@@ -143,7 +145,7 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
 async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     """Prime DB pool, then spin up notification + strategy + event + stream workers."""
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
-    global _memory_profile_worker, _snapshot_worker
+    global _memory_profile_worker, _snapshot_worker, _daily_report_worker
 
     # W-7: enable allocation tracking before the bot starts opening
     # connections so the snapshot worker captures every long-lived
@@ -199,10 +201,19 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     _snapshot_worker = SnapshotWorker()
     await _snapshot_worker.start()
 
+    # Daily realized-P&L summary auto-posted just before UTC midnight.
+    # Reuses the /income builder so the body matches what the operator
+    # gets on demand. Disabled via DAILY_REPORT_ENABLED=false.
+    _daily_report_worker = DailyReportWorker()
+    await _daily_report_worker.start()
+
 
 async def _shutdown(_app: Application) -> None:  # type: ignore[type-arg]
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
-    global _memory_profile_worker, _snapshot_worker
+    global _memory_profile_worker, _snapshot_worker, _daily_report_worker
+    if _daily_report_worker is not None:
+        await _daily_report_worker.stop()
+        _daily_report_worker = None
     if _snapshot_worker is not None:
         await _snapshot_worker.stop()
         _snapshot_worker = None

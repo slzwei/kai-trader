@@ -167,6 +167,9 @@ kai-trader/
 | DATABASE_URL_RO       | for chat | Read-only DSN for the chat tool layer. Authenticate as `kai_chat_ro`. Without it, `query_supabase` fails closed. |
 | KAI_CHAT_RO_PASSWORD  | bootstrap | Used by `scripts/create_chat_ro_role.py` to create or rotate the `kai_chat_ro` role. Not read at runtime by the bot. |
 | HEARTBEAT_URL         | no       | Out-of-band liveness URL pinged after every successful strategy tick (e.g. healthchecks.io). When unset, the heartbeat is a no-op. |
+| ACCOUNT_SNAPSHOT_INTERVAL_SECONDS | no | Cadence for the periodic account-snapshot writer. Default 3600s. Floored at 60s to avoid self-rate-limiting Alpaca. |
+| DAILY_REPORT_UTC_TIME | no       | `HH:MM` UTC for the daily realized-P&L summary post. Default `23:55`. |
+| DAILY_REPORT_ENABLED  | no       | `true` (default) or `false` to suppress the daily summary entirely. |
 
 ## Conventions
 

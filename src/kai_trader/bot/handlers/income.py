@@ -128,7 +128,14 @@ def _format_money(value: Decimal) -> str:
     return f"{sign}${abs(value):,.0f}"
 
 
-async def _build(_update: Update, ctx: CommandContext) -> str:
+async def build_income_summary() -> str:
+    """Render the same Income Summary that the /income command sends.
+
+    Exposed as a public coroutine so the daily-report worker can post the
+    same content to Telegram without going through python-telegram-bot's
+    command dispatch path. Behaviour is identical to ``_build``: any
+    refactor here flows through to /income.
+    """
     settings = get_settings()
     ts = format_sgt_timestamp(settings.timezone)
     head = header("Income Summary", ts)
@@ -298,6 +305,10 @@ def _format_annualised(
         f"  x 52 weeks ~= {annualised_pct:.1f}%",
         "  (rough; ignores tail losses and weekly variance)",
     ]
+
+
+async def _build(_update: Update, _ctx: CommandContext) -> str:
+    return await build_income_summary()
 
 
 async def handle(update: Update, tg_ctx: ContextTypes.DEFAULT_TYPE) -> None:

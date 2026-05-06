@@ -38,3 +38,6 @@ coverage.xml
 # Logs
 *.log
 logs/
+
+# Claude Code harness state (per-session locks, scheduled-task metadata)
+.claude/
