@@ -248,7 +248,9 @@ async def test_new_deployment_collateral_since_sums_open_orders() -> None:
     sql = args[0]
     assert "submitted_at >= $1" in sql
     assert "open_short_put" in sql
-    assert "open_covered_call" in sql
+    # B2: covered calls must NOT count against the daily cash-deployment
+    # cap because the shares they cover are already on the books.
+    assert "open_covered_call" not in sql
     assert "submitted" in sql
     assert "filled" in sql
     assert args[1] == cutoff
