@@ -15,20 +15,19 @@ resolution-markers = [
 
 [[package]]
 name = "alpaca-py"
-version = "0.43.3"
+version = "0.33.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "msgpack" },
     { name = "pandas" },
     { name = "pydantic" },
-    { name = "pytz" },
     { name = "requests" },
     { name = "sseclient-py" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/31/40/e0b3470786de2dd917276759d669b3adc6577432323e8535724e71e53c2e/alpaca_py-0.43.3.tar.gz", hash = "sha256:d97e815eb503fe084113b139ed94227913dc4da8025f28460a14d489371bd07d", size = 97985, upload-time = "2026-04-24T18:28:37.068Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cf/5e/d0d97f799e14968deca5628f84a8facf09ae832c9d198a013d76f0f16810/alpaca_py-0.33.1.tar.gz", hash = "sha256:6d72248c327f38deffcfec8a84001113d9a9443005398b1f527d06ee59677e6d", size = 97532, upload-time = "2024-11-26T00:08:44.907Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f8/b4/062dbf87910c4a5c0accde3bd073c2fa3f7ac9e66571489ef1a7c0f44531/alpaca_py-0.43.3-py3-none-any.whl", hash = "sha256:0eb36921696bbfc5ea839f083e7822c9ccab062d8d523a888bc4470985f1b3ef", size = 122528, upload-time = "2026-04-24T18:28:38.25Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/4f/a8963858791d300e390e5f15b7e1616d60d4fb270ae96a5424d1ffe0f960/alpaca_py-0.33.1-py3-none-any.whl", hash = "sha256:c268291d250324fac0ba01ce180872b9f421bd2fe5e003a935615009531d909b", size = 119971, upload-time = "2024-11-26T00:08:43.747Z" },
 ]
 
 [[package]]
@@ -633,7 +632,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "alpaca-py", specifier = ">=0.32,<1" },
+    { name = "alpaca-py", specifier = ">=0.32,<0.34" },
     { name = "anthropic", specifier = ">=0.39,<1" },
     { name = "asyncpg", specifier = ">=0.29,<0.31" },
     { name = "lxml", specifier = ">=5.0,<7" },
