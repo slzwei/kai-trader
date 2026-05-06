@@ -26,7 +26,7 @@ import asyncio
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from kai_trader.bot.formatting import bold, format_money, header, pre
+from kai_trader.bot.formatting import bold, format_money, format_strike, header, pre
 from kai_trader.broker.alpaca import (
     PositionSnapshot,
     SubmitResult,
@@ -120,7 +120,8 @@ def _format_open_positions_lines(
         collateral = strike * Decimal("100") * qty
         total += collateral
         lines.append(
-            f"  {underlying} P{strike:.0f} x{int(qty)}  {format_money(collateral)}"
+            f"  {underlying} P{format_strike(strike)} x{int(qty)}  "
+            f"{format_money(collateral)}"
         )
     if total == 0:
         return []

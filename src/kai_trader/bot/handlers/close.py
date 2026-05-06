@@ -32,6 +32,7 @@ from kai_trader.bot.auth import authorize, user_id_from_update
 from kai_trader.bot.formatting import (
     format_money,
     format_signed_money,
+    format_strike,
     italic,
     pre,
 )
@@ -190,7 +191,7 @@ def _button_label(p: PositionSnapshot) -> str:
     except ValueError:
         return f"Close {p.symbol} x{p.qty}{mark_part}"
     type_letter = "C" if opt_type == "call" else "P"
-    return f"Close {underlying} ${strike:.0f}{type_letter} x{p.qty}{mark_part}"
+    return f"Close {underlying} ${format_strike(strike)}{type_letter} x{p.qty}{mark_part}"
 
 
 def _selection_keyboard(positions: list[PositionSnapshot]) -> InlineKeyboardMarkup:
