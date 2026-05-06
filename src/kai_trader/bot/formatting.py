@@ -135,20 +135,42 @@ def render_table(rows: Iterable[tuple[str, str]], *, key_width: int = 16) -> str
 # Column widths for the position-row monospace table.
 # Tuned so common tickers (BAC, F, GM, NVDA, AVGO) and most strikes
 # ($11.5 through $500) align without wrap on a typical phone screen.
+# _QTY_WIDTH covers up to "999" plus the leading "x"; fractional share
+# counts like "x10.5" are wider and will offset the entry column for
+# that row, but the tradeoff is faithful display vs silent truncation.
 _SYMBOL_WIDTH = 5
 _STRIKE_WIDTH = 7
 _TYPE_WIDTH = 5
-_QTY_WIDTH = 4
+_QTY_WIDTH = 5
+
+
+def format_qty(qty: Decimal | int) -> str:
+    """Render a position quantity, preserving fractional shares.
+
+    Whole numbers render as integers (``"100"``). Fractional values
+    (Alpaca supports fractional-share equity positions) keep
+    significant digits and drop trailing zeros: ``Decimal("10.50")``
+    -> ``"10.5"``. The sign is dropped because the caller renders
+    long/short via the side, not the qty.
+    """
+    abs_qty = abs(Decimal(qty))
+    if abs_qty == abs_qty.to_integral_value():
+        return str(int(abs_qty))
+    text = format(abs_qty, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
 def format_option_label(option_symbol: str, qty: Decimal | int) -> str:
     """Render an OCC-encoded option as a fixed-width label.
 
-    Example: ``BAC260515P00054000``, qty -1 -> ``"BAC   $54     put   x1"``.
+    Example: ``BAC260515P00054000``, qty -1 -> ``"BAC  $54    put  x1"``.
 
     Widths are tuned so a column of these labels aligns inside a <pre>
-    block. Quantity is rendered as ``xN`` and uses the absolute value
-    (the sign is implied by the side, not shown in the label).
+    block. Quantity is rendered as ``xN`` via ``format_qty`` and uses
+    the absolute value (the sign is implied by the side, not shown in
+    the label).
 
     Raises ``ValueError`` (via parse_occ_symbol) when the symbol is not
     a valid OCC string. Callers that may receive equity tickers should
@@ -157,23 +179,27 @@ def format_option_label(option_symbol: str, qty: Decimal | int) -> str:
     from kai_trader.broker.options_data import parse_occ_symbol
 
     underlying, _exp, opt_type, strike = parse_occ_symbol(option_symbol)
-    qty_int = int(abs(Decimal(qty)))
+    qty_text = f"x{format_qty(qty)}"
     strike_text = f"${format_strike(strike)}"
     return (
         f"{underlying:<{_SYMBOL_WIDTH}}"
         f"{strike_text:<{_STRIKE_WIDTH}}"
         f"{opt_type:<{_TYPE_WIDTH}}"
-        f"x{qty_int:<{_QTY_WIDTH - 1}}"
+        f"{qty_text:<{_QTY_WIDTH}}"
     )
 
 
 def format_equity_label(symbol: str, qty: Decimal | int) -> str:
-    """Render an equity holding using the same column widths as options."""
-    qty_int = int(abs(Decimal(qty)))
+    """Render an equity holding using the same column widths as options.
+
+    Fractional share counts are preserved (``Decimal("10.5")`` ->
+    ``"x10.5"``) rather than truncated to ``"x10"``.
+    """
+    qty_text = f"x{format_qty(qty)}"
     return (
         f"{symbol:<{_SYMBOL_WIDTH}}"
         f"{'shares':<{_STRIKE_WIDTH + _TYPE_WIDTH}}"
-        f"x{qty_int:<{_QTY_WIDTH - 1}}"
+        f"{qty_text:<{_QTY_WIDTH}}"
     )
 
 
