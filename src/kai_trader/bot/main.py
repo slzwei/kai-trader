@@ -59,6 +59,7 @@ from kai_trader.observability.dependency_probe import (
     assert_dependencies_loadable,
 )
 from kai_trader.observability.equity_chart import WeeklyEquityChartWorker
+from kai_trader.observability.flags_nag import FlagsNagWorker
 from kai_trader.observability.memory_profile import (
     MemoryProfileWorker,
     start_tracemalloc,
@@ -76,6 +77,7 @@ _memory_profile_worker: MemoryProfileWorker | None = None
 _snapshot_worker: SnapshotWorker | None = None
 _daily_report_worker: DailyReportWorker | None = None
 _weekly_chart_worker: WeeklyEquityChartWorker | None = None
+_flags_nag_worker: FlagsNagWorker | None = None
 _watchdog: TaskWatchdog | None = None
 
 
@@ -154,7 +156,7 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     """Prime DB pool, then spin up notification + strategy + event + stream workers."""
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
     global _memory_profile_worker, _snapshot_worker, _daily_report_worker
-    global _weekly_chart_worker, _watchdog
+    global _weekly_chart_worker, _flags_nag_worker, _watchdog
 
     # Refuse to start when a required wheel went missing. lxml has
     # done this once already; surface that class of failure at boot
@@ -234,6 +236,13 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     _weekly_chart_worker = WeeklyEquityChartWorker()
     await _weekly_chart_worker.start()
 
+    # Autonomy gap 2: alert when trading_enabled or new_entries_enabled
+    # has been off for more than 4 hours of contiguous open-market time
+    # without the kill switch being on. Catches the "I turned it off
+    # to debug something and forgot" failure mode.
+    _flags_nag_worker = FlagsNagWorker()
+    await _flags_nag_worker.start()
+
     # B6: supervise every long-lived worker spawned above. If any of
     # them dies via an unhandled exception, the watchdog respawns it
     # and fires a critical Telegram alert. Healthchecks.io covers the
@@ -247,6 +256,7 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
         ("snapshot_writer", _snapshot_worker),
         ("daily_report", _daily_report_worker),
         ("weekly_chart", _weekly_chart_worker),
+        ("flags_nag", _flags_nag_worker),
     ])
     await _watchdog.start()
 
@@ -254,12 +264,15 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
 async def _shutdown(_app: Application) -> None:  # type: ignore[type-arg]
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
     global _memory_profile_worker, _snapshot_worker, _daily_report_worker
-    global _weekly_chart_worker, _watchdog
+    global _weekly_chart_worker, _flags_nag_worker, _watchdog
     # Stop the watchdog FIRST so it does not respawn workers we are
     # about to shut down.
     if _watchdog is not None:
         await _watchdog.stop()
         _watchdog = None
+    if _flags_nag_worker is not None:
+        await _flags_nag_worker.stop()
+        _flags_nag_worker = None
     if _weekly_chart_worker is not None:
         await _weekly_chart_worker.stop()
         _weekly_chart_worker = None
