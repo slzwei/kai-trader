@@ -124,3 +124,61 @@ def assert_dependencies_loadable() -> None:
         "dependency_probe.passed",
         probed=len(results),
     )
+
+
+class AlpacaKeyConfigError(RuntimeError):
+    """Raised at startup when the Alpaca key resolution does not produce credentials."""
+
+
+def assert_alpaca_keys_resolvable() -> None:
+    """Block boot when the configured Alpaca keys cannot be resolved.
+
+    In paper mode the resolution falls back to ``ALPACA_API_KEY`` /
+    ``ALPACA_SECRET_KEY`` (which Pydantic already requires). In live
+    mode the resolver requires ``ALPACA_API_KEY_LIVE`` /
+    ``ALPACA_SECRET_KEY_LIVE`` and refuses to fall back. Without this
+    boot check, that refusal surfaces lazily on the first broker call,
+    which on a fresh deploy is several minutes after the bot has
+    started polling Telegram. The operator only finds out the key is
+    missing when the strategy worker logs an error - too late if the
+    market is already open.
+
+    This probe runs the resolution once at boot. A misconfiguration
+    refuses to start polling, the same posture as a missing wheel.
+    """
+    # Imported here to keep the dependency probe importable in test
+    # environments that do not set the full settings surface.
+    from kai_trader.config import get_settings
+
+    settings = get_settings()
+    try:
+        api_key = settings.effective_alpaca_api_key
+        secret = settings.effective_alpaca_secret_key
+    except ValueError as exc:
+        _log.error(
+            "alpaca_key_probe.failed",
+            paper=settings.alpaca_paper,
+            error=str(exc),
+        )
+        raise AlpacaKeyConfigError(
+            f"Alpaca key resolution failed: {exc}"
+        ) from exc
+    # Pydantic already enforces the value is non-empty; the resolver
+    # also raises when the live override is missing. A bare-string
+    # belt-and-braces check below catches the unlikely case of an
+    # explicit empty string slipped through env loading.
+    if not api_key or not secret:
+        _log.error(
+            "alpaca_key_probe.empty",
+            paper=settings.alpaca_paper,
+            api_key_blank=not api_key,
+            secret_blank=not secret,
+        )
+        raise AlpacaKeyConfigError(
+            "Alpaca key resolution returned an empty string. Check that "
+            "the relevant *_LIVE or paper env vars are set non-empty."
+        )
+    _log.info(
+        "alpaca_key_probe.passed",
+        paper=settings.alpaca_paper,
+    )
