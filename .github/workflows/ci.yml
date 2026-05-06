@@ -97,3 +97,41 @@ jobs:
         # 80% gate fails on pure CI smoke that legitimately doesn't
         # touch most of the codebase.
         run: uv run pytest tests/test_schema_integration.py -v --no-cov
+
+  e2e-smoke:
+    # Pre-merge dry-tick smoke. Drives build_intents_with_diagnostics
+    # with a realistic production scenario and asserts every W-1..W-9
+    # defence is wired correctly. No live broker, no live DB; pure
+    # in-memory pipeline. If a refactor breaks the strategy build,
+    # this job catches it before the change reaches Render.
+    runs-on: ubuntu-latest
+
+    env:
+      # Stub credentials so any get_settings() call inside the import
+      # chain loads cleanly. None of these talk to real services.
+      TELEGRAM_BOT_TOKEN: 1234:test
+      TELEGRAM_OWNER_ID: "0"
+      SUPABASE_URL: https://ci.supabase.co
+      SUPABASE_KEY: ci-stub-key
+      SUPABASE_DB_PASSWORD: ci-stub-password
+      ALPACA_API_KEY: PKCITESTKEYAAAAAAAAAA
+      ALPACA_SECRET_KEY: ci-stub-secret
+      ALPACA_PAPER: "true"
+      ANTHROPIC_API_KEY: ci-stub-anthropic
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --extra dev --frozen
+
+      - name: Dry-tick smoke
+        run: uv run python scripts/e2e_smoke_test.py

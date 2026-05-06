@@ -195,7 +195,7 @@ COOLDOWN_SYMBOLS = {"T"}
 # ------------- runner -------------
 
 
-async def main() -> None:
+async def main() -> int:
     print("=" * 70)
     print("End-to-end smoke test: W-1 through W-9")
     print("=" * 70)
@@ -321,7 +321,8 @@ async def main() -> None:
     n_pass = sum(1 for _, ok in checks if ok)
     print()
     print(f"Result: {n_pass}/{len(checks)} assertions passed.")
+    return 0 if n_pass == len(checks) else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))
