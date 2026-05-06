@@ -247,36 +247,35 @@ async def has_failed_since(
 
 
 async def new_deployment_collateral_since(since: datetime) -> Decimal:
-    """Sum collateral across new-entry orders submitted since ``since``.
+    """Sum cash collateral committed by new short-put openings since ``since``.
 
-    W-4 uses this to enforce the per-day deployment cap. Counts both
-    short put openings and covered call openings because both lock
-    capital (cash for puts, shares for calls) and represent fresh
-    capital being put at risk on the day. Status filter restricts to
-    rows that actually went to the broker (submitted or filled), so a
-    skipped-by-flag attempt does not consume the daily budget.
+    W-4 uses this to enforce the per-day deployment cap. The cap is a
+    cash-deployment cap, so it must count only orders that lock new
+    cash. Covered calls do **not** lock cash (the shares they cover
+    are already on the books from a prior assignment); including them
+    overcounts the daily budget and binds the cap earlier than intended
+    on tick days where assignment + CC fire.
 
-    Collateral is extracted from intent_payload via the JSONB operator;
-    for short puts, ``strike * 100 * qty``; for covered calls, the
-    per-contract collateral on a CC is shares (already held), so the
-    payload's ``collateral`` field is used when present, otherwise
-    falls back to ``strike * 100 * qty`` which approximates the
-    notional.
+    Collateral is ``strike * 100 * qty`` from ``intent_payload``. The
+    earlier implementation also coalesced into a payload ``collateral``
+    field, but no caller sets that key, so the fallback was always the
+    multiplication path; that's the only path now.
+
+    Status filter restricts to rows that actually went to the broker
+    (submitted or filled) so a skipped-by-flag attempt does not consume
+    the daily budget.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             select coalesce(sum(
-                coalesce(
-                    (intent_payload->>'collateral')::numeric,
-                    (intent_payload->>'strike')::numeric * 100 *
-                    (intent_payload->>'qty')::int
-                )
+                (intent_payload->>'strike')::numeric * 100 *
+                (intent_payload->>'qty')::int
             ), 0) as total
               from orders
              where submitted_at >= $1
-               and action in ('open_short_put', 'open_covered_call')
+               and action = 'open_short_put'
                and status in ('submitted', 'filled')
             """,
             since,
