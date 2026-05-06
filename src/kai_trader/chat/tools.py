@@ -603,7 +603,14 @@ async def _system_pulse() -> dict[str, Any]:
 # ---------- propose_change ----------
 
 
-_VALID_KINDS = {"order", "strategy_param", "watchlist_edit"}
+# Order proposals are deliberately rejected here because the apply step
+# (approvals.applier._apply_order) is a stub: approving one would update
+# decision_log but never reach the broker, leaving the operator with the
+# false impression that a trade was placed. Until that path is wired
+# end-to-end, ``order`` proposals fail at the entry point and the
+# operator is told to use the slash commands (/trade_now, /close,
+# /flag) for any action that should hit Alpaca.
+_VALID_KINDS = {"strategy_param", "watchlist_edit"}
 
 
 async def _current_state_for(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -647,6 +654,15 @@ async def _propose_change(
     reason: str,
     proposed_by: int,
 ) -> dict[str, Any]:
+    if kind == "order":
+        return {
+            "error": (
+                "order proposals are not accepted via chat. The apply path "
+                "is not wired to the broker, so an approval would not place "
+                "a trade. Use /trade_now, /close, or /flag for actions that "
+                "must reach Alpaca."
+            )
+        }
     if kind not in _VALID_KINDS:
         return {"error": f"kind must be one of {sorted(_VALID_KINDS)}"}
     if not isinstance(payload, dict):
@@ -837,7 +853,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "kind": {
                     "type": "string",
-                    "enum": ["order", "strategy_param", "watchlist_edit"],
+                    "enum": ["strategy_param", "watchlist_edit"],
                 },
                 "payload": {"type": "object"},
                 "reason": {

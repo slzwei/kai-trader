@@ -35,19 +35,24 @@ def _pending(
     )
 
 
-async def test_apply_order_writes_decision_log_stub() -> None:
+async def test_apply_order_refuses_with_not_implemented() -> None:
+    """B3: order proposals cannot reach the broker via approvals.
+
+    The chat layer rejects them at the entry point; this asserts the
+    defence-in-depth refusal at the applier layer for any historical
+    pending_changes row whose kind='order' sits over from before the
+    chat-layer gate landed.
+    """
     record = AsyncMock(return_value="dec-1")
     with patch(
         "kai_trader.approvals.applier.record_decision", record
     ):
-        out = await apply_pending(
-            _pending(kind="order", payload={"symbol": "SPY", "qty": 1})
-        )
-    assert out["stub"] is True
-    record.assert_awaited_once()
-    call = record.await_args
-    assert call.kwargs["kind"] == "order"
-    assert call.kwargs["outputs"]["stub"] is True
+        with pytest.raises(NotImplementedError, match="order proposals"):
+            await apply_pending(
+                _pending(kind="order", payload={"symbol": "SPY", "qty": 1})
+            )
+    # No decision_log row should be written for a refused order.
+    record.assert_not_awaited()
 
 
 async def test_apply_strategy_param_calls_update_sleeve() -> None:
