@@ -306,6 +306,99 @@ async def test_latest_submission_at_per_symbol_empty_when_no_rows() -> None:
     assert result == {}
 
 
+# ------------- B1 targeted lookups -------------
+
+
+async def test_latest_filled_csps_for_option_symbols_returns_rows() -> None:
+    pool = _fake_pool()
+    pool._conn.fetch = AsyncMock(return_value=[
+        _row(
+            id="csp-1",
+            option_symbol="AMZN260506P00250000",
+            symbol="AMZN",
+            action="open_short_put",
+            status="filled",
+            filled_avg_price=Decimal("1.10"),
+        ),
+    ])
+
+    with patch(
+        "kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)
+    ):
+        rows = await orders.latest_filled_csps_for_option_symbols(
+            ["AMZN260506P00250000", "SPY260505P00500000"]
+        )
+
+    assert len(rows) == 1
+    assert rows[0].option_symbol == "AMZN260506P00250000"
+    args, _ = pool._conn.fetch.await_args
+    sql = args[0]
+    # Targeted query proves we did not fall back to a full scan.
+    assert "distinct on (option_symbol)" in sql
+    assert "action = 'open_short_put'" in sql
+    assert "status = 'filled'" in sql
+    assert args[1] == ["AMZN260506P00250000", "SPY260505P00500000"]
+
+
+async def test_latest_filled_csps_empty_input_skips_db() -> None:
+    pool = _fake_pool()
+    pool._conn.fetch = AsyncMock(return_value=[])
+
+    with patch(
+        "kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)
+    ):
+        rows = await orders.latest_filled_csps_for_option_symbols([])
+
+    assert rows == []
+    pool._conn.fetch.assert_not_awaited()
+
+
+async def test_filled_csps_and_assignments_for_symbols_returns_rows() -> None:
+    pool = _fake_pool()
+    pool._conn.fetch = AsyncMock(return_value=[
+        _row(
+            id="csp-1",
+            symbol="AMZN",
+            option_symbol="AMZN260506P00250000",
+            action="open_short_put",
+            status="filled",
+        ),
+        _row(
+            id="asg-1",
+            symbol="AMZN",
+            option_symbol="AMZN260506P00250000",
+            action="assignment",
+            status="filled",
+        ),
+    ])
+
+    with patch(
+        "kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)
+    ):
+        rows = await orders.filled_csps_and_assignments_for_symbols(["AMZN"])
+
+    assert len(rows) == 2
+    args, _ = pool._conn.fetch.await_args
+    sql = args[0]
+    assert "symbol = any($1::text[])" in sql
+    assert "open_short_put" in sql
+    assert "assignment" in sql
+    assert args[1] == ["AMZN"]
+
+
+async def test_filled_csps_and_assignments_empty_input_skips_db() -> None:
+    pool = _fake_pool()
+    pool._conn.fetch = AsyncMock(return_value=[])
+
+    with patch(
+        "kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)
+    ):
+        rows = await orders.filled_csps_and_assignments_for_symbols([])
+
+    assert rows == []
+    pool._conn.fetch.assert_not_awaited()
+
+
 # ------------- W-9 helpers -------------
 
 

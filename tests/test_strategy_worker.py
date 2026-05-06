@@ -159,7 +159,8 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     ))
     get_order_status = AsyncMock(return_value=_filled_status())
     pending_orders = AsyncMock(return_value=[])
-    recent_orders = AsyncMock(return_value=[])
+    latest_filled_csps_for_option_symbols = AsyncMock(return_value=[])
+    filled_csps_and_assignments_for_symbols = AsyncMock(return_value=[])
     has_failed_since = AsyncMock(return_value=False)
     record_intent = AsyncMock(return_value="intent-uuid")
     mark_submitted = AsyncMock()
@@ -223,7 +224,16 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     monkeypatch.setattr(worker_module, "check_drawdown", check_drawdown)
     monkeypatch.setattr(worker_module, "evaluate_rolls", evaluate_rolls)
     monkeypatch.setattr(worker_module, "submit_short_call", submit_short_call)
-    monkeypatch.setattr(worker_module, "recent_orders", recent_orders)
+    monkeypatch.setattr(
+        worker_module,
+        "latest_filled_csps_for_option_symbols",
+        latest_filled_csps_for_option_symbols,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "filled_csps_and_assignments_for_symbols",
+        filled_csps_and_assignments_for_symbols,
+    )
     monkeypatch.setattr(worker_module, "has_failed_since", has_failed_since)
     monkeypatch.setattr(worker_module, "record_assignment", record_assignment)
     monkeypatch.setattr(worker_module, "get_earnings_status", get_earnings_status)
@@ -705,7 +715,9 @@ async def test_tick_records_assignment_when_shares_appear(
     _patch_dependencies["list_long_equity_positions"].return_value = [
         _equity_position()
     ]
-    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    _patch_dependencies["filled_csps_and_assignments_for_symbols"].return_value = [
+        _filled_csp_for_amzn()
+    ]
     _patch_dependencies["get_chain"].return_value = [_call_contract()]
 
     summary = await worker_module.StrategyWorker().tick()
@@ -729,7 +741,9 @@ async def test_tick_submits_covered_call_against_held_shares(
     _patch_dependencies["list_long_equity_positions"].return_value = [
         _equity_position()
     ]
-    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    _patch_dependencies["filled_csps_and_assignments_for_symbols"].return_value = [
+        _filled_csp_for_amzn()
+    ]
     _patch_dependencies["get_chain"].return_value = [_call_contract()]
 
     summary = await worker_module.StrategyWorker().tick()
@@ -755,7 +769,7 @@ async def test_tick_skips_cc_when_no_shares_held(
     }
     _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
     _patch_dependencies["list_long_equity_positions"].return_value = []
-    _patch_dependencies["recent_orders"].return_value = []
+    _patch_dependencies["filled_csps_and_assignments_for_symbols"].return_value = []
     _patch_dependencies["get_chain"].return_value = [_call_contract()]
 
     summary = await worker_module.StrategyWorker().tick()
@@ -817,7 +831,9 @@ async def test_tick_submits_profit_take_when_threshold_hit(
     _patch_dependencies["list_short_option_positions"].return_value = [
         _short_put_position_for_amzn()
     ]
-    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    _patch_dependencies["latest_filled_csps_for_option_symbols"].return_value = [
+        _filled_csp_for_amzn()
+    ]
     _patch_dependencies["get_chain"].return_value = [_put_chain_at_threshold()]
 
     summary = await worker_module.StrategyWorker().tick()
@@ -845,7 +861,9 @@ async def test_tick_skips_profit_take_below_threshold(
     _patch_dependencies["list_short_option_positions"].return_value = [
         _short_put_position_for_amzn()
     ]
-    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    _patch_dependencies["latest_filled_csps_for_option_symbols"].return_value = [
+        _filled_csp_for_amzn()
+    ]
     # Ask of 0.80 is well above the 0.55 threshold (50% of 1.10).
     above_threshold = OptionContract(
         symbol="AMZN260506P00250000",
@@ -887,7 +905,9 @@ async def test_tick_skips_profit_take_when_kill_switch_engaged(
     _patch_dependencies["list_short_option_positions"].return_value = [
         _short_put_position_for_amzn()
     ]
-    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    _patch_dependencies["latest_filled_csps_for_option_symbols"].return_value = [
+        _filled_csp_for_amzn()
+    ]
     _patch_dependencies["get_chain"].return_value = [_put_chain_at_threshold()]
 
     await worker_module.StrategyWorker().tick()
@@ -987,7 +1007,9 @@ async def test_tick_summary_includes_open_positions(
     _patch_dependencies["list_short_option_positions"].return_value = [
         _short_put_position_for_amzn()  # 1 contract AMZN P250 = $25k
     ]
-    _patch_dependencies["recent_orders"].return_value = [_filled_csp_for_amzn()]
+    _patch_dependencies["latest_filled_csps_for_option_symbols"].return_value = [
+        _filled_csp_for_amzn()
+    ]
 
     summary = await worker_module.StrategyWorker().tick()
 
