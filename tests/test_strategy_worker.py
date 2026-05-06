@@ -310,7 +310,7 @@ async def test_tick_submits_when_flags_green(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "Submitted: 1" in summary
+    assert "Opened 1 new" in summary
     assert "SPY P50" in summary
     _patch_dependencies["record_intent"].assert_awaited_once()
     _patch_dependencies["submit_short_put"].assert_awaited_once()
@@ -348,7 +348,7 @@ async def test_tick_skipped_intent_records_skipped_status(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "Skipped:   1" in summary
+    assert "1 candidate(s) skipped" in summary
     _patch_dependencies["mark_submitted"].assert_not_awaited()
     _patch_dependencies["mark_status"].assert_awaited_once()
     args = _patch_dependencies["mark_status"].await_args
@@ -375,7 +375,8 @@ async def test_tick_failed_intent_records_failure(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "Failed:    1" in summary
+    assert "1 failed" in summary  # headline
+    assert "1 submission(s) failed" in summary  # body
     args = _patch_dependencies["mark_status"].await_args
     assert args.args[1] == "failed"
     # The exception detail must be persisted, not just the generic reason.
@@ -400,7 +401,7 @@ async def test_tick_skips_intent_with_prior_same_day_failure(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "Skipped:   1" in summary
+    assert "1 candidate(s) skipped" in summary
     _patch_dependencies["record_intent"].assert_not_awaited()
     _patch_dependencies["submit_short_put"].assert_not_awaited()
     _patch_dependencies["mark_status"].assert_not_awaited()
@@ -543,7 +544,8 @@ async def test_tick_executes_rolls_when_flags_green(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "1 rolled, 0 held" in summary
+    assert "1 rolled" in summary
+    assert "Rolled 1 position(s)" in summary
     # Two record_intent calls: one for the close, one for the new short put.
     assert _patch_dependencies["record_intent"].await_count == 2
     _patch_dependencies["close_position"].assert_awaited_once_with("SPY")
@@ -617,7 +619,8 @@ async def test_tick_logs_held_rolls_without_executing(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "0 rolled, 1 held" in summary
+    assert "Watching SPY" in summary
+    assert "Holding 1 challenged" in summary
     _patch_dependencies["close_position"].assert_not_awaited()
 
 
@@ -722,7 +725,7 @@ async def test_tick_records_assignment_when_shares_appear(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "Assigned:  1 new" in summary
+    assert "1 new assignment" in summary
     _patch_dependencies["record_assignment"].assert_awaited_once()
 
 
@@ -748,7 +751,7 @@ async def test_tick_submits_covered_call_against_held_shares(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "CCs:" in summary
+    assert "covered call" in summary
     assert "AMZN C260" in summary
     _patch_dependencies["submit_short_call"].assert_awaited_once()
     submit_args = _patch_dependencies["submit_short_call"].await_args
@@ -774,7 +777,7 @@ async def test_tick_skips_cc_when_no_shares_held(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "CCs:" not in summary
+    assert "covered call" not in summary
     _patch_dependencies["submit_short_call"].assert_not_awaited()
     _patch_dependencies["record_assignment"].assert_not_awaited()
 
@@ -838,7 +841,7 @@ async def test_tick_submits_profit_take_when_threshold_hit(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "Profit-take: 1 closed" in summary
+    assert "Closed 1 position for profit" in summary
     _patch_dependencies["submit_buy_to_close"].assert_awaited_once()
     submit_args = _patch_dependencies["submit_buy_to_close"].await_args
     assert submit_args.kwargs["option_symbol"] == "AMZN260506P00250000"
@@ -884,7 +887,8 @@ async def test_tick_skips_profit_take_below_threshold(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "Profit-take" not in summary
+    assert "closed for profit" not in summary
+    assert "Closed " not in summary
     _patch_dependencies["submit_buy_to_close"].assert_not_awaited()
 
 
@@ -917,85 +921,11 @@ async def test_tick_skips_profit_take_when_kill_switch_engaged(
 # ------------- open positions surfaced in tick summary -------------
 
 
-def test_format_open_positions_lines_empty_returns_empty() -> None:
-    from kai_trader.strategy.worker import _format_open_positions_lines
-    assert _format_open_positions_lines([], Decimal("100000")) == []
-
-
-def test_format_open_positions_lines_renders_short_puts() -> None:
-    from kai_trader.broker.alpaca import PositionSnapshot
-    from kai_trader.strategy.worker import _format_open_positions_lines
-
-    positions = [
-        PositionSnapshot(
-            symbol="AMZN260506P00250000",
-            qty=Decimal("-2"),
-            side="short",
-            avg_entry_price=Decimal("4.55"),
-            current_price=Decimal("5.05"),
-            market_value=None,
-            unrealized_pl=None,
-            unrealized_intraday_pl=None,
-        ),
-        PositionSnapshot(
-            symbol="AVGO260506P00400000",
-            qty=Decimal("-1"),
-            side="short",
-            avg_entry_price=Decimal("6.0"),
-            current_price=Decimal("7.1"),
-            market_value=None,
-            unrealized_pl=None,
-            unrealized_intraday_pl=None,
-        ),
-    ]
-    out = _format_open_positions_lines(positions, Decimal("99686"))
-    text = "\n".join(out)
-    assert "Open shorts:" in text
-    assert "AMZN P250 x2" in text
-    assert "AVGO P400 x1" in text
-    # 2 * $250 * 100 = $50,000; 1 * $400 * 100 = $40,000
-    assert "USD 50,000.00" in text
-    assert "USD 40,000.00" in text
-    # Total committed $90,000; cap = 70% * $99,686 = $69,780.20
-    assert "Committed: USD 90,000.00" in text
-    assert "USD 69,780.20" in text
-
-
-def test_format_open_positions_skips_calls_and_invalid_symbols() -> None:
-    from kai_trader.broker.alpaca import PositionSnapshot
-    from kai_trader.strategy.worker import _format_open_positions_lines
-
-    positions = [
-        PositionSnapshot(  # short call (skip)
-            symbol="AMZN260506C00260000",
-            qty=Decimal("-1"),
-            side="short",
-            avg_entry_price=Decimal("1.0"),
-            current_price=None,
-            market_value=None,
-            unrealized_pl=None,
-            unrealized_intraday_pl=None,
-        ),
-        PositionSnapshot(  # not OCC (skip)
-            symbol="AMZN",
-            qty=Decimal("-100"),
-            side="short",
-            avg_entry_price=Decimal("250"),
-            current_price=None,
-            market_value=None,
-            unrealized_pl=None,
-            unrealized_intraday_pl=None,
-        ),
-    ]
-    out = _format_open_positions_lines(positions, Decimal("100000"))
-    assert out == []  # nothing valid to render
-
-
 async def test_tick_summary_includes_open_positions(
     monkeypatch: pytest.MonkeyPatch,
     _patch_dependencies: dict[str, AsyncMock],
 ) -> None:
-    """When short puts exist, the tick body shows them with committed-vs-cap."""
+    """When short puts exist, the tick surfaces them in Open positions."""
     monkeypatch.setattr(
         worker_module, "get_clock_snapshot",
         AsyncMock(return_value=_clock(is_open=True)),
@@ -1013,9 +943,13 @@ async def test_tick_summary_includes_open_positions(
 
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "Open shorts:" in summary
-    assert "AMZN P250 x1" in summary
-    assert "Committed:" in summary
+    # New format: Open positions section + per-row label parts.
+    assert "Open positions" in summary
+    assert "AMZN" in summary
+    assert "$250" in summary
+    assert "put" in summary
+    # Account section replaces the old "Committed:" line.
+    assert "In trades" in summary
 
 
 # ------------- W-9 post-fill delta verification -------------

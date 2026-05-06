@@ -26,7 +26,7 @@ import asyncio
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from kai_trader.bot.formatting import bold, format_money, format_strike, header, pre
+from kai_trader.bot.formatting import format_sgt_timestamp
 from kai_trader.broker.alpaca import (
     PositionSnapshot,
     SubmitResult,
@@ -41,6 +41,7 @@ from kai_trader.broker.alpaca import (
     submit_short_put,
 )
 from kai_trader.broker.options_data import get_chain, parse_occ_symbol
+from kai_trader.config import get_settings
 from kai_trader.db.orders import (
     OrderRow,
     OrderStatus,
@@ -63,7 +64,6 @@ from kai_trader.observability.heartbeat import ping_heartbeat
 from kai_trader.strategy.assignment import detect_assignments, record_assignment
 from kai_trader.strategy.candidates import (
     COOLDOWN_MINUTES,
-    TOTAL_DEPLOYMENT_CAP_PCT,
     TradeIntent,
     build_intents_with_diagnostics,
 )
@@ -78,6 +78,12 @@ from kai_trader.strategy.earnings import get_earnings_status
 from kai_trader.strategy.iv_rv import compute_realized_vol_30d
 from kai_trader.strategy.profit_take import CloseIntent, evaluate_profit_takes
 from kai_trader.strategy.regime import RegimeSnapshot, compute_and_record
+from kai_trader.strategy.render import (
+    TickRenderInputs,
+    render_kill_switch,
+    render_market_closed,
+    render_tick,
+)
 from kai_trader.strategy.rolls import RollIntent, evaluate_rolls
 
 _log = get_logger(__name__)
@@ -92,46 +98,6 @@ _TERMINAL_ALPACA_STATUSES = {"filled", "canceled", "expired", "rejected"}
 # risk_off, and a 0.10 drift means the contract is materially closer to
 # the money than the rule book intended.
 DELTA_TOLERANCE = Decimal("0.10")
-
-
-def _format_open_positions_lines(
-    short_puts: list[PositionSnapshot],
-    equity: Decimal,
-) -> list[str]:
-    """Render open short puts + committed-vs-total-cap as tick body lines.
-
-    Returns an empty list when nothing is open so the tick stays compact.
-    Output is monospace-friendly inside a <pre> block.
-    """
-    if not short_puts:
-        return []
-    lines: list[str] = ["Open shorts:"]
-    total = Decimal("0")
-    for p in short_puts:
-        try:
-            underlying, _exp, opt_type, strike = parse_occ_symbol(p.symbol)
-        except ValueError:
-            continue
-        if opt_type != "put":
-            continue
-        qty = abs(p.qty)
-        if qty <= 0:
-            continue
-        collateral = strike * Decimal("100") * qty
-        total += collateral
-        lines.append(
-            f"  {underlying} P{format_strike(strike)} x{int(qty)}  "
-            f"{format_money(collateral)}"
-        )
-    if total == 0:
-        return []
-    cap = equity * TOTAL_DEPLOYMENT_CAP_PCT
-    pct = (total / cap * Decimal("100")).quantize(Decimal("1")) if cap > 0 else Decimal("0")
-    lines.append(
-        f"Committed: {format_money(total)} of {format_money(cap)} cap ({pct}%)"
-    )
-    lines.append("")
-    return lines
 
 
 def _format_error_text(result: SubmitResult) -> str | None:
@@ -199,11 +165,13 @@ class StrategyWorker:
         # filled overnight should be reflected on Monday morning.
         reconciled = await self._reconcile_pending()
 
+        settings = get_settings()
         clock = await get_clock_snapshot()
         if not clock.is_open:
-            summary = (
-                f"Market closed; reconciled {reconciled} open orders. "
-                f"Next open: {clock.next_open.isoformat()}."
+            summary = render_market_closed(
+                timestamp_label=format_sgt_timestamp(settings.timezone),
+                reconciled=reconciled,
+                next_open_iso=clock.next_open.isoformat(),
             )
             _log.info("strategy.tick.skipped_market_closed", reconciled=reconciled)
             return summary
@@ -223,16 +191,16 @@ class StrategyWorker:
             flags = await get_all_flags()
 
         if flags.get("kill_switch", False):
-            note = (
-                f"Reconciled {reconciled} open orders. "
-                "No new candidates evaluated."
+            summary = render_kill_switch(
+                timestamp_label=format_sgt_timestamp(settings.timezone),
+                reconciled=reconciled,
+                drawdown_pct=(
+                    dd_check.drawdown_pct if dd_check.breached else None
+                ),
+                high_water_mark=(
+                    dd_check.high_water_mark if dd_check.breached else None
+                ),
             )
-            if dd_check.breached:
-                note += (
-                    f" Drawdown {dd_check.drawdown_pct:.2f}% from "
-                    f"{dd_check.high_water_mark}."
-                )
-            summary = f"{bold('Kill switch engaged')}\n{note}"
             await enqueue(summary, "alert", channel="telegram")
             _log.info("strategy.tick.kill_switch_engaged", reconciled=reconciled)
             return summary
@@ -351,61 +319,31 @@ class StrategyWorker:
             else:
                 cc_skipped.append(label)
 
-        rolled = sum(1 for r in rolls if r.reason == "rolled")
-        held = len(rolls) - rolled
-        sub_line = (
-            f"Submitted: {len(submitted)}"
-            + (f" ({', '.join(submitted)})" if submitted else "")
-        )
-        skip_line = (
-            f"Skipped:   {len(skipped)}"
-            + (f" ({', '.join(skipped)})" if skipped else "")
-        )
-        fail_line = (
-            f"Failed:    {len(failed)}"
-            + (f" ({', '.join(failed)})" if failed else "")
-        )
-        body_lines = [
-            *_format_open_positions_lines(existing_shorts, account.equity),
-            f"Reconciled: {reconciled} open orders.",
-            f"Rolls:     {rolled} rolled, {held} held",
-            sub_line,
-            skip_line,
-            fail_line,
-        ]
-        if profit_take_closes:
-            body_lines.append(
-                f"Profit-take: {profit_take_closes} closed at threshold"
+        summary = render_tick(
+            TickRenderInputs(
+                timestamp_label=format_sgt_timestamp(settings.timezone),
+                regime=regime.regime,
+                vix=regime.vix,
+                regime_transitioned=transitioned,
+                equity=account.equity,
+                last_equity=account.last_equity,
+                short_puts=existing_shorts,
+                long_equity=held_equity,
+                reconciled=reconciled,
+                rolls=rolls,
+                submitted=submitted,
+                skipped=skipped,
+                failed=failed,
+                profit_take_closes=profit_take_closes,
+                assignments_recorded=assignments_recorded,
+                cc_submitted=cc_submitted,
+                cc_skipped=cc_skipped,
+                cc_failed=cc_failed,
+                diagnostic_warnings=diagnostics.warning_lines(),
+                cc_diagnostic_warnings=call_diagnostics.warning_lines(),
+                today=today,
             )
-        if assignments_recorded:
-            body_lines.append(
-                f"Assigned:  {assignments_recorded} new (shares now held)"
-            )
-        cc_total = len(cc_submitted) + len(cc_skipped) + len(cc_failed)
-        if cc_total > 0:
-            cc_line = (
-                f"CCs:       submitted {len(cc_submitted)}"
-                + (f" ({', '.join(cc_submitted)})" if cc_submitted else "")
-            )
-            body_lines.append(cc_line)
-            if cc_skipped:
-                body_lines.append(
-                    f"CCs skipped: {len(cc_skipped)} ({', '.join(cc_skipped)})"
-                )
-            if cc_failed:
-                body_lines.append(
-                    f"CCs failed:  {len(cc_failed)} ({', '.join(cc_failed)})"
-                )
-        for warning in diagnostics.warning_lines():
-            body_lines.append(f"Warning:   {warning}")
-        for warning in call_diagnostics.warning_lines():
-            body_lines.append(f"CC warn:   {warning}")
-        subtitle = (
-            f"regime={regime.regime} · VIX {regime.vix:.2f} · equity {account.equity}"
         )
-        if transitioned:
-            subtitle += " · regime changed"
-        summary = header("Strategy Tick", subtitle) + "\n\n" + pre("\n".join(body_lines))
         await enqueue(summary, "info", channel="telegram")
         _log.info(
             "strategy.tick.completed",
