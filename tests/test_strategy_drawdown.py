@@ -13,7 +13,11 @@ from kai_trader.strategy import drawdown
 
 
 def _snap(equity: Decimal, days_ago: int = 0) -> StoredSnapshot:
-    when = datetime(2026, 4, 27, 14, tzinfo=UTC) - timedelta(days=days_ago)
+    # Anchor to ``now`` so the snapshot always falls inside the 7-day
+    # drawdown lookback regardless of when the suite runs. The B9 fix
+    # changed the cutoff from "snapshots[0].timestamp - 7d" to
+    # "now - 7d", which made hard-coded calendar fixtures age out.
+    when = datetime.now(UTC) - timedelta(days=days_ago)
     return StoredSnapshot(
         id=f"row-{days_ago}",
         captured_at=when,
