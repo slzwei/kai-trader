@@ -44,14 +44,15 @@ from kai_trader.broker.options_data import get_chain, parse_occ_symbol
 from kai_trader.db.orders import (
     OrderRow,
     OrderStatus,
+    filled_csps_and_assignments_for_symbols,
     has_failed_since,
+    latest_filled_csps_for_option_symbols,
     latest_submission_at_per_symbol,
     mark_actual_delta,
     mark_status,
     mark_submitted,
     new_deployment_collateral_since,
     pending_orders,
-    recent_orders,
     record_intent,
 )
 from kai_trader.db.sleeve_config import SleeveConfig, get_all_sleeves
@@ -605,7 +606,9 @@ class StrategyWorker:
         if not shorts:
             return 0
         try:
-            window = await recent_orders(limit=200)
+            window = await latest_filled_csps_for_option_symbols(
+                [p.symbol for p in shorts]
+            )
         except Exception as exc:
             _log.warning("strategy.profit_take.orders_fetch_failed", error=str(exc))
             return 0
@@ -681,10 +684,15 @@ class StrategyWorker:
             return 0
         if not held:
             return 0
-        # Pull a window of recent orders large enough to cover any open
-        # CSP plus prior assignment audit rows for those symbols.
+        # Pull only filled-CSP and prior-assignment rows for the symbols
+        # we currently hold. The previous limit-200 scan silently stopped
+        # detecting assignments once the originating CSP scrolled past
+        # row 200; the targeted query stays correct regardless of how
+        # many unrelated orders sit in the table.
         try:
-            window = await recent_orders(limit=200)
+            window = await filled_csps_and_assignments_for_symbols(
+                [p.symbol for p in held]
+            )
         except Exception as exc:
             _log.warning("strategy.assignments.orders_fetch_failed", error=str(exc))
             return 0

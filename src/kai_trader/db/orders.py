@@ -287,6 +287,76 @@ async def new_deployment_collateral_since(since: datetime) -> Decimal:
     return Decimal(str(total))
 
 
+async def latest_filled_csps_for_option_symbols(
+    option_symbols: list[str],
+) -> list[OrderRow]:
+    """Latest filled ``open_short_put`` row for each option symbol.
+
+    Profit-take used to scan ``recent_orders(limit=200)`` to find the
+    originating credit. With a 30-name pool and 5-minute ticks the
+    table can scroll past 200 rows in 1-2 active days, after which
+    profit-take silently stopped firing on contracts whose source CSP
+    had aged out. This helper queries by option symbol so the lookup
+    cost stays constant in total order volume.
+
+    Returns one row per ``option_symbol`` (the most recent fill);
+    contracts without a filled CSP in the table are simply absent. An
+    empty input returns ``[]`` without touching the DB.
+    """
+    if not option_symbols:
+        return []
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select distinct on (option_symbol) *
+              from orders
+             where option_symbol = any($1::text[])
+               and action = 'open_short_put'
+               and status = 'filled'
+               and filled_avg_price is not null
+             order by option_symbol,
+                      filled_at desc nulls last,
+                      created_at desc
+            """,
+            option_symbols,
+        )
+    return [_row_to_order(dict(row)) for row in rows]
+
+
+async def filled_csps_and_assignments_for_symbols(
+    symbols: list[str],
+) -> list[OrderRow]:
+    """Filled ``open_short_put`` + ``assignment`` rows for the given underlyings.
+
+    Assignment detection used to scan ``recent_orders(limit=200)`` for
+    the same reason as profit-take, with the same silent failure mode
+    once the originating CSP scrolled past row 200. This helper returns
+    only the rows the matcher actually needs (filled puts and prior
+    assignments) for the symbols currently held, regardless of overall
+    order volume.
+
+    Empty input returns ``[]`` without touching the DB.
+    """
+    if not symbols:
+        return []
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select * from orders
+             where symbol = any($1::text[])
+               and (
+                 (action = 'open_short_put' and status = 'filled')
+                 or action = 'assignment'
+               )
+             order by created_at desc
+            """,
+            symbols,
+        )
+    return [_row_to_order(dict(row)) for row in rows]
+
+
 async def latest_submission_at_per_symbol(
     since: datetime,
 ) -> dict[str, datetime]:
