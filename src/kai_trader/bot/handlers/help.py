@@ -32,6 +32,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/close", "stage a close on a held position; confirm with /close_confirm"),
     ("/close_confirm", "confirm a staged /close within 30 seconds"),
     ("/decisions", "applied changes from chat approvals, /decisions N for last N"),
+    ("/dlq", "notifications stuck after retries, last 7 days"),
 ]
 
 

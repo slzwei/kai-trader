@@ -27,6 +27,7 @@ from kai_trader.bot.handlers import (
     chat,
     close,
     decisions,
+    dlq,
     flag,
     flags,
     health,
@@ -139,6 +140,7 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CommandHandler("close", close.handle_close))
     app.add_handler(CommandHandler("close_confirm", close.handle_confirm))
     app.add_handler(CommandHandler("decisions", decisions.handle))
+    app.add_handler(CommandHandler("dlq", dlq.handle))
 
     # Free-form text from the owner is routed to the conversational
     # chat handler. Slash commands are matched by the CommandHandlers
