@@ -54,6 +54,7 @@ from kai_trader.events.dispatcher import EventDispatcher, build_owner_send
 from kai_trader.logging import configure_logging, get_logger
 from kai_trader.notifications.worker import NotificationWorker
 from kai_trader.observability.daily_report import DailyReportWorker
+from kai_trader.observability.dependency_probe import assert_dependencies_loadable
 from kai_trader.observability.equity_chart import WeeklyEquityChartWorker
 from kai_trader.observability.memory_profile import (
     MemoryProfileWorker,
@@ -149,6 +150,11 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
     global _memory_profile_worker, _snapshot_worker, _daily_report_worker
     global _weekly_chart_worker
+
+    # Refuse to start when a required wheel went missing. lxml has
+    # done this once already; surface that class of failure at boot
+    # rather than at the first time the broken code path runs.
+    assert_dependencies_loadable()
 
     # W-7: enable allocation tracking before the bot starts opening
     # connections so the snapshot worker captures every long-lived
