@@ -53,6 +53,26 @@ def format_signed_money(amount: Decimal, *, currency: str = "USD") -> str:
     return f"{sign}{currency} {body}"
 
 
+def format_strike(strike: Decimal) -> str:
+    """Render a strike compactly while preserving half-strike precision.
+
+    Whole strikes show as integers (``50``), fractional strikes drop
+    trailing zeros (``50.5``, not ``50.500``; ``50.25``). Critical
+    distinction from ``f"{strike:.0f}"``: a $50.50 contract must not
+    display as $50, because the operator was checking the collateral
+    arithmetic against the rendered strike and the gap was confusing.
+    OCC encodes strikes with three trailing decimals (``00050500``
+    -> ``Decimal('50.500')``) so plain ``str(strike)`` keeps those
+    zeros; this helper trims them.
+    """
+    if strike == strike.to_integral_value():
+        return str(int(strike))
+    text = format(strike, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
 # ----- HTML formatting helpers -----
 #
 # Output is parsed by Telegram in HTML mode. All text that came from

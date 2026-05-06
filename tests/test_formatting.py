@@ -10,6 +10,7 @@ from kai_trader.bot.formatting import (
     format_money,
     format_sgt_timestamp,
     format_signed_money,
+    format_strike,
     now_in,
     render_kv,
 )
@@ -69,3 +70,37 @@ def test_format_signed_money_negative() -> None:
 
 def test_format_signed_money_zero_shows_plus() -> None:
     assert format_signed_money(Decimal("0")) == "+USD 0.00"
+
+
+# ----- format_strike -----
+
+
+def test_format_strike_whole_number_drops_decimals() -> None:
+    assert format_strike(Decimal("50")) == "50"
+    # OCC encoding leaves trailing zeros, so 50 typically arrives as "50.000".
+    assert format_strike(Decimal("50.000")) == "50"
+    assert format_strike(Decimal("100.0")) == "100"
+    assert format_strike(Decimal("2500")) == "2500"
+
+
+def test_format_strike_half_strike_preserved() -> None:
+    """The bug this helper fixes: P26.5 must NOT round to P26."""
+    assert format_strike(Decimal("26.5")) == "26.5"
+    # OCC half-strike arrives as "26.500".
+    assert format_strike(Decimal("26.500")) == "26.5"
+    assert format_strike(Decimal("51.50")) == "51.5"
+
+
+def test_format_strike_quarter_strike_preserved() -> None:
+    """Some cheap underlyings have $0.25 strike granularity."""
+    assert format_strike(Decimal("3.25")) == "3.25"
+    assert format_strike(Decimal("3.250")) == "3.25"
+
+
+def test_format_strike_fractional_cents_preserved() -> None:
+    """Don't lose precision below the natural strike grid."""
+    assert format_strike(Decimal("123.456")) == "123.456"
+
+
+def test_format_strike_zero_renders_as_zero() -> None:
+    assert format_strike(Decimal("0")) == "0"

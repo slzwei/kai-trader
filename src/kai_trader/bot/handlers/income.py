@@ -40,7 +40,13 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from kai_trader.bot.auth import CommandContext
-from kai_trader.bot.formatting import format_sgt_timestamp, header, italic, pre
+from kai_trader.bot.formatting import (
+    format_sgt_timestamp,
+    format_strike,
+    header,
+    italic,
+    pre,
+)
 from kai_trader.bot.handlers._common import run_command
 from kai_trader.broker.alpaca import (
     FillActivity,
@@ -255,7 +261,7 @@ async def _format_open_exposure(
 
         underlying_label = underlying[:6]
         lines.append(
-            f"  {underlying_label:<6} P{strike} x{qty}  "
+            f"  {underlying_label:<6} P{format_strike(strike)} x{qty}  "
             f"cred {_format_money(credit)}  {mtm_str}  {dte}d"
         )
     lines.append("  " + "-" * 50)
