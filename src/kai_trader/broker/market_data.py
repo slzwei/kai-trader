@@ -5,9 +5,11 @@ chains, and historical streams arrive when the strategy code needs them.
 The underlying SDK is sync, so each call is pushed through
 ``asyncio.to_thread`` to keep the bot's event loop responsive.
 
-Free Alpaca paper accounts get the IEX feed by default; symbols not active
-on IEX may return stale or empty quotes during off-hours. That's a data
-issue, not a wrapper bug.
+All requests pin ``feed=DataFeed.SIP`` to use the full consolidated tape.
+The Algo Trader Plus subscription entitles the account to SIP; without that
+flag the SDK silently falls back to the IEX-only default, which is a thin
+slice of total US volume and gives stale or empty quotes for many symbols
+outside market hours.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import (
     StockBarsRequest,
@@ -107,7 +110,7 @@ async def get_latest_quote(symbol: str) -> QuoteSnapshot:
     """Fetch the latest bid/ask quote for ``symbol``."""
     upper = symbol.upper()
     client = _get_client()
-    request = StockLatestQuoteRequest(symbol_or_symbols=upper)
+    request = StockLatestQuoteRequest(symbol_or_symbols=upper, feed=DataFeed.SIP)
     result = await asyncio.to_thread(client.get_stock_latest_quote, request)
     if isinstance(result, dict) and upper not in result:
         raise LookupError(f"No quote returned for {upper!r}.")
@@ -141,6 +144,7 @@ async def get_daily_bars(symbol: str, lookback_days: int) -> list[DailyBar]:
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
+        feed=DataFeed.SIP,
     )
     result = await asyncio.to_thread(client.get_stock_bars, request)
     raw_bars: list[Any] = []
@@ -164,7 +168,7 @@ async def get_latest_trade(symbol: str) -> TradeSnapshot:
     """Fetch the most recent trade print for ``symbol``."""
     upper = symbol.upper()
     client = _get_client()
-    request = StockLatestTradeRequest(symbol_or_symbols=upper)
+    request = StockLatestTradeRequest(symbol_or_symbols=upper, feed=DataFeed.SIP)
     result = await asyncio.to_thread(client.get_stock_latest_trade, request)
     if isinstance(result, dict) and upper not in result:
         raise LookupError(f"No trade returned for {upper!r}.")
