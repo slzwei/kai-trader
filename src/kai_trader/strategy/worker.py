@@ -481,8 +481,19 @@ class StrategyWorker:
             )
             return "skipped"
 
-        # Use bid when present; fall back to mid (already a Decimal in the intent).
-        limit_price = intent.bid if intent.bid > 0 else intent.mid
+        # Submit at the chain mid, not the bid. Submitting at the bid is
+        # a marketable sell-limit that fills at the bid for sure but
+        # captures none of the spread. Submitting at the mid is a
+        # passive limit: it fills only if a buyer crosses the spread,
+        # which means we capture the full half-spread on every fill at
+        # the cost of some unfilled orders. Audited 2026-05-08 against
+        # 26 real production fills: with bid-priced limits, half landed
+        # below the day's first quartile (BAC 53P 41% under day median;
+        # PFE 26P 21% under). Switching to mid lifts the realistic
+        # ceiling toward the +30% backtest figure. Falls back to mid
+        # explicitly for clarity (mid was already the fallback when bid
+        # was zero or missing).
+        limit_price = intent.mid
         gating_decision = {
             "trading_enabled": flags.get("trading_enabled", False),
             "new_entries_enabled": flags.get("new_entries_enabled", False),
@@ -686,7 +697,9 @@ class StrategyWorker:
         flags: dict[str, bool],
     ) -> str:
         """Record + submit one CC intent. Returns 'submitted', 'skipped', 'failed'."""
-        limit_price = intent.bid if intent.bid > 0 else intent.mid
+        # Mirror the CSP path: submit at mid, not bid. See _submit_intent
+        # for the rationale and the fill-quality data.
+        limit_price = intent.mid
         gating_decision = {
             "trading_enabled": flags.get("trading_enabled", False),
             "new_entries_enabled": flags.get("new_entries_enabled", False),

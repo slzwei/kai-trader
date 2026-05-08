@@ -316,8 +316,11 @@ async def test_tick_submits_when_flags_green(
     _patch_dependencies["submit_short_put"].assert_awaited_once()
     _patch_dependencies["mark_submitted"].assert_awaited_once()
     submit_args = _patch_dependencies["submit_short_put"].await_args
-    # Limit price should be the contract bid.
-    assert submit_args.kwargs["limit_price"] == Decimal("1.10")
+    # Limit price should be the chain mid (passive limit, not marketable).
+    # The 2026-05-08 fill-quality audit showed bid-priced limits were
+    # capturing zero spread on average; mid-priced limits aim for +0.05
+    # better per share at the cost of some unfilled orders.
+    assert submit_args.kwargs["limit_price"] == Decimal("1.15")
     # $100k equity, per-tick deployment cap (W-4) = 10% = $10k.
     # Strike $50 = $5000 per contract → 2 contracts fit before per-tick
     # cap binds. The 15% per-name cap (W-3) would allow 3, the 40%
