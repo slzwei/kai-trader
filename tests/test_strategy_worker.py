@@ -192,6 +192,7 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     # zero/empty so the test path proceeds as if no recent activity.
     new_deployment_collateral_since = AsyncMock(return_value=Decimal("0"))
     latest_submission_at_per_symbol = AsyncMock(return_value={})
+    latest_profit_take_at_per_symbol = AsyncMock(return_value={})
     # W-8: IV/RV filter. Default RV30 returns None so the filter
     # fail-opens and tests focused on other paths are unaffected. Tests
     # that exercise the IV/RV filter can override.
@@ -246,6 +247,11 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
         worker_module,
         "latest_submission_at_per_symbol",
         latest_submission_at_per_symbol,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "latest_profit_take_at_per_symbol",
+        latest_profit_take_at_per_symbol,
     )
     monkeypatch.setattr(
         worker_module, "compute_realized_vol_30d", compute_realized_vol_30d
@@ -327,6 +333,67 @@ async def test_tick_submits_when_flags_green(
     # sleeve cap would allow 8, and MAX_CONTRACTS_PER_SYMBOL caps at
     # 10. Per-tick cap is the smallest binding constraint here.
     assert submit_args.kwargs["qty"] == 2
+
+
+async def test_tick_post_profit_take_cooldown_blocks_reentry(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Symbol that just profit-took stays out of the candidate pool."""
+    from datetime import UTC, datetime, timedelta
+
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
+    _patch_dependencies["get_chain"].return_value = [_put_contract()]
+    # Profit-take fired on SPY 2 hours ago; well inside the 4-hour
+    # post-profit-take window, so the worker should skip the entry
+    # despite the contract still being a top candidate.
+    _patch_dependencies["latest_profit_take_at_per_symbol"].return_value = {
+        "SPY": datetime.now(UTC) - timedelta(hours=2),
+    }
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+
+
+async def test_tick_premium_floor_blocks_thin_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Contract with bid below MIN_BID_PREMIUM is dropped before scoring."""
+    from datetime import date, timedelta
+
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
+    # Put with a $0.10 bid: economically too thin to justify the trade.
+    expiry = date.today() + timedelta(days=8)
+    occ = f"SPY{expiry.strftime('%y%m%d')}P00050000"
+    thin = OptionContract(
+        symbol=occ, underlying="SPY", option_type="put",
+        strike=Decimal("50"), expiration=expiry,
+        bid=Decimal("0.10"), ask=Decimal("0.14"), last=Decimal("0.12"),
+        delta=Decimal("-0.30"), gamma=Decimal("0.01"),
+        theta=Decimal("-0.05"), vega=Decimal("0.10"),
+        implied_volatility=Decimal("0.20"),
+    )
+    _patch_dependencies["get_chain"].return_value = [thin]
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
 
 
 async def test_tick_skipped_intent_records_skipped_status(

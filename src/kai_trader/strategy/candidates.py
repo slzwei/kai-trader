@@ -53,6 +53,31 @@ COOLDOWN_TICKS = 6
 TICK_INTERVAL_MINUTES = 5
 COOLDOWN_MINUTES = COOLDOWN_TICKS * TICK_INTERVAL_MINUTES
 
+# Post-profit-take cooldown. After a profit_take_close fills on a
+# symbol, refuse to re-enter that same symbol for this many minutes
+# even if it ranks highly again. The base 30-min cooldown is for
+# rapid-stacking prevention (W-4); this longer one is to prevent
+# churn-after-profit-take, where the just-closed contract still ranks
+# top in the candidate scorer because its delta and yield haven't
+# moved enough yet. Observed 2026-05-06: bot closed F 11.5P x 8 at
+# $0.09 (profit-take), then re-opened the same strike x 2 at $0.09
+# 32 minutes later, just past the base cooldown. The new entry's
+# expected return barely covered fees and risk. Four hours is enough
+# for the chain to settle, the underlying to move, or a different
+# candidate to rotate to the top of the score table.
+POST_PROFIT_TAKE_COOLDOWN_MINUTES = 240
+
+# Per-contract minimum bid floor. Refuse any candidate whose bid is
+# below this, regardless of how well it scored on yield + spread.
+# A $0.10 bid on a $20 strike is $10 of premium per contract for a
+# week of risk on $2,000 of collateral (0.5% return). After fees and
+# the assignment-tail risk that's inherent in any short put, the
+# expected value is too thin to justify the trade. The floor is a
+# coarse "is this even worth our time" filter that runs before the
+# scoring system, so contracts below the floor are dropped before
+# they can rank top by virtue of having a tight synthetic spread.
+MIN_BID_PREMIUM = Decimal("0.15")
+
 # W-3: hard 15% per-name notional ceiling. The historical per-symbol cap
 # was tiered (60% at small accounts, 15% at large) because at $50k equity
 # a single SPY contract would exceed a 15% cap and the strategy would never
@@ -352,6 +377,12 @@ def select_put_strike(
         if c.delta is None:
             continue
         if not _within_dte_band(c.expiration, today, sleeve):
+            continue
+        # Per-contract premium floor. Below MIN_BID_PREMIUM the
+        # expected return on collateral is too thin after fees and
+        # tail risk; drop the contract before delta-distance picking
+        # so a deflated-but-on-target strike doesn't get chosen.
+        if c.bid is None or c.bid < MIN_BID_PREMIUM:
             continue
         typed_candidates.append((c, c.delta))
     if not typed_candidates:

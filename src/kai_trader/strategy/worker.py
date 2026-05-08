@@ -48,6 +48,7 @@ from kai_trader.db.orders import (
     filled_csps_and_assignments_for_symbols,
     has_failed_since,
     latest_filled_csps_for_option_symbols,
+    latest_profit_take_at_per_symbol,
     latest_submission_at_per_symbol,
     mark_actual_delta,
     mark_status,
@@ -64,6 +65,7 @@ from kai_trader.observability.heartbeat import ping_heartbeat
 from kai_trader.strategy.assignment import detect_assignments, record_assignment
 from kai_trader.strategy.candidates import (
     COOLDOWN_MINUTES,
+    POST_PROFIT_TAKE_COOLDOWN_MINUTES,
     TradeIntent,
     build_intents_with_diagnostics,
 )
@@ -262,6 +264,31 @@ class StrategyWorker:
             for symbol, last_at in recent_submissions.items()
             if last_at >= cooldown_cutoff
         }
+        # Layer the longer post-profit-take cool-down on top: if a
+        # symbol just profit-took inside the last 4 hours, suppress
+        # re-entry even if the base 30-min cool-down has expired.
+        # Prevents the close-and-immediately-reopen-same-strike churn
+        # observed on F 11.5P (close $0.20 → close $0.09 → reopen
+        # $0.09 → close $0.04 over 3 days, with the bottom round-trip
+        # capturing only $10 across 2 contracts).
+        post_pt_cutoff = now_utc - timedelta(
+            minutes=POST_PROFIT_TAKE_COOLDOWN_MINUTES
+        )
+        try:
+            recent_profit_takes = await latest_profit_take_at_per_symbol(
+                post_pt_cutoff
+            )
+        except Exception as exc:
+            _log.warning(
+                "strategy.profit_take_cooldown_lookup.fetch_failed",
+                error=str(exc),
+            )
+            recent_profit_takes = {}
+        cooldown_symbols.update(
+            symbol
+            for symbol, last_at in recent_profit_takes.items()
+            if last_at >= post_pt_cutoff
+        )
 
         intents, diagnostics = await build_intents_with_diagnostics(
             regime=regime,

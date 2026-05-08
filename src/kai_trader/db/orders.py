@@ -380,3 +380,30 @@ async def latest_submission_at_per_symbol(
             since,
         )
     return {row["symbol"]: row["last_at"] for row in rows}
+
+
+async def latest_profit_take_at_per_symbol(
+    since: datetime,
+) -> dict[str, datetime]:
+    """Return the most recent ``profit_take_close`` ``filled_at`` per underlying.
+
+    Used by the post-profit-take cool-down to suppress same-symbol
+    re-entries after a profit-take, separately from the base 30-min
+    cool-down. Only filled rows count: a skipped or failed close did
+    not actually realize the profit, so the strategy should still be
+    free to enter normally on that symbol.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            select symbol, max(filled_at) as last_at
+              from orders
+             where filled_at >= $1
+               and action = 'profit_take_close'
+               and status = 'filled'
+             group by symbol
+            """,
+            since,
+        )
+    return {row["symbol"]: row["last_at"] for row in rows}
