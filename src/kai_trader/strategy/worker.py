@@ -401,6 +401,7 @@ class StrategyWorker:
             regime=regime,
             chain_fetcher=get_chain,
             today=today,
+            earnings_status=get_earnings_status,
         )
 
         for roll in rolls:

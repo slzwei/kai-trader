@@ -223,3 +223,106 @@ async def test_evaluate_rolls_returns_no_chain_match_when_no_candidate() -> None
     )
     assert len(rolls) == 1
     assert rolls[0].reason == "no_chain_match"
+
+
+async def test_evaluate_rolls_holds_when_earnings_in_new_window() -> None:
+    """A net-credit roll is refused when earnings fall in the new contract's life."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=7)
+    pos = _short_put_position("SPY260504P00050000")
+    chain = [
+        _put(strike=50, delta=-0.55, expiration=expiry, bid=2.50, ask=2.60),
+        # Net-credit candidate (would otherwise be 'rolled').
+        _put(strike=48, delta=-0.30, expiration=expiry, bid=3.00, ask=3.10),
+    ]
+    earnings_provider = AsyncMock(return_value="in_window")
+
+    rolls = await evaluate_rolls(
+        positions=[pos],
+        sleeves=[_sleeve(earnings_blackout_enabled=True)],
+        regime=_regime("risk_on"),
+        chain_fetcher=AsyncMock(return_value=chain),
+        today=today,
+        earnings_status=earnings_provider,
+    )
+
+    assert len(rolls) == 1
+    assert rolls[0].reason == "earnings_blackout"
+    # The candidate metadata is still surfaced so the operator can see
+    # what would have been the roll target.
+    assert rolls[0].new_strike == Decimal("48")
+    earnings_provider.assert_awaited_once()
+
+
+async def test_evaluate_rolls_proceeds_when_earnings_outside_window() -> None:
+    """An outside-window earnings status does not block the roll."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=7)
+    pos = _short_put_position("SPY260504P00050000")
+    chain = [
+        _put(strike=50, delta=-0.55, expiration=expiry, bid=2.50, ask=2.60),
+        _put(strike=48, delta=-0.30, expiration=expiry, bid=3.00, ask=3.10),
+    ]
+    earnings_provider = AsyncMock(return_value="outside_window")
+
+    rolls = await evaluate_rolls(
+        positions=[pos],
+        sleeves=[_sleeve(earnings_blackout_enabled=True)],
+        regime=_regime("risk_on"),
+        chain_fetcher=AsyncMock(return_value=chain),
+        today=today,
+        earnings_status=earnings_provider,
+    )
+
+    assert len(rolls) == 1
+    assert rolls[0].reason == "rolled"
+
+
+async def test_evaluate_rolls_holds_when_earnings_status_unknown() -> None:
+    """Fail-closed: unknown earnings status blocks the roll."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=7)
+    pos = _short_put_position("SPY260504P00050000")
+    chain = [
+        _put(strike=50, delta=-0.55, expiration=expiry, bid=2.50, ask=2.60),
+        _put(strike=48, delta=-0.30, expiration=expiry, bid=3.00, ask=3.10),
+    ]
+    earnings_provider = AsyncMock(side_effect=RuntimeError("yfinance is down"))
+
+    rolls = await evaluate_rolls(
+        positions=[pos],
+        sleeves=[_sleeve(earnings_blackout_enabled=True)],
+        regime=_regime("risk_on"),
+        chain_fetcher=AsyncMock(return_value=chain),
+        today=today,
+        earnings_status=earnings_provider,
+    )
+
+    assert len(rolls) == 1
+    assert rolls[0].reason == "earnings_blackout"
+
+
+async def test_evaluate_rolls_skips_earnings_check_when_sleeve_disabled() -> None:
+    """Sleeve with earnings_blackout_enabled=False bypasses the check entirely."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=7)
+    pos = _short_put_position("SPY260504P00050000")
+    chain = [
+        _put(strike=50, delta=-0.55, expiration=expiry, bid=2.50, ask=2.60),
+        _put(strike=48, delta=-0.30, expiration=expiry, bid=3.00, ask=3.10),
+    ]
+    # Sleeve has the flag off; the provider should never be called.
+    earnings_provider = AsyncMock(return_value="in_window")
+
+    rolls = await evaluate_rolls(
+        positions=[pos],
+        sleeves=[_sleeve(earnings_blackout_enabled=False)],
+        regime=_regime("risk_on"),
+        chain_fetcher=AsyncMock(return_value=chain),
+        today=today,
+        earnings_status=earnings_provider,
+    )
+
+    assert len(rolls) == 1
+    assert rolls[0].reason == "rolled"
+    earnings_provider.assert_not_awaited()

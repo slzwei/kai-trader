@@ -8,12 +8,23 @@ only roll for **net credit**: if the chain has no candidate where the
 new put's bid exceeds the existing put's ask, we hold and accept
 assignment risk rather than locking in a debit.
 
+Earnings blackout (added 2026-05-09): rolls are subject to the same
+earnings filter as new entries. Rolling a challenged put into a new
+contract whose expiration spans the underlying's next earnings is
+strictly worse than holding the original to expiry: the original has
+a known max loss (assignment cost) while the rolled-into-earnings
+position has unknown binary-event tail risk. The check fires only
+when the sleeve has ``earnings_blackout_enabled``; the data source is
+the same yfinance-backed ``earnings_status`` callable used by
+``candidates.build_intents_with_diagnostics``.
+
 Phase 3.5 evaluates rolls and surfaces the decision; the worker submits
 the close + new-open pair when execution is allowed by the system flags.
 """
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -28,9 +39,12 @@ from kai_trader.strategy.candidates import (
     _target_delta_for,
     _within_dte_band,
 )
+from kai_trader.strategy.earnings import EarningsStatus
 from kai_trader.strategy.regime import RegimeSnapshot
 
 _log = get_logger(__name__)
+
+EarningsStatusProvider = Callable[[str, date, int], Awaitable[EarningsStatus]]
 
 
 @dataclass(frozen=True)
@@ -50,7 +64,7 @@ class RollIntent:
     new_delta: Decimal | None
     new_credit: Decimal | None
     net_credit: Decimal | None
-    reason: str  # "rolled" | "no_net_credit_candidate" | "no_chain_match"
+    reason: str  # "rolled" | "no_net_credit_candidate" | "no_chain_match" | "earnings_blackout"
 
 
 def _find_current_in_chain(
@@ -113,6 +127,7 @@ async def evaluate_rolls(
     chain_fetcher: ChainFetcher,
     *,
     today: date,
+    earnings_status: EarningsStatusProvider | None = None,
 ) -> list[RollIntent]:
     """Walk open short puts; produce a RollIntent per challenged position.
 
@@ -120,6 +135,13 @@ async def evaluate_rolls(
     sleeve are silently skipped. risk_off does NOT skip rolls because
     rolling reduces risk on a challenged position; the risk_off behaviour
     only blocks new entries, not management of existing trades.
+
+    ``earnings_status`` (when supplied AND the sleeve has
+    ``earnings_blackout_enabled``) gates each roll: if earnings fall
+    inside the new candidate's life (today through new expiration) the
+    roll is held with reason ``earnings_blackout``. Fail-closed: when
+    the lookup raises or returns ``unknown``, the roll is held. When
+    no provider is supplied, the gate is bypassed (back-compat).
     """
     intents: list[RollIntent] = []
     for pos in positions:
@@ -184,6 +206,54 @@ async def evaluate_rolls(
                 )
             )
             continue
+
+        # Earnings blackout: refuse to roll into a contract whose life
+        # spans the underlying's next earnings date. Holds the original
+        # position to expiry and accepts assignment risk; that risk is
+        # bounded (max loss = strike * 100 * qty - premium received)
+        # while binary-event vol on a fresh roll is unbounded.
+        if (
+            earnings_status is not None
+            and sleeve.earnings_blackout_enabled
+        ):
+            new_dte_days = (candidate.expiration - today).days
+            try:
+                status = await earnings_status(
+                    underlying, today, max(new_dte_days, 1)
+                )
+            except Exception as exc:
+                _log.warning(
+                    "rolls.earnings_status.failed",
+                    underlying=underlying,
+                    error=str(exc),
+                )
+                status = "unknown"
+            if status != "outside_window":
+                _log.info(
+                    "rolls.earnings_blackout",
+                    underlying=underlying,
+                    new_expiration=candidate.expiration.isoformat(),
+                    status=status,
+                )
+                intents.append(
+                    RollIntent(
+                        sleeve=sleeve.sleeve,
+                        underlying=underlying,
+                        current_option_symbol=pos.symbol,
+                        current_strike=strike,
+                        current_expiration=expiration,
+                        current_delta=current.delta,
+                        close_price=close_cost,
+                        new_option_symbol=candidate.symbol,
+                        new_strike=candidate.strike,
+                        new_expiration=candidate.expiration,
+                        new_delta=candidate.delta,
+                        new_credit=candidate.bid,
+                        net_credit=None,
+                        reason="earnings_blackout",
+                    )
+                )
+                continue
 
         new_credit = candidate.bid
         net_credit = new_credit - close_cost

@@ -166,6 +166,8 @@ def _format_held_line(roll: RollIntent, today: date | None) -> str:
         why = "no profitable roll available"
     elif roll.reason == "no_chain_match":
         why = "no further-OTM strike found in chain"
+    elif roll.reason == "earnings_blackout":
+        why = "earnings inside the new contract's window; holding to expiry"
     else:
         why = roll.reason
     return (
