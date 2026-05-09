@@ -50,16 +50,37 @@ def _sleeve(
     )
 
 
+_UNSET: object = object()
+
+
 def _put(
     *,
     strike: float,
     delta: float,
     expiration: date,
-    bid: float | None = 1.10,
-    ask: float | None = 1.20,
+    bid: float | None | object = _UNSET,
+    ask: float | None | object = _UNSET,
     underlying: str = "SPY",
     iv: float = 0.18,
 ) -> OptionContract:
+    """Build an OptionContract for tests.
+
+    When ``bid`` / ``ask`` are not passed (sentinel ``_UNSET``), the
+    default scales with strike so the contract clears the new bid-
+    yield floor (P6, 2026-05-09). Default bid = 1.5% of strike, ask
+    = 1.7% of strike — produces ~0.18%/day yield at 8 DTE, ~0.13%/day
+    at 11 DTE, cleanly above the 0.10%/day production floor. Tests
+    that pass ``bid=None`` explicitly (e.g. to simulate missing
+    quotes) get the literal None they asked for.
+    """
+    if bid is _UNSET:
+        bid_resolved: float | None = float(Decimal(str(strike)) * Decimal("0.015"))
+    else:
+        bid_resolved = bid  # type: ignore[assignment]
+    if ask is _UNSET:
+        ask_resolved: float | None = float(Decimal(str(strike)) * Decimal("0.017"))
+    else:
+        ask_resolved = ask  # type: ignore[assignment]
     suffix = f"{int(strike * 1000):08d}"
     yymmdd = expiration.strftime("%y%m%d")
     return OptionContract(
@@ -68,8 +89,8 @@ def _put(
         option_type="put",
         strike=Decimal(str(strike)),
         expiration=expiration,
-        bid=Decimal(str(bid)) if bid is not None else None,
-        ask=Decimal(str(ask)) if ask is not None else None,
+        bid=Decimal(str(bid_resolved)) if bid_resolved is not None else None,
+        ask=Decimal(str(ask_resolved)) if ask_resolved is not None else None,
         last=Decimal("1.15"),
         delta=Decimal(str(delta)),
         gamma=Decimal("0.01"),
@@ -192,7 +213,14 @@ async def test_build_intents_skips_all_in_risk_off() -> None:
 
 
 async def test_build_intents_keeps_opportunistic_active_in_neutral() -> None:
-    """Phase 3.6: opportunistic stays active in neutral for premium juice."""
+    """Phase 3.6: opportunistic stays active in neutral for premium juice.
+
+    Sized at $100k with $5 strike so the per-tick deployment cap (10%
+    = $10k = 20 contracts at $500 collateral) doesn't bind before
+    both sleeves write their ceiling-bound 10 contracts. P7
+    (2026-05-09) lifted ceilings at $150k+ — using $100k keeps
+    ceiling at 10 and preserves the original test geometry.
+    """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
@@ -200,18 +228,16 @@ async def test_build_intents_keeps_opportunistic_active_in_neutral() -> None:
     # sleeve's intent is attributed to its own name.
     async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
         return [
-            _put(strike=50, delta=-0.20, expiration=expiry, underlying=symbol)
+            _put(strike=5, delta=-0.20, expiration=expiry, underlying=symbol)
         ]
 
-    # Use a $1M equity so the W-4 per-tick cap (10% = $100k) does not bind
-    # before both sleeves can produce an intent each.
     intents = await build_intents(
         regime=_regime("neutral"),
         sleeves=[
             _sleeve("index_core", whitelist=["SPY"]),
             _sleeve("opportunistic", whitelist=["NVDA"], target_pct=Decimal("0.20")),
         ],
-        account=_account(equity=1_000_000),
+        account=_account(equity=100_000),
         chain_fetcher=fetcher,
         today=today,
     )
@@ -307,7 +333,9 @@ async def test_build_intents_multi_contract_within_per_symbol_cap() -> None:
 
     Tested at $1M equity so the W-4 per-tick cap (10% = $100k) is well
     above the $15k per-name dollar cap and does not bind before the
-    per-symbol cap is reached.
+    per-symbol cap is reached. P7 (2026-05-09) lifts the contract
+    ceiling to 50 at $500k+; the test now verifies the dollar cap
+    binds before the 50-contract ceiling does at this scale.
     """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
@@ -325,10 +353,12 @@ async def test_build_intents_multi_contract_within_per_symbol_cap() -> None:
     )
     assert len(intents) == 1
     intent = intents[0]
-    # Contract ceiling MAX_CONTRACTS_PER_SYMBOL = 10 binds before the
-    # 15% per-name dollar cap (which would allow $150k / $1500 = 100).
-    assert intent.qty == 10
-    assert intent.collateral == Decimal("15000")
+    # At $1M equity, P7 sets the contract ceiling to 50 (>=$500k tier).
+    # Per-tick cap = 10% = $100k → $100k / $1500 = 66 contracts of headroom.
+    # Per-name dollar cap = 15% = $150k → 100 contracts of headroom.
+    # Contract ceiling = 50 → that's the binding constraint here.
+    assert intent.qty == 50
+    assert intent.collateral == Decimal("75000")
 
 
 async def test_build_intents_per_symbol_cap_overrides_sleeve_headroom() -> None:
@@ -1922,3 +1952,94 @@ async def test_per_name_dollar_cap_warning_uses_15pct_wording() -> None:
     warnings = diag.warning_lines()
     assert any("per-name 15% notional cap" in w for w in warnings)
     assert any("EXPENSIVE" in w for w in warnings)
+
+
+# ------------- P6: bid-yield floor -------------
+
+async def test_bid_yield_floor_blocks_thin_yield_contract() -> None:
+    """A contract whose bid/strike/dte ratio is below 0.10%/day is dropped.
+
+    Concrete production case (2026-05-07): KMI 30.5P at $0.18 bid,
+    8 DTE. bid_yield_per_day = 0.18 / 30.5 / 8 = 0.074%/day → fails
+    the 0.10%/day floor. The strategy should refuse this trade.
+    """
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(
+                strike=30.5,
+                delta=-0.30,
+                expiration=expiry,
+                bid=0.18,
+                ask=0.22,
+                underlying=symbol,
+            ),
+        ]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["KMI"])],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert intents == []
+
+
+async def test_bid_yield_floor_lets_high_yield_contract_through() -> None:
+    """A 0.30%/day yield contract clears the floor."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        # MARA-style: $11.5 strike, $0.50 bid, 8 DTE = 0.54%/day yield.
+        return [
+            _put(
+                strike=11.5,
+                delta=-0.30,
+                expiration=expiry,
+                bid=0.50,
+                ask=0.55,
+                underlying=symbol,
+            ),
+        ]
+
+    intents = await build_intents(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["MARA"])],
+        account=_account(equity=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert len(intents) == 1
+
+
+# ------------- P7: tiered MAX_CONTRACTS_PER_SYMBOL -------------
+
+def test_max_contracts_per_symbol_tier_below_150k() -> None:
+    """Small accounts retain the original 10-contract ceiling."""
+    from kai_trader.strategy.candidates import max_contracts_per_symbol
+
+    assert max_contracts_per_symbol(Decimal("25000")) == 10
+    assert max_contracts_per_symbol(Decimal("100000")) == 10
+    assert max_contracts_per_symbol(Decimal("149999")) == 10
+
+
+def test_max_contracts_per_symbol_tier_150k_to_500k() -> None:
+    """Mid-size accounts ($150k-$500k) get a 25-contract ceiling."""
+    from kai_trader.strategy.candidates import max_contracts_per_symbol
+
+    assert max_contracts_per_symbol(Decimal("150000")) == 25
+    assert max_contracts_per_symbol(Decimal("250000")) == 25
+    assert max_contracts_per_symbol(Decimal("499999")) == 25
+
+
+def test_max_contracts_per_symbol_tier_above_500k() -> None:
+    """Large accounts ($500k+) get a 50-contract ceiling."""
+    from kai_trader.strategy.candidates import max_contracts_per_symbol
+
+    assert max_contracts_per_symbol(Decimal("500000")) == 50
+    assert max_contracts_per_symbol(Decimal("1000000")) == 50
+    assert max_contracts_per_symbol(Decimal("10000000")) == 50

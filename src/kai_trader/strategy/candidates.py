@@ -31,7 +31,48 @@ _log = get_logger(__name__)
 
 
 TOTAL_DEPLOYMENT_CAP_PCT = Decimal("0.70")  # max 70% of equity in CSP collateral
-MAX_CONTRACTS_PER_SYMBOL = 10  # hard ceiling regardless of sleeve headroom
+
+# P7 (2026-05-09): MAX_CONTRACTS_PER_SYMBOL tiered by equity. The
+# original flat 10-contract ceiling was sized for $50k-$150k accounts;
+# at $200k+ it forces under-deployment on cheap names (e.g. SOFI $7
+# strike, $700/contract = $7k of the $30k per-name budget at 15%; the
+# 10-contract cap then leaves 60-70% of the per-name dollar budget
+# unused). Tiering lets larger books deploy fully without breaking the
+# small-account safety properties.
+_MAX_CONTRACTS_TIERS: tuple[tuple[Decimal, int], ...] = (
+    (Decimal("150000"), 10),
+    (Decimal("500000"), 25),
+)
+_MAX_CONTRACTS_LARGE_ACCOUNT = 50
+
+
+def max_contracts_per_symbol(equity: Decimal) -> int:
+    """Return the per-symbol contract ceiling for the given equity.
+
+    Below $150k: 10 contracts (preserves W-3 over-allocation safety
+    on small books, where 10 cheap-name contracts already saturate the
+    15% per-name dollar cap).
+
+    $150k-$500k: 25 contracts. Lifts the bottleneck on cheap-name
+    deployment at this scale; the 15% per-name dollar cap still binds
+    independently.
+
+    Above $500k: 50 contracts. Very large books only; the dollar cap
+    is the meaningful constraint and the contract ceiling exists only
+    to prevent fat-finger accidents at scale.
+    """
+    for threshold, ceiling in _MAX_CONTRACTS_TIERS:
+        if equity < threshold:
+            return ceiling
+    return _MAX_CONTRACTS_LARGE_ACCOUNT
+
+
+# Back-compat alias used by older test fixtures and by string
+# formatting in the diagnostic warning lines. The functional path
+# uses ``max_contracts_per_symbol(equity)`` directly. The constant
+# here is the floor (smallest tier) so any literal usage stays
+# conservative.
+MAX_CONTRACTS_PER_SYMBOL = 10
 
 # W-4: deployment velocity guard rails. The over-allocation incident on
 # 2026-05-01 took the book from 0% to 96% of the deployment cap in 20
@@ -67,16 +108,27 @@ COOLDOWN_MINUTES = COOLDOWN_TICKS * TICK_INTERVAL_MINUTES
 # candidate to rotate to the top of the score table.
 POST_PROFIT_TAKE_COOLDOWN_MINUTES = 240
 
-# Per-contract minimum bid floor. Refuse any candidate whose bid is
-# below this, regardless of how well it scored on yield + spread.
-# A $0.10 bid on a $20 strike is $10 of premium per contract for a
-# week of risk on $2,000 of collateral (0.5% return). After fees and
-# the assignment-tail risk that's inherent in any short put, the
-# expected value is too thin to justify the trade. The floor is a
-# coarse "is this even worth our time" filter that runs before the
-# scoring system, so contracts below the floor are dropped before
-# they can rank top by virtue of having a tight synthetic spread.
-MIN_BID_PREMIUM = Decimal("0.15")
+# P6 (2026-05-09): two-layer per-contract floor.
+#
+# Layer A: absolute fee-protection floor. OCC + ORF + SEC fees on a
+# round-trip total ~$0.08-$0.13 per contract. Below $0.05 of bid the
+# fees eat half the premium before any other friction; the trade has
+# negative expected value regardless of yield. This is a fee floor,
+# not an income filter.
+#
+# Layer B: bid-yield floor (replaces the previous absolute $0.15
+# floor that was shipped today and audited as wrong-direction for
+# income generation). The income target is 6%/month on collateral.
+# With ~70% deployment and ~5-day cycles, that requires per-day
+# yield of ~0.43%/day on average. We set the floor at 0.10%/day —
+# loose enough to pass any moderately-yielding trade (SPY-style
+# 0.30-delta 8DTE puts come in around 0.05-0.15%/day), tight enough
+# to reject the genuinely thin trades observed in production
+# (KMI 0.074%/day, KHC 0.061%/day, XLF 0.059%/day on 2026-05-07).
+# Will be tuned upward in Phase 3 once the universe is concentrated
+# to high-IV names where 0.30-0.50%/day is normal.
+MIN_BID_PREMIUM = Decimal("0.05")
+MIN_BID_YIELD_PER_DAY = Decimal("0.0010")
 
 # W-3: hard 15% per-name notional ceiling. The historical per-symbol cap
 # was tiered (60% at small accounts, 15% at large) because at $50k equity
@@ -158,6 +210,7 @@ class BuildDiagnostics:
     today_deployment_used_pct: Decimal = Decimal("0")
     today_deployment_remaining_usd: Decimal = Decimal("0")
     per_tick_cap_remaining_usd: Decimal = Decimal("0")
+    contract_ceiling: int = MAX_CONTRACTS_PER_SYMBOL
 
     def warning_lines(self) -> list[str]:
         active = [
@@ -285,7 +338,7 @@ class BuildDiagnostics:
             )
             warnings.append(
                 f"{total_skipped_ceiling} symbol(s) at per-symbol contract "
-                f"ceiling ({MAX_CONTRACTS_PER_SYMBOL}): {sample}{more}"
+                f"ceiling ({self.contract_ceiling}): {sample}{more}"
             )
             return warnings
         total_skipped_earnings = sum(
@@ -378,11 +431,19 @@ def select_put_strike(
             continue
         if not _within_dte_band(c.expiration, today, sleeve):
             continue
-        # Per-contract premium floor. Below MIN_BID_PREMIUM the
-        # expected return on collateral is too thin after fees and
-        # tail risk; drop the contract before delta-distance picking
-        # so a deflated-but-on-target strike doesn't get chosen.
+        # Two-layer per-contract floor (P6).
+        # Layer A: absolute fee-protection ($0.05 bid).
+        # Layer B: bid-yield per day floor (0.20%/day) — the trade
+        # must contribute meaningfully to the income target.
         if c.bid is None or c.bid < MIN_BID_PREMIUM:
+            continue
+        dte_days = (c.expiration - today).days
+        if dte_days <= 0:
+            continue  # already expired or settling today
+        if c.strike <= 0:
+            continue
+        bid_yield_per_day = c.bid / c.strike / Decimal(dte_days)
+        if bid_yield_per_day < MIN_BID_YIELD_PER_DAY:
             continue
         typed_candidates.append((c, c.delta))
     if not typed_candidates:
@@ -516,6 +577,7 @@ def _max_qty_for(
     total_remaining: Decimal,
     per_symbol_remaining: Decimal,
     existing_qty: int = 0,
+    contract_ceiling: int = MAX_CONTRACTS_PER_SYMBOL,
 ) -> int:
     """Compute the largest qty respecting sleeve, total, per-symbol caps.
 
@@ -523,15 +585,17 @@ def _max_qty_for(
     collateral already committed to open positions. ``existing_qty`` is
     the open short-put contract count for the candidate's underlying;
     the function caps the returned qty at
-    ``max(0, MAX_CONTRACTS_PER_SYMBOL - existing_qty)`` so the per-name
+    ``max(0, contract_ceiling - existing_qty)`` so the per-name
     contract ceiling is enforced cumulatively across ticks (W-2). The
     historical behaviour (no existing positions) is preserved when
-    ``existing_qty`` is zero.
+    ``existing_qty`` is zero. ``contract_ceiling`` defaults to the
+    base 10-contract floor; callers with equity context should pass
+    ``max_contracts_per_symbol(equity)`` to honour the P7 tier.
     """
     per_contract_collateral = contract.strike * Decimal("100")
     if per_contract_collateral <= 0:
         return 0
-    contract_remaining = max(0, MAX_CONTRACTS_PER_SYMBOL - existing_qty)
+    contract_remaining = max(0, contract_ceiling - existing_qty)
     if contract_remaining <= 0:
         return 0
     headroom = min(sleeve_remaining, total_remaining, per_symbol_remaining)
@@ -672,6 +736,9 @@ async def build_intents_with_diagnostics(
         equity * TOTAL_DEPLOYMENT_CAP_PCT - committed_total, Decimal("0")
     )
     per_symbol_cap_dollars = equity * per_symbol_cap_pct(equity)
+    # P7: per-symbol contract ceiling tiered on equity. Smaller books
+    # see 10; $150k+ books see 25; $500k+ books see 50.
+    contract_ceiling = max_contracts_per_symbol(equity)
     intents: list[TradeIntent] = []
     sleeve_diags: list[SleeveDiagnostic] = []
 
@@ -870,10 +937,12 @@ async def build_intents_with_diagnostics(
                 per_symbol_cap_dollars - committed_for_underlying, Decimal("0")
             )
             existing_qty = existing_contracts.get(contract.underlying, 0)
-            if existing_qty >= MAX_CONTRACTS_PER_SYMBOL:
+            if existing_qty >= contract_ceiling:
                 # W-2: per-symbol contract ceiling already met by held
                 # positions. Refusing here is the cumulative version of
-                # the historical per-build cap.
+                # the historical per-build cap. Ceiling is tiered by
+                # equity (P7) so the same constraint scales with the
+                # account.
                 symbols_skipped_for_contract_ceiling += 1
                 if contract.underlying not in contract_ceiling_symbols:
                     contract_ceiling_symbols.append(contract.underlying)
@@ -882,7 +951,7 @@ async def build_intents_with_diagnostics(
                     sleeve=sleeve.sleeve,
                     symbol=contract.underlying,
                     existing_qty=existing_qty,
-                    ceiling=MAX_CONTRACTS_PER_SYMBOL,
+                    ceiling=contract_ceiling,
                 )
                 continue
             qty = _max_qty_for(
@@ -891,6 +960,7 @@ async def build_intents_with_diagnostics(
                 total_remaining=total_remaining,
                 per_symbol_remaining=per_symbol_remaining,
                 existing_qty=existing_qty,
+                contract_ceiling=contract_ceiling,
             )
             if qty < 1:
                 candidates_cap_rejected += 1
@@ -1000,6 +1070,7 @@ async def build_intents_with_diagnostics(
         today_deployment_used_pct=today_used_pct,
         today_deployment_remaining_usd=per_day_remaining,
         per_tick_cap_remaining_usd=per_tick_remaining,
+        contract_ceiling=contract_ceiling,
     )
 
 
