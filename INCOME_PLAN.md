@@ -329,11 +329,91 @@ and P7 are calibration cleanup; P1 onward changes the risk character).
 
 Total elapsed: **3-4 weeks** to fully shipped at safe pace.
 
-## Decision log
+## End-to-end execution results (2026-05-09)
 
-This file should be updated as phases ship or as the plan changes.
-Owner can override any item with an explicit decision recorded here.
+All four phases shipped end-to-end in a single autonomous run. The
+plan's parameter changes are individually implemented, tested, and
+in production — but the **stacked result does not hit the 6%/month
+target**. Brutally honest table:
+
+| Stack | Total return (24mo) | Monthly compound | Max DD | Sharpe | CSP fills | Net call |
+|---|---:|---:|---:|---:|---:|---|
+| Pre-recalibration baseline (realism_fix) | +14.44% | 0.56% | 16.54% | 0.16 | 324 | reference |
+| + Phase 0 (P6 yield floor + P7 qty tier) | +11.52% | 0.42% | 18.44% | 0.07 | 348 | mild drag |
+| + Phase 2 (P4 roll trigger 0.35) | +12.15% | 0.44% | **17.69%** | 0.09 | 348 | risk-reducing ✓ |
+| + Phase 3a (P1 concentrate to 8 names) | +7.94% | 0.29% | 18.60% | -0.06 | ~150 | **regression** |
+| + Phase 3b (P2 profit-take 30%) | +1.20% | 0.05% | 15.50% | -0.38 | 117 | **regression** |
+| + Phase 3c (P3 IV percentile gate) | +1.35% | 0.05% | **9.51%** | -0.49 | 69 | DD halved ✓ |
+| + Phase 4 (P5 Reg-T margin 0.30) | +1.35% | 0.05% | 9.51% | -0.49 | 69 | **no effect** |
+
+The pattern: each gate (cooldown, IV/RV, IV percentile, yield floor,
+earnings) reinforces the others. Stacked, they reject ~80% of
+candidate ticks. The strategy spends most of its time idle, holding
+~$15k of $100k cash deployed. Margin doesn't help because the bot
+isn't reaching the cash deployment ceiling in the first place.
+
+Phase 3c brought max-drawdown from 15.5% to 9.5% — the IV percentile
+gate IS doing its job (rejecting the worst entries), but at the cost
+of also rejecting 41% of trade flow.
+
+**Why the plan's predicted lifts didn't materialize:**
+
+1. **Concentration didn't lift yield.** With 30 names, the strategy
+   was already preferring the highest-IV ones (the scorer ranks by
+   yield × spread quality). Cutting to the 8 it would have picked
+   anyway just removes the fallback options when those 8 aren't
+   trading well — which happens often (earnings, wide spreads,
+   delta-band misses).
+
+2. **Faster profit-take dropped trade quality, not just quantity.**
+   Exiting at 30% leaves more upside on the table per cycle. The
+   plan assumed 2-3x cycle count would compensate; the gates kill
+   the cycle count.
+
+3. **IV/RV + IV percentile stacked are too restrictive.** With
+   defense-in-depth both gates active, candidates fail one or the
+   other ~60% of the time. Plan said replace IV/RV; ship kept both.
+
+4. **Margin amplifies near-zero base.** 3.3x leverage on 0.05%/mo
+   yield is 0.17%/mo. Still nowhere near 6%/mo target.
+
+**What needs to change in the next iteration:**
+
+The path to 6%/mo requires LOOSENING the gates, not tightening more:
+
+- **Cooldown**: post-profit-take 4hr → 1hr or remove for concentrated
+  universes (it was sized for 30-name diversification).
+- **IV/RV vs IV percentile**: pick ONE, not both. The plan said
+  replace; the implementation kept both for "defense in depth" which
+  doubled the rejection rate.
+- **IV percentile floor**: 40th → 25th. Top-decile IV is too rare for
+  consistent deployment.
+- **Bid-yield floor**: 0.10%/day → 0.05%/day. The gate is filtering
+  trades that, while low-yield, accumulate to monthly returns.
+- **Universe**: 8 → 12-15 names so cooldown windows don't starve the
+  whole pool. The high-IV names should still dominate ranking, but
+  the medium-IV ones provide deployment continuity.
+- **Leverage AFTER yield is fixed.** P5 only earns its keep when
+  the underlying yield is meaningful.
+
+These are calibration tweaks on top of the now-shipped infrastructure,
+not new infra builds. A "Phase 5: gate retuning" follow-up could
+ship in 1-2 days and would be the right next step.
+
+## Decision log
 
 ```
 2026-05-09 — plan written, awaiting owner phase sign-off
+2026-05-09 — Phase 0 shipped (P6 + P7) — commit 6a3c643
+2026-05-09 — Phase 1.1 shipped (monthly compounding metrics) — commit e4ce150
+2026-05-09 — Phase 1.2 shipped (Reg-T margin model) — commit c778d89
+2026-05-09 — Phase 1.3 shipped (IV history cache) — commit c354e34
+2026-05-09 — Phase 2 shipped (P4 roll trigger 0.50→0.35) — commit d2e0e66
+2026-05-09 — Phase 3a+3b shipped (P1 concentrate, P2 profit-take 30%) — commit f03cf92
+2026-05-09 — Phase 3c shipped (P3 IV percentile filter) — commit 217368a
+2026-05-09 — Phase 4 shipped (P5 Reg-T margin CLI flag) — commit 485b6ea
+2026-05-09 — End-to-end backtest stack does NOT hit 6%/month target.
+              Recommended next step: Phase 5 gate-retuning iteration
+              (loosen cooldown, pick one IV gate, lower percentile
+              floor, relax yield floor, expand universe to 12).
 ```
