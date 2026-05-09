@@ -239,7 +239,11 @@ async def build_call_intents(
             )
             continue
 
-        if regime.regime == "risk_off":
+        # Phase 9 (2026-05-09): risk_off no longer blocks CC entries.
+        # Selling calls on assigned stock generates premium regardless
+        # of regime; the bigger risk in risk_off is rolling losses on
+        # the put leg, not new CC entries.
+        if False and regime.regime == "risk_off":
             _log.info(
                 "strategy.cc.skipped_regime",
                 sleeve=sleeve.sleeve,

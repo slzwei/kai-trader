@@ -47,24 +47,33 @@ _DEFAULT_SLEEVE_CONFIG: list[dict[str, Any]] = [
     {
         "sleeve": "index_core",
         "target_pct": "1.00",
-        "target_delta_put_risk_on": "-0.40",
-        "target_delta_put_neutral": "-0.30",
-        "target_delta_call": "0.30",
+        "target_delta_put_risk_on": "-0.45",
+        "target_delta_put_neutral": "-0.35",
+        "target_delta_call": "0.35",
         "target_dte_min": 7,
-        "target_dte_max": 10,
-        "profit_take_pct": "0.30",
+        "target_dte_max": 14,
+        "profit_take_pct": "0.10",
         "roll_trigger_delta": "0.35",
         "symbol_whitelist": [
             # Phase 5 (migration 025): 8 high-IV + 4 moderate-IV
             # for deployment continuity. The IV percentile gate
             # routes flow to wherever vol is rich on each tick.
+            # Phase 12: revert to Phase 8's 12-name universe.
+            # Adding 6 more names (Phase 11) diluted yield more
+            # than it helped deployment, dropping monthly return
+            # from 3.00% → 2.52%.
             "MARA", "RIOT", "SOFI", "HOOD",
             "PLTR", "MU", "SNAP", "RIVN",
             "F", "INTC", "GM", "KMI",
         ],
         "enabled": True,
+        # Phase 10: earnings filter back ON (Phase 9 dropping it
+        # produced WORSE returns — earnings blackouts protect against
+        # losing trades that eat the gains from the extra deployment).
         "earnings_blackout_enabled": True,
-        "max_new_entries_per_tick": 2,
+        # Phase 11: max_new_entries 10 → 5. Phase 10 showed 10 was
+        # too aggressive; 5 still allows good throughput on 18-name pool.
+        "max_new_entries_per_tick": 5,
     },
     {
         "sleeve": "stable_largecap",
@@ -74,7 +83,7 @@ _DEFAULT_SLEEVE_CONFIG: list[dict[str, Any]] = [
         "target_delta_call": "0.30",
         "target_dte_min": 7,
         "target_dte_max": 10,
-        "profit_take_pct": "0.30",
+        "profit_take_pct": "0.20",
         "roll_trigger_delta": "0.35",
         "symbol_whitelist": [],
         "enabled": False,
@@ -89,7 +98,7 @@ _DEFAULT_SLEEVE_CONFIG: list[dict[str, Any]] = [
         "target_delta_call": "0.30",
         "target_dte_min": 7,
         "target_dte_max": 10,
-        "profit_take_pct": "0.30",
+        "profit_take_pct": "0.20",
         "roll_trigger_delta": "0.35",
         "symbol_whitelist": [],
         "enabled": False,

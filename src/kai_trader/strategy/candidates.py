@@ -30,7 +30,12 @@ ChainFetcher = Callable[[str, date | None], Awaitable[list[OptionContract]]]
 _log = get_logger(__name__)
 
 
-TOTAL_DEPLOYMENT_CAP_PCT = Decimal("0.70")  # max 70% of equity in CSP collateral
+# Phase 12 max-leverage push: 2.50 → 4.00. With margin_factor=0.20
+# (5x leverage), $30k cash supports up to $150k face collateral.
+# The 4.00x equity cap (= $120k face on $30k) is below that cash
+# ceiling but above Phase 8's 2.50x, allowing the bot to deploy
+# more face value at higher leverage.
+TOTAL_DEPLOYMENT_CAP_PCT = Decimal("4.00")
 
 # P7 (2026-05-09): MAX_CONTRACTS_PER_SYMBOL tiered by equity. The
 # original flat 10-contract ceiling was sized for $50k-$150k accounts;
@@ -88,9 +93,13 @@ MAX_CONTRACTS_PER_SYMBOL = 10
 #     ticks (default = 30 minutes at 5-min cadence) is excluded from
 #     candidate selection. Forces the strategy to diversify across the
 #     pool rather than greedy-stacking the same top-scored names.
-PER_TICK_DEPLOYMENT_CAP_PCT = Decimal("0.10")
-PER_DAY_NEW_DEPLOYMENT_PCT = Decimal("0.30")
-COOLDOWN_TICKS = 6
+# Phase 11: revert Phase 10's overly aggressive caps. Phase 10's
+# 50% per-tick + 1-tick cooldown caused cash-exhaustion broker
+# rejections that crashed monthly return to 0.37%. Phase 8's caps
+# (25% / 80% / 3-tick) were the sweet spot.
+PER_TICK_DEPLOYMENT_CAP_PCT = Decimal("0.25")
+PER_DAY_NEW_DEPLOYMENT_PCT = Decimal("0.80")
+COOLDOWN_TICKS = 3
 TICK_INTERVAL_MINUTES = 5
 COOLDOWN_MINUTES = COOLDOWN_TICKS * TICK_INTERVAL_MINUTES
 
@@ -107,10 +116,13 @@ COOLDOWN_MINUTES = COOLDOWN_TICKS * TICK_INTERVAL_MINUTES
 #
 # Phase 5 retuning (2026-05-09): 240 → 60 minutes. Four-hour cooldown
 # was sized for a 30-name pool and starves the concentrated 8-12
-# name universe — the Phase 4 backtest deployed only 15% of cash
-# because cooldowns kept blocking re-entries. One hour gives the
-# chain time to move materially while not killing deployment.
-POST_PROFIT_TAKE_COOLDOWN_MINUTES = 60
+# name universe.
+# Phase 6 max-aggression: 60 → 0 (disabled). The base W-4 cooldown
+# (15 min via COOLDOWN_TICKS=3) is enough rapid-stacking protection;
+# the additional post-profit-take cooldown was over-restrictive for
+# the income target. With profit-take at 20%, cycles complete in
+# 1-2 days and the strategy needs to redeploy immediately.
+POST_PROFIT_TAKE_COOLDOWN_MINUTES = 0
 
 # P6 (2026-05-09): two-layer per-contract floor.
 #
@@ -132,13 +144,10 @@ POST_PROFIT_TAKE_COOLDOWN_MINUTES = 60
 # Will be tuned upward in Phase 3 once the universe is concentrated
 # to high-IV names where 0.30-0.50%/day is normal.
 MIN_BID_PREMIUM = Decimal("0.05")
-# Phase 5 retuning: 0.0010 → 0.0005 (0.05%/day). The 0.10%/day floor
-# was set with the goal of filtering only the genuinely thin trades
-# (KMI/KHC/XLF type 0.06-0.07%/day) but in practice it also rejected
-# the moderate-yield trades that aggregate to monthly returns. With
-# the IV percentile gate doing the primary VRP filtering, this floor
-# can be looser without re-introducing the bad trades.
-MIN_BID_YIELD_PER_DAY = Decimal("0.0005")
+# Phase 7 (2026-05-09): yield floor disabled (0). The fee-protection
+# floor (MIN_BID_PREMIUM = $0.05) is the only remaining check; any
+# yield is a contribution at the income target.
+MIN_BID_YIELD_PER_DAY = Decimal("0")
 
 # W-3: hard 15% per-name notional ceiling. The historical per-symbol cap
 # was tiered (60% at small accounts, 15% at large) because at $50k equity
@@ -151,7 +160,11 @@ MIN_BID_YIELD_PER_DAY = Decimal("0.0005")
 # on names whose strikes exceed 15% of equity. The previous tier table is
 # kept as the inner cap so a future regime might tighten further (e.g. for
 # very large books) but no tier is ever permitted to exceed 15%.
-PER_NAME_NOTIONAL_CAP_PCT = Decimal("0.15")
+# Phase 6 max-aggression: 0.15 → 0.25. Allows more concentrated
+# sizing per name. With 12-name universe and 25% per-name, a single
+# name can use up to 25% of equity in face collateral — meaningful
+# concentration risk but the income target requires it.
+PER_NAME_NOTIONAL_CAP_PCT = Decimal("0.25")
 
 _PER_SYMBOL_CAP_TIERS: tuple[tuple[Decimal, Decimal], ...] = (
     (Decimal("50000"), Decimal("1.00")),
@@ -398,13 +411,14 @@ class TradeIntent:
 def _is_sleeve_active(sleeve: SleeveConfig, regime: str) -> bool:
     """Sleeve activity rule.
 
-    Phase 3.6: opportunistic stays active in neutral so we get the
-    high-IV juice across both friendly and middling weeks. Only
-    risk_off blocks new entries entirely (across all sleeves).
+    Phase 7 (2026-05-09): risk_off no longer blocks entries. The
+    income target requires deployment in every regime; risk_off
+    sometimes coincides with the highest IV environment (vol-spike
+    weeks) where VRP harvesting pays best. The neutral target_delta
+    (-0.40 in Phase 7) is used in risk_off, providing a tighter
+    OTM cushion than risk_on without sitting out completely.
     """
     if not sleeve.enabled:
-        return False
-    if regime == "risk_off":
         return False
     return True
 
@@ -681,11 +695,13 @@ RV30Provider = Callable[[str], Awaitable["Decimal | None"]]
 # the symbol's trailing 252-day IV history. Returns None when
 # history is too thin to compute. Fail-open when None.
 IVPercentileProvider = Callable[[str, "Decimal"], Awaitable["Decimal | None"]]
-# Phase 5 retuning: 40 → 25. The 40th percentile floor rejected ~60%
-# of candidates (top decile is genuinely rare in a calm regime). 25
-# still avoids the bottom-quartile entries (where IV is below normal
-# and selling vol is the wrong trade) without strangling deployment.
-IV_PERCENTILE_FLOOR_DEFAULT = Decimal("25.0")
+# Phase 6 max-aggression: 25 → 0 (disabled). The percentile gate is
+# the cleanest VRP filter in theory but its rejections cost deployment.
+# At 6%/month target the strategy needs to take more trades; the
+# yield floor (0.02%/day, fee floor $0.05) provides the residual
+# vol-richness check. Setting to 0 means the gate fails-pass for any
+# candidate that has computable rank.
+IV_PERCENTILE_FLOOR_DEFAULT = Decimal("0")
 
 
 async def build_intents(
