@@ -1,6 +1,7 @@
 """Backtest harness for the Kai Trader wheel strategy.
 
-Replays the production strategy against historical Alpaca + EODHD data to
+Replays the production strategy against historical Alpaca (bars + options)
+plus yfinance (VIX, risk-free rate, earnings calendar fallback) data to
 answer one question: would this strategy, with today's calibration, have
 been profitable on the past ~2 years of market data.
 

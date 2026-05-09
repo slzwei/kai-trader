@@ -45,9 +45,12 @@ limitations apply:
 * Greeks are reconstructed via Black-Scholes from historical close +
   underlying + 3-month T-bill rate. Real-time exchange-published Greeks
   may differ; expect a few percent of error in delta near expiry.
-* Earnings calendar comes from EODHD with self-reported 97.25%
-  exact-date accuracy. Roughly 1 in 36 historical earnings dates is
-  off by at least a day.
+* Earnings calendar comes from yfinance (Ticker.calendar / get_
+  earnings_dates), the free fallback. The originally-planned EODHD
+  Calendar API requires a separate paid add-on the user does not
+  hold. yfinance accuracy is ~95-97%; ~1 in 25 historical earnings
+  dates may be off by a day. The W-1 fail-closed posture (skip on
+  unknown) covers data gaps for the live worker.
 * Historical bid/ask spreads are estimated from option daily volume.
   The estimate is conservative for liquid index ETFs and may understate
   the spread on illiquid mid-caps.

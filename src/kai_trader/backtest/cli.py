@@ -3,7 +3,9 @@
 Orchestrates the four phases the user invokes from the shell:
 
   1. Load (or snapshot) the production sleeve config.
-  2. Warm caches: equity bars, VIX, rates, EODHD earnings, option contracts and bars.
+  2. Warm caches: equity bars (Alpaca SIP), VIX (yfinance), rates
+     (yfinance ^IRX), earnings (yfinance fallback — EODHD Calendar
+     add-on not held), option contracts and bars (Alpaca SIP).
   3. Run the replay loop.
   4. Write artefacts and print the summary path.
 
@@ -209,7 +211,12 @@ async def _warm_earnings(
     end: date,
     symbols: list[str],
 ) -> None:
-    """Cache EODHD earnings for every universe symbol."""
+    """Cache earnings (yfinance fallback) for every universe symbol.
+
+    Originally planned to use EODHD's Calendar API but the user's
+    EODHD subscription does not include that add-on (returns 403).
+    yfinance's get_earnings_dates is the actual data source.
+    """
     total = 0
     pad_start = start
     for s in symbols:
@@ -355,7 +362,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="kai_trader.backtest",
         description=(
             "Backtest the Kai Trader wheel strategy against historical "
-            "Alpaca + EODHD data."
+            "Alpaca SIP (bars + options) and yfinance (VIX, rates, "
+            "earnings) data."
         ),
     )
     parser.add_argument("--start", required=True, help="ISO date, e.g. 2024-03-01")
