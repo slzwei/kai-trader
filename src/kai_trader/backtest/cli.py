@@ -289,7 +289,12 @@ async def _do_run(args: argparse.Namespace) -> int:
         await _warm_earnings(start=start, end=end, symbols=union_symbols)
         await _warm_chains(start=start, end=end, symbols=union_symbols)
 
-    state = BacktestState(starting_capital=capital, sleeves=sleeves)
+    margin_factor = Decimal(str(args.margin_factor))
+    state = BacktestState(
+        starting_capital=capital,
+        sleeves=sleeves,
+        margin_factor=margin_factor,
+    )
     broker = BacktestBroker(state=state, fill_model=fill_model, cost_model=DEFAULT_COST_MODEL)
 
     days = clock.trading_days(start, end)
@@ -359,6 +364,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--skip-warmup",
         action="store_true",
         help="reuse existing caches; skip every fetcher's warm step",
+    )
+    parser.add_argument(
+        "--margin-factor",
+        type=float,
+        default=1.0,
+        help=(
+            "Reg-T margin factor (P5). 1.0 (default) = cash-secured: "
+            "each $1 of strike collateral consumes $1 of cash. 0.30 = "
+            "Reg-T preset: each $1 of collateral consumes $0.30 of "
+            "cash, ~3.3x leverage. Allowed range (0, 1]."
+        ),
     )
     parser.add_argument(
         "--kill-switch-mode",
