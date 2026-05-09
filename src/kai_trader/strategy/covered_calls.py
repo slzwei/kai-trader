@@ -28,9 +28,11 @@ from kai_trader.broker.alpaca import PositionSnapshot
 from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.logging import get_logger
+from kai_trader.strategy.earnings import EarningsStatus
 from kai_trader.strategy.regime import RegimeSnapshot
 
 ChainFetcher = Callable[[str, date | None], Awaitable[list[OptionContract]]]
+EarningsStatusProvider = Callable[[str, date, int], Awaitable[EarningsStatus]]
 
 _log = get_logger(__name__)
 
@@ -196,12 +198,21 @@ async def build_call_intents(
     chain_fetcher: ChainFetcher,
     *,
     today: date | None = None,
+    earnings_status: EarningsStatusProvider | None = None,
 ) -> tuple[list[CallIntent], CallBuildDiagnostics]:
     """Walk held equity positions, find a CC for each whose sleeve owns it.
 
     Returns a list of intents (one per sleeve+underlying that produced
-    a viable strike) plus a per-sleeve diagnostic. ``risk_off`` regime
-    blocks new CC entries the same way it blocks puts.
+    a viable strike) plus a per-sleeve diagnostic.
+
+    Earnings blackout (added 2026-05-10): when ``earnings_status`` is
+    supplied AND the sleeve has ``earnings_blackout_enabled``, skip
+    underlyings whose next earnings date falls inside the sleeve's
+    DTE window. Selling a CC that spans an earnings report exposes
+    the assigned shares to a post-earnings gap-up that calls them
+    away at the strike, capping upside on a binary event. Fail-
+    closed: an ``unknown`` earnings status causes the symbol to be
+    skipped (matches the W-1 production posture for puts).
     """
     today = today or datetime.now(UTC).date()
 
@@ -275,6 +286,37 @@ async def build_call_intents(
         intents_built_for_sleeve = 0
 
         for _sleeve_match, position in positions_for_sleeve:
+            # Earnings filter (2026-05-10): skip the symbol if its next
+            # earnings date falls inside the sleeve's DTE window. A CC
+            # that spans earnings caps upside if the stock gaps up on
+            # the report and the call assigns; a CC that's still open
+            # post-earnings often drops below the entry credit on a
+            # gap-down, leaving the holder with both an unrealized
+            # loss on the stock AND a worthless short call.
+            if (
+                earnings_status is not None
+                and sleeve.earnings_blackout_enabled
+            ):
+                try:
+                    status = await earnings_status(
+                        position.symbol, today, sleeve.target_dte_max
+                    )
+                except Exception as exc:
+                    _log.warning(
+                        "strategy.cc.earnings_status_failed",
+                        sleeve=sleeve.sleeve,
+                        symbol=position.symbol,
+                        error=str(exc),
+                    )
+                    status = "unknown"
+                if status != "outside_window":
+                    _log.info(
+                        "strategy.cc.earnings_blackout",
+                        sleeve=sleeve.sleeve,
+                        symbol=position.symbol,
+                        status=status,
+                    )
+                    continue
             try:
                 chain = await chain_fetcher(position.symbol, None)
             except Exception as exc:

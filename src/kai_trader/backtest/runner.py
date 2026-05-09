@@ -381,6 +381,7 @@ async def _run_cc_entries(
         regime=regime,
         chain_fetcher=fetcher,
         today=asof,
+        earnings_status=earnings.earnings_status,
     )
     # Filter out CC intents on shares that already have an open short call.
     existing_calls_by_underlying: set[str] = set()

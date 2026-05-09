@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from unittest.mock import AsyncMock
 
 from kai_trader.broker.alpaca import PositionSnapshot
 from kai_trader.broker.options_data import OptionContract
@@ -267,7 +268,7 @@ async def test_build_call_intents_proceeds_in_risk_off_phase9() -> None:
     async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
         return [_call(strike=260, delta=0.30, expiration=expiry)]
 
-    intents, diag = await build_call_intents(
+    _intents, diag = await build_call_intents(
         long_equity_positions=[_equity("AMZN", "100")],
         sleeves=[_sleeve(whitelist=["AMZN"])],
         regime=_regime("risk_off"),
@@ -342,3 +343,121 @@ async def test_summarise_call_intents_renders_total_line() -> None:
     assert "stable_largecap/AMZN" in out
     assert "1xC" in out
     assert "Total: 1 CC intents" in out
+
+
+# ------------- earnings blackout filter (2026-05-10) -------------
+
+
+
+
+async def test_build_call_intents_blocks_when_earnings_in_window() -> None:
+    """An in-window earnings status skips the symbol entirely."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_call(strike=260, delta=0.30, expiration=expiry)]
+
+    earnings_provider = AsyncMock(return_value="in_window")
+
+    intents, diag = await build_call_intents(
+        long_equity_positions=[_equity("AMZN", "100")],
+        sleeves=[_sleeve(whitelist=["AMZN"])],
+        regime=_regime("neutral"),
+        chain_fetcher=fetcher,
+        today=today,
+        earnings_status=earnings_provider,
+    )
+
+    assert intents == []
+    earnings_provider.assert_awaited_once()
+    # Chain fetcher should not have been called once earnings blocked it.
+    assert diag.sleeves[0].chains_fetched == 0
+
+
+async def test_build_call_intents_proceeds_when_earnings_outside_window() -> None:
+    """An outside-window earnings status lets the candidate through."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_call(strike=260, delta=0.30, expiration=expiry)]
+
+    earnings_provider = AsyncMock(return_value="outside_window")
+
+    intents, _diag = await build_call_intents(
+        long_equity_positions=[_equity("AMZN", "100")],
+        sleeves=[_sleeve(whitelist=["AMZN"])],
+        regime=_regime("neutral"),
+        chain_fetcher=fetcher,
+        today=today,
+        earnings_status=earnings_provider,
+    )
+
+    assert len(intents) == 1
+
+
+async def test_build_call_intents_blocks_when_earnings_status_unknown() -> None:
+    """Fail-closed: an unknown earnings status skips the symbol."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_call(strike=260, delta=0.30, expiration=expiry)]
+
+    earnings_provider = AsyncMock(side_effect=RuntimeError("yfinance is down"))
+
+    intents, _diag = await build_call_intents(
+        long_equity_positions=[_equity("AMZN", "100")],
+        sleeves=[_sleeve(whitelist=["AMZN"])],
+        regime=_regime("neutral"),
+        chain_fetcher=fetcher,
+        today=today,
+        earnings_status=earnings_provider,
+    )
+
+    # Earnings lookup raised → status set to "unknown" → skip the symbol.
+    assert intents == []
+
+
+async def test_build_call_intents_skips_earnings_check_when_sleeve_disabled() -> None:
+    """Sleeve with earnings_blackout_enabled=False bypasses the check entirely."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_call(strike=260, delta=0.30, expiration=expiry)]
+
+    # Provider returns "in_window" but sleeve has the flag off — the
+    # provider should never be called. The strategy needs to allow the
+    # operator to disable earnings filtering per-sleeve.
+    earnings_provider = AsyncMock(return_value="in_window")
+
+    sleeve_no_blackout = SleeveConfig(
+        sleeve="stable_largecap",
+        target_pct=Decimal("0.30"),
+        target_delta_put_risk_on=Decimal("-0.40"),
+        target_delta_put_neutral=Decimal("-0.30"),
+        target_delta_call=Decimal("0.30"),
+        target_dte_min=7,
+        target_dte_max=10,
+        profit_take_pct=Decimal("0.50"),
+        roll_trigger_delta=Decimal("0.45"),
+        symbol_whitelist=["AMZN"],
+        enabled=True,
+        earnings_blackout_enabled=False,
+        updated_at=datetime(2026, 4, 26, tzinfo=UTC),
+        updated_by=None,
+    )
+
+    intents, _diag = await build_call_intents(
+        long_equity_positions=[_equity("AMZN", "100")],
+        sleeves=[sleeve_no_blackout],
+        regime=_regime("neutral"),
+        chain_fetcher=fetcher,
+        today=today,
+        earnings_status=earnings_provider,
+    )
+
+    assert len(intents) == 1
+    earnings_provider.assert_not_awaited()
