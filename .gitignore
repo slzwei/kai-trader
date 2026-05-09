@@ -39,5 +39,11 @@ coverage.xml
 *.log
 logs/
 
+# Backtest data (large) and per-run outputs (regenerable). The
+# harness source under src/kai_trader/backtest/ and tests/backtest/
+# IS tracked; only the populated cache and run artefacts are not.
+backtest_cache/
+backtest_runs/
+
 # Claude Code harness state (per-session locks, scheduled-task metadata)
 .claude/
