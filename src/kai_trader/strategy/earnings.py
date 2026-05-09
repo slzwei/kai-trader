@@ -2,26 +2,37 @@
 
 Phase 5d filters CSP candidates that have earnings inside the sleeve's
 DTE window: selling premium into binary events is exactly what defensive
-wheels avoid. The data source is yfinance because it is already a
-project dependency for VIX. yfinance is sync, so each lookup runs in a
-worker thread.
+wheels avoid.
+
+Data sources (2026-05-10): EODHD Calendar API as primary, yfinance as
+fallback. EODHD has documented 97.25% exact-date accuracy and is the
+practitioner standard. yfinance was the original fallback and remains
+in place for resilience: when EODHD throws (network glitch, rate limit,
+or transient 5xx), we degrade to yfinance rather than failing the
+trade closed across the entire universe. The 24-hour per-symbol cache
+sits in front of both.
+
+Real-world catch on 2026-05-10: yfinance reported RIVN earnings as
+2026-05-01 (already past); EODHD correctly reported 2026-05-12. With
+yfinance alone the bot would have entered RIVN CSPs into a known
+earnings event. EODHD primacy is not cosmetic.
 
 W-1 hardens this for live capital. The original Phase 5d posture was
-fail-open: if yfinance failed or returned no row, the strategy proceeded
-as if earnings were not in the window. That is acceptable on paper. On
-live capital it is not: a single yfinance outage during an earnings
-season would flood the book with binary-event exposure. The current
-posture is fail-closed: any lookup that does not produce a confirmed
-date outside the DTE window is treated as a skip, with a separate
-diagnostic counter so the operator can see when the filter is actively
-defending against unknowns.
+fail-open: if the lookup failed or returned no row, the strategy
+proceeded as if earnings were not in the window. That is acceptable
+on paper. On live capital it is not: a single data-source outage
+during an earnings season would flood the book with binary-event
+exposure. The current posture is fail-closed: any lookup that does
+not produce a confirmed date outside the DTE window is treated as a
+skip, with a separate diagnostic counter so the operator can see
+when the filter is actively defending against unknowns.
 
 Two principles guide this module:
 
 1. **Fail closed.** A network or parser failure causes the symbol to be
    skipped, not traded. The cost is an occasional missed entry. The
-   benefit is that on the day yfinance silently breaks, we do not
-   write 30 contracts into earnings.
+   benefit is that on the day both data sources silently break, we do
+   not write 30 contracts into earnings.
 2. **Cache aggressively.** Earnings dates change once per quarter at
    most; we cache for 24 hours per symbol. Cache lookup is a synchronous
    dict read.
@@ -30,11 +41,16 @@ Two principles guide this module:
 from __future__ import annotations
 
 import asyncio
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import UTC, date, datetime, timedelta
-from typing import Literal
+from typing import Final, Literal
 
 import yfinance as yf
 
+from kai_trader.config import get_settings
 from kai_trader.logging import get_logger
 
 _log = get_logger(__name__)
@@ -83,8 +99,66 @@ def reset_cache() -> None:
     _quote_type_cache.clear()
 
 
-def _fetch_earnings_sync(symbol: str) -> date | None:
-    """Synchronous yfinance lookup. Caller wraps in asyncio.to_thread.
+_EODHD_CALENDAR_URL: Final[str] = "https://eodhd.com/api/calendar/earnings"
+_EODHD_TIMEOUT_S: Final[int] = 10
+
+
+def _fetch_eodhd_sync(symbol: str) -> date | None:
+    """Primary earnings fetch via EODHD Calendar API.
+
+    Returns the soonest scheduled earnings date >= today, or None when
+    no upcoming event is found. Returns None on missing API key (caller
+    falls back to yfinance). HTTP errors propagate so the caller can
+    log and decide between fallback and fail-closed.
+
+    EODHD format example::
+
+        {"earnings": [
+            {"code": "RIVN.US", "report_date": "2026-05-12",
+             "before_after_market": "AfterMarket", ...},
+            ...
+        ]}
+    """
+    settings = get_settings()
+    if settings.eodhd_api_key is None:
+        return None
+    key = settings.eodhd_api_key.get_secret_value()
+    today = _now().date()
+    # Request a 1-year window starting today; EODHD returns the
+    # symbol's full schedule in the range, sorted by report_date.
+    end = today + timedelta(days=365)
+    params = urllib.parse.urlencode({
+        "api_token": key,
+        "symbols": f"{symbol.upper()}.US",
+        "from": today.isoformat(),
+        "to": end.isoformat(),
+        "fmt": "json",
+    })
+    url = f"{_EODHD_CALENDAR_URL}?{params}"
+    with urllib.request.urlopen(url, timeout=_EODHD_TIMEOUT_S) as resp:
+        body = resp.read().decode("utf-8")
+    payload = json.loads(body)
+    events = payload.get("earnings") or []
+    if not events:
+        return None
+    upcoming: list[date] = []
+    for event in events:
+        rd = event.get("report_date")
+        if not isinstance(rd, str):
+            continue
+        try:
+            d = date.fromisoformat(rd)
+        except ValueError:
+            continue
+        if d >= today:
+            upcoming.append(d)
+    if not upcoming:
+        return None
+    return min(upcoming)
+
+
+def _fetch_yfinance_sync(symbol: str) -> date | None:
+    """yfinance fallback. Same return shape as ``_fetch_eodhd_sync``.
 
     Uses ``Ticker.calendar`` (JSON quote-summary endpoint) rather than
     ``get_earnings_dates`` (HTML reader-mode scrape). The calendar path
@@ -92,9 +166,11 @@ def _fetch_earnings_sync(symbol: str) -> date | None:
     per symbol for the earnings-dates path. With 30+ whitelist symbols
     that difference is the literal Render OOM gap.
 
-    Returns the next earnings date >= today, or None when yfinance has
-    no upcoming row. Errors propagate to the caller, which is
-    responsible for logging and the fail-closed default.
+    yfinance is the FALLBACK as of 2026-05-10 — EODHD has been verified
+    more accurate (yfinance had RIVN off by 11 days during the live
+    trial preflight). The fallback exists so an EODHD outage does not
+    fail-close the entire universe; in normal operation, EODHD's
+    response is what populates the cache.
     """
     ticker = yf.Ticker(symbol)
     cal = ticker.calendar
@@ -111,6 +187,53 @@ def _fetch_earnings_sync(symbol: str) -> date | None:
     if not upcoming:
         return None
     return min(upcoming)
+
+
+def _fetch_earnings_sync(symbol: str) -> date | None:
+    """Union of EODHD and yfinance — return the SOONEST upcoming date.
+
+    Live preflight on 2026-05-10 surfaced two distinct failure modes:
+
+    * RIVN:  EODHD = 2026-05-12 (correct, fresh post-announcement);
+             yfinance = 2026-05-01 (stale, the company's PRIOR
+             announcement date that yfinance hasn't refreshed).
+             Filtered to dates >= today, EODHD wins.
+
+    * MARA:  EODHD = None (the calendar add-on hasn't ingested
+             MARA's next date yet — small/mid caps lag); yfinance =
+             2026-05-12 (extrapolated from historical pattern,
+             accurate). EODHD-only would have MISSED this and
+             entered MARA CSPs into earnings week.
+
+    Union-min handles both: take whichever non-None answer is sooner.
+    Both raise → fail-closed (caller treats None as "skip").
+
+    EODHD HTTP errors fall through to yfinance silently. yfinance
+    errors are also tolerated; the worst case is both raise and the
+    function returns None which fails-closed in ``get_earnings_status``.
+    """
+    eodhd_date: date | None = None
+    try:
+        eodhd_date = _fetch_eodhd_sync(symbol)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+        _log.warning(
+            "strategy.earnings.eodhd_failed",
+            symbol=symbol,
+            error=str(exc),
+        )
+    yf_date: date | None = None
+    try:
+        yf_date = _fetch_yfinance_sync(symbol)
+    except Exception as exc:
+        _log.warning(
+            "strategy.earnings.yfinance_failed",
+            symbol=symbol,
+            error=str(exc),
+        )
+    candidates = [d for d in (eodhd_date, yf_date) if d is not None]
+    if not candidates:
+        return None
+    return min(candidates)
 
 
 def _fetch_quote_type_sync(symbol: str) -> str | None:
