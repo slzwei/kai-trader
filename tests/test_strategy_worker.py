@@ -327,41 +327,26 @@ async def test_tick_submits_when_flags_green(
     # capturing zero spread on average; mid-priced limits aim for +0.05
     # better per share at the cost of some unfilled orders.
     assert submit_args.kwargs["limit_price"] == Decimal("1.15")
-    # $100k equity, per-tick deployment cap (W-4) = 10% = $10k.
-    # Strike $50 = $5000 per contract → 2 contracts fit before per-tick
-    # cap binds. The 15% per-name cap (W-3) would allow 3, the 40%
-    # sleeve cap would allow 8, and MAX_CONTRACTS_PER_SYMBOL caps at
-    # 10. Per-tick cap is the smallest binding constraint here.
-    assert submit_args.kwargs["qty"] == 2
+    # Variant A constants (2026-05-09):
+    #   PER_NAME_NOTIONAL_CAP_PCT = 0.15 → 15% × $100k = $15k = 3 contracts
+    #   PER_TICK_DEPLOYMENT_CAP_PCT = 0.25 → 25% × $100k = $25k = 5 contracts
+    #   TOTAL_DEPLOYMENT_CAP_PCT = 1.00 → $100k = 20 contracts
+    #   max_contracts_per_symbol(<$150k) = 10
+    # Per-name cap binds first at 3 contracts.
+    assert submit_args.kwargs["qty"] == 3
 
 
-async def test_tick_post_profit_take_cooldown_blocks_reentry(
-    monkeypatch: pytest.MonkeyPatch,
-    _patch_dependencies: dict[str, AsyncMock],
-) -> None:
-    """Symbol that just profit-took stays out of the candidate pool."""
-    from datetime import UTC, datetime, timedelta
+async def test_tick_post_profit_take_cooldown_disabled_phase6() -> None:
+    """Phase 6+ (2026-05-09): post-profit-take cooldown disabled (= 0).
 
-    monkeypatch.setattr(
-        worker_module, "get_clock_snapshot",
-        AsyncMock(return_value=_clock(is_open=True)),
-    )
-    _patch_dependencies["get_flags"].return_value = {
-        "trading_enabled": True, "kill_switch": False,
-    }
-    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
-    _patch_dependencies["get_chain"].return_value = [_put_contract()]
-    # Phase 5 retuning lowered cooldown 4h → 1h. A profit-take 30 min
-    # ago is well inside the new 1-hour window so the worker should
-    # still skip the entry. (Pre-Phase-5 this test used 2h which now
-    # would NOT block.)
-    _patch_dependencies["latest_profit_take_at_per_symbol"].return_value = {
-        "SPY": datetime.now(UTC) - timedelta(minutes=30),
-    }
+    The income recalibration removed the 4-hour and then 1-hour
+    cooldowns; the W-4 base cooldown (15 min via COOLDOWN_TICKS=3)
+    remains as anti-stacking protection. This test exists as a
+    placeholder to document the behavior change.
+    """
+    from kai_trader.strategy.candidates import POST_PROFIT_TAKE_COOLDOWN_MINUTES
 
-    await worker_module.StrategyWorker().tick()
-
-    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    assert POST_PROFIT_TAKE_COOLDOWN_MINUTES == 0
 
 
 async def test_tick_premium_floor_blocks_thin_contract(

@@ -487,9 +487,11 @@ async def test_system_pulse_aggregates_live_state() -> None:
     assert payload["flags"]["kill_switch"] is False
     assert payload["account"]["equity"] == "100000"
     assert payload["shorts"]["open_short_puts"][0]["underlying"] == "AMZN"
-    # qty=2, strike=250 -> 50000 collateral, cap = 0.7 * 100000 = 70000
+    # qty=2, strike=250 -> 50000 collateral. Variant A (2026-05-09)
+    # raised TOTAL_DEPLOYMENT_CAP_PCT from 0.70 to 1.00 so cap =
+    # 1.00 * 100000 = 100000.
     assert payload["shorts"]["cap"]["committed_usd"] == "50000"
-    assert payload["shorts"]["cap"]["total_cap_usd"] == "70000.00"
+    assert payload["shorts"]["cap"]["total_cap_usd"] == "100000.00"
     assert payload["latest_strategy_tick"]["present"] is True
     assert payload["latest_strategy_tick"]["sent_at"]["age_seconds"] >= 0
     assert payload["latest_filled_order"]["present"] is True

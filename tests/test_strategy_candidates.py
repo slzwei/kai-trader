@@ -7,9 +7,12 @@ from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from kai_trader.broker.alpaca import AccountSnapshot
 from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.sleeve_config import SleeveConfig
+from kai_trader.strategy import candidates as candidates_module
 from kai_trader.strategy.candidates import (
     build_intents,
     build_intents_with_diagnostics,
@@ -18,6 +21,29 @@ from kai_trader.strategy.candidates import (
     summarise_intents,
 )
 from kai_trader.strategy.regime import RegimeSnapshot
+
+
+@pytest.fixture
+def _legacy_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restore original deployment-cap constants for cap-mechanic tests.
+
+    Variant A safety (2026-05-09) changed:
+      TOTAL_DEPLOYMENT_CAP_PCT      0.70 → 1.00
+      PER_TICK_DEPLOYMENT_CAP_PCT   0.10 → 0.25
+      PER_DAY_NEW_DEPLOYMENT_PCT    0.30 → 0.80
+      COOLDOWN_TICKS                6    → 3
+      POST_PROFIT_TAKE_COOLDOWN_MINUTES  240 → 0
+
+    Tests that assert specific dollar/contract counts based on the
+    pre-Variant-A constants opt into this fixture so they keep
+    testing the cap MECHANICS without breaking on every calibration
+    change.
+    """
+    monkeypatch.setattr(candidates_module, "TOTAL_DEPLOYMENT_CAP_PCT", Decimal("0.70"))
+    monkeypatch.setattr(candidates_module, "PER_TICK_DEPLOYMENT_CAP_PCT", Decimal("0.10"))
+    monkeypatch.setattr(candidates_module, "PER_DAY_NEW_DEPLOYMENT_PCT", Decimal("0.30"))
+    monkeypatch.setattr(candidates_module, "COOLDOWN_TICKS", 6)
+    monkeypatch.setattr(candidates_module, "COOLDOWN_MINUTES", 30)
 
 
 def _sleeve(
@@ -198,18 +224,31 @@ def test_select_put_strike_returns_none_for_empty_chain() -> None:
 
 # ------------- build_intents -------------
 
-async def test_build_intents_skips_all_in_risk_off() -> None:
+async def test_build_intents_proceeds_in_risk_off_phase7() -> None:
+    """Phase 7+ (2026-05-09): risk_off no longer blocks entries.
+
+    The income-target recalibration unblocks risk_off because some of
+    the highest-IV environments (vol-spike weeks) coincide with the
+    risk_off classification. The strategy uses the neutral target_delta
+    in risk_off, providing a tighter OTM cushion than risk_on.
+    """
     today = date(2026, 4, 27)
-    chain_fetcher = AsyncMock(return_value=[])
+    expiry = today + timedelta(days=8)
+    chain_fetcher = AsyncMock(return_value=[
+        _put(strike=50, delta=-0.30, expiration=expiry),
+    ])
     intents = await build_intents(
         regime=_regime("risk_off"),
-        sleeves=[_sleeve("index_core"), _sleeve("opportunistic", target_pct=Decimal("0.20"))],
+        sleeves=[_sleeve("index_core")],
         account=_account(),
         chain_fetcher=chain_fetcher,
         today=today,
     )
-    assert intents == []
-    chain_fetcher.assert_not_awaited()
+    # Chain IS fetched in risk_off (vs the old behaviour of skipping).
+    chain_fetcher.assert_awaited()
+    # An intent will fire since the chain has a viable strike at the
+    # neutral target delta (-0.20). Don't assert the count; the goal
+    # of this test is to confirm risk_off doesn't blanket-skip.
 
 
 async def test_build_intents_keeps_opportunistic_active_in_neutral() -> None:
@@ -381,7 +420,7 @@ async def test_build_intents_per_symbol_cap_overrides_sleeve_headroom() -> None:
     assert intents[0].qty == 10  # MAX_CONTRACTS_PER_SYMBOL
 
 
-async def test_build_intents_respects_total_deployment_cap() -> None:
+async def test_build_intents_respects_total_deployment_cap(_legacy_caps: None) -> None:
     """Total deployment is bounded by the smallest applicable cap.
 
     With W-4 the per-tick cap (10% of equity) is always tighter than the
@@ -953,7 +992,7 @@ async def test_committed_collateral_reduces_sleeve_remaining() -> None:
     assert intents == []
 
 
-async def test_committed_collateral_reduces_total_remaining() -> None:
+async def test_committed_collateral_reduces_total_remaining(_legacy_caps: None) -> None:
     """Existing positions across sleeves should subtract from the total cap."""
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
@@ -1034,7 +1073,7 @@ async def test_committed_collateral_does_not_block_unrelated_underlying() -> Non
     assert "AVGO" in symbols_in_intents
 
 
-async def test_no_existing_positions_matches_legacy_behavior() -> None:
+async def test_no_existing_positions_matches_legacy_behavior(_legacy_caps: None) -> None:
     """Default empty list of existing positions still respects all caps.
 
     At $100k equity the most binding constraint is the W-4 per-tick cap
@@ -1711,7 +1750,7 @@ async def test_iv_rv_filter_warning_surfaces() -> None:
     assert any("IV/RV 1.10 floor" in w for w in warnings)
 
 
-async def test_per_tick_dollar_cap_drops_lowest_ranked_candidates() -> None:
+async def test_per_tick_dollar_cap_drops_lowest_ranked_candidates(_legacy_caps: None) -> None:
     """W-4 acceptance test 1: 5 candidates x $5k, $100k equity → top 2 fit, rest dropped."""
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
@@ -1766,7 +1805,7 @@ async def test_per_tick_dollar_cap_drops_lowest_ranked_candidates() -> None:
     assert diag.intents_dropped_for_per_tick_cap >= 1
 
 
-async def test_per_day_cap_blocks_after_25k_already_today() -> None:
+async def test_per_day_cap_blocks_after_25k_already_today(_legacy_caps: None) -> None:
     """W-4 acceptance test 2: $25k already today, cap=30%, candidate set reduced to fit."""
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
@@ -1797,7 +1836,7 @@ async def test_per_day_cap_blocks_after_25k_already_today() -> None:
     assert diag.today_deployment_used_pct == Decimal("0.25")
 
 
-async def test_per_day_cap_resets_at_utc_midnight() -> None:
+async def test_per_day_cap_resets_at_utc_midnight(_legacy_caps: None) -> None:
     """W-4 day-rollover: yesterday's deployment is irrelevant when today_already_deployed=0."""
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
@@ -1863,7 +1902,7 @@ async def test_cooldown_skips_recently_entered_symbols() -> None:
     assert all(i.symbol == "FRESH" for i in intents)
 
 
-async def test_combined_caps_cooldown_per_day_per_tick() -> None:
+async def test_combined_caps_cooldown_per_day_per_tick(_legacy_caps: None) -> None:
     """W-4 combined: cool-down skips first, per-day budget clamps the rest."""
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)

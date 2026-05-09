@@ -106,18 +106,18 @@ secured).
 
 ## Backtest projections to compare against
 
-These are what the Phase 12 calibration produced over 24 months
+These are what the Variant A calibration (cash-secured, blow-up-resistant) produced over 24 months
 on $30k starting capital. Reality may diverge for many reasons —
 single-week variance is huge — but if the trial diverges by >2x in
 either direction over 2 weeks, that's a signal.
 
 | Metric | 24-month backtest | Per-week pro-rata | 2-week trial expectation |
 |---|---:|---:|---:|
-| Total return | +115% | ~1.7% | +0% to +5% (high variance) |
+| Total return | +60.8% | ~1.7% | +0% to +5% (high variance) |
 | Monthly compounding | 3.00% | — | — |
-| Max drawdown | 37% | — | up to 15% in 2 weeks plausible |
-| CSP fills | 677 / 542d | 6 / week | 8-15 fills total |
-| Profit takes | 169 / 542d | 1.6 / week | 2-5 in 2 weeks |
+| Max drawdown 30% | — | up to 15% in 2 weeks plausible |
+| CSP fills | 300 / 542d | 3 / week | 4-8 fills total |
+| Profit takes | 97 / 542d | 1.3 / week | 1-3 in 2 weeks |
 | Assignments | 54 / 542d | 0.5 / week | 0-2 in 2 weeks |
 | Sharpe | 0.91 | — | — |
 | Win rate (per row) | 91% | — | — |

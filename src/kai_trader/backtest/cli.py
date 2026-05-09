@@ -47,12 +47,12 @@ _DEFAULT_SLEEVE_CONFIG: list[dict[str, Any]] = [
     {
         "sleeve": "index_core",
         "target_pct": "1.00",
-        "target_delta_put_risk_on": "-0.45",
-        "target_delta_put_neutral": "-0.35",
-        "target_delta_call": "0.35",
+        "target_delta_put_risk_on": "-0.40",
+        "target_delta_put_neutral": "-0.30",
+        "target_delta_call": "0.30",
         "target_dte_min": 7,
         "target_dte_max": 14,
-        "profit_take_pct": "0.10",
+        "profit_take_pct": "0.50",
         "roll_trigger_delta": "0.35",
         "symbol_whitelist": [
             # Phase 5 (migration 025): 8 high-IV + 4 moderate-IV

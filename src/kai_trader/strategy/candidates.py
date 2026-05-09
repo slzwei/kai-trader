@@ -30,12 +30,12 @@ ChainFetcher = Callable[[str, date | None], Awaitable[list[OptionContract]]]
 _log = get_logger(__name__)
 
 
-# Phase 12 max-leverage push: 2.50 → 4.00. With margin_factor=0.20
-# (5x leverage), $30k cash supports up to $150k face collateral.
-# The 4.00x equity cap (= $120k face on $30k) is below that cash
-# ceiling but above Phase 8's 2.50x, allowing the bot to deploy
-# more face value at higher leverage.
-TOTAL_DEPLOYMENT_CAP_PCT = Decimal("4.00")
+# Variant A safety (2026-05-09): 4.00 → 1.00. Variant A is cash-
+# secured; even if Alpaca's account grants some options margin, the
+# strategy refuses to deploy beyond 1x equity in face collateral.
+# Caps blow-up risk: with $30k equity, max $30k of strikes at risk,
+# matching cash on hand.
+TOTAL_DEPLOYMENT_CAP_PCT = Decimal("1.00")
 
 # P7 (2026-05-09): MAX_CONTRACTS_PER_SYMBOL tiered by equity. The
 # original flat 10-contract ceiling was sized for $50k-$150k accounts;
@@ -160,11 +160,12 @@ MIN_BID_YIELD_PER_DAY = Decimal("0")
 # on names whose strikes exceed 15% of equity. The previous tier table is
 # kept as the inner cap so a future regime might tighten further (e.g. for
 # very large books) but no tier is ever permitted to exceed 15%.
-# Phase 6 max-aggression: 0.15 → 0.25. Allows more concentrated
-# sizing per name. With 12-name universe and 25% per-name, a single
-# name can use up to 25% of equity in face collateral — meaningful
-# concentration risk but the income target requires it.
-PER_NAME_NOTIONAL_CAP_PCT = Decimal("0.25")
+# Phase 13 safety: 0.25 → 0.15. Phase 6's 25% allowed too much
+# single-name concentration; the 2024-04 backtest had cash going
+# to -$21k because multiple correlated names (MARA/RIOT/HOOD)
+# assigned simultaneously. 15% caps single-name losses to the
+# original W-3 ceiling.
+PER_NAME_NOTIONAL_CAP_PCT = Decimal("0.15")
 
 _PER_SYMBOL_CAP_TIERS: tuple[tuple[Decimal, Decimal], ...] = (
     (Decimal("50000"), Decimal("1.00")),

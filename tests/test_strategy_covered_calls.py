@@ -254,7 +254,13 @@ async def test_build_call_intents_skips_when_no_sleeve_owns_underlying() -> None
     assert intents == []
 
 
-async def test_build_call_intents_skips_in_risk_off_regime() -> None:
+async def test_build_call_intents_proceeds_in_risk_off_phase9() -> None:
+    """Phase 9+ (2026-05-09): risk_off no longer blocks CC entries.
+
+    Selling calls on assigned stock generates premium regardless of
+    regime; the bigger risk in risk_off is rolling losses on the put
+    leg, not new CC entries.
+    """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
@@ -268,9 +274,10 @@ async def test_build_call_intents_skips_in_risk_off_regime() -> None:
         chain_fetcher=fetcher,
         today=today,
     )
-    assert intents == []
-    assert diag.sleeves[0].symbols_evaluated == 1
-    assert diag.sleeves[0].chains_fetched == 0
+    # Chain is fetched even in risk_off; an intent may or may not fire
+    # depending on whether the candidate clears all gates. The
+    # behavior assertion: chains_fetched > 0 (no blanket skip).
+    assert diag.sleeves[0].chains_fetched >= 1
 
 
 async def test_build_call_intents_handles_chain_fetch_error() -> None:
