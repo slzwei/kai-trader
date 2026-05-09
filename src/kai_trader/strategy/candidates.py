@@ -103,10 +103,14 @@ COOLDOWN_MINUTES = COOLDOWN_TICKS * TICK_INTERVAL_MINUTES
 # moved enough yet. Observed 2026-05-06: bot closed F 11.5P x 8 at
 # $0.09 (profit-take), then re-opened the same strike x 2 at $0.09
 # 32 minutes later, just past the base cooldown. The new entry's
-# expected return barely covered fees and risk. Four hours is enough
-# for the chain to settle, the underlying to move, or a different
-# candidate to rotate to the top of the score table.
-POST_PROFIT_TAKE_COOLDOWN_MINUTES = 240
+# expected return barely covered fees and risk.
+#
+# Phase 5 retuning (2026-05-09): 240 → 60 minutes. Four-hour cooldown
+# was sized for a 30-name pool and starves the concentrated 8-12
+# name universe — the Phase 4 backtest deployed only 15% of cash
+# because cooldowns kept blocking re-entries. One hour gives the
+# chain time to move materially while not killing deployment.
+POST_PROFIT_TAKE_COOLDOWN_MINUTES = 60
 
 # P6 (2026-05-09): two-layer per-contract floor.
 #
@@ -128,7 +132,13 @@ POST_PROFIT_TAKE_COOLDOWN_MINUTES = 240
 # Will be tuned upward in Phase 3 once the universe is concentrated
 # to high-IV names where 0.30-0.50%/day is normal.
 MIN_BID_PREMIUM = Decimal("0.05")
-MIN_BID_YIELD_PER_DAY = Decimal("0.0010")
+# Phase 5 retuning: 0.0010 → 0.0005 (0.05%/day). The 0.10%/day floor
+# was set with the goal of filtering only the genuinely thin trades
+# (KMI/KHC/XLF type 0.06-0.07%/day) but in practice it also rejected
+# the moderate-yield trades that aggregate to monthly returns. With
+# the IV percentile gate doing the primary VRP filtering, this floor
+# can be looser without re-introducing the bad trades.
+MIN_BID_YIELD_PER_DAY = Decimal("0.0005")
 
 # W-3: hard 15% per-name notional ceiling. The historical per-symbol cap
 # was tiered (60% at small accounts, 15% at large) because at $50k equity
@@ -671,7 +681,11 @@ RV30Provider = Callable[[str], Awaitable["Decimal | None"]]
 # the symbol's trailing 252-day IV history. Returns None when
 # history is too thin to compute. Fail-open when None.
 IVPercentileProvider = Callable[[str, "Decimal"], Awaitable["Decimal | None"]]
-IV_PERCENTILE_FLOOR_DEFAULT = Decimal("40.0")
+# Phase 5 retuning: 40 → 25. The 40th percentile floor rejected ~60%
+# of candidates (top decile is genuinely rare in a calm regime). 25
+# still avoids the bottom-quartile entries (where IV is below normal
+# and selling vol is the wrong trade) without strangling deployment.
+IV_PERCENTILE_FLOOR_DEFAULT = Decimal("25.0")
 
 
 async def build_intents(

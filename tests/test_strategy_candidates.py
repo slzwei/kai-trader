@@ -1957,11 +1957,12 @@ async def test_per_name_dollar_cap_warning_uses_15pct_wording() -> None:
 # ------------- P6: bid-yield floor -------------
 
 async def test_bid_yield_floor_blocks_thin_yield_contract() -> None:
-    """A contract whose bid/strike/dte ratio is below 0.10%/day is dropped.
+    """A contract whose bid/strike/dte ratio is below 0.05%/day is dropped.
 
-    Concrete production case (2026-05-07): KMI 30.5P at $0.18 bid,
-    8 DTE. bid_yield_per_day = 0.18 / 30.5 / 8 = 0.074%/day → fails
-    the 0.10%/day floor. The strategy should refuse this trade.
+    Phase 5 retuning (2026-05-09) lowered the floor from 0.10%/day to
+    0.05%/day. Test case: a 0.04%/day-yield contract still gets
+    rejected. KHC 22.5P at $0.07 bid, 8 DTE: 0.07/22.5/8 = 0.039%/day,
+    which fails the new floor.
     """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
@@ -1969,18 +1970,18 @@ async def test_bid_yield_floor_blocks_thin_yield_contract() -> None:
     async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
         return [
             _put(
-                strike=30.5,
+                strike=22.5,
                 delta=-0.30,
                 expiration=expiry,
-                bid=0.18,
-                ask=0.22,
+                bid=0.07,
+                ask=0.10,
                 underlying=symbol,
             ),
         ]
 
     intents = await build_intents(
         regime=_regime("risk_on"),
-        sleeves=[_sleeve("index_core", whitelist=["KMI"])],
+        sleeves=[_sleeve("index_core", whitelist=["KHC"])],
         account=_account(equity=100_000),
         chain_fetcher=fetcher,
         today=today,

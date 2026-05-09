@@ -351,11 +351,12 @@ async def test_tick_post_profit_take_cooldown_blocks_reentry(
     }
     _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
     _patch_dependencies["get_chain"].return_value = [_put_contract()]
-    # Profit-take fired on SPY 2 hours ago; well inside the 4-hour
-    # post-profit-take window, so the worker should skip the entry
-    # despite the contract still being a top candidate.
+    # Phase 5 retuning lowered cooldown 4h → 1h. A profit-take 30 min
+    # ago is well inside the new 1-hour window so the worker should
+    # still skip the entry. (Pre-Phase-5 this test used 2h which now
+    # would NOT block.)
     _patch_dependencies["latest_profit_take_at_per_symbol"].return_value = {
-        "SPY": datetime.now(UTC) - timedelta(hours=2),
+        "SPY": datetime.now(UTC) - timedelta(minutes=30),
     }
 
     await worker_module.StrategyWorker().tick()

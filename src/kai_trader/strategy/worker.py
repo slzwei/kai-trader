@@ -78,7 +78,14 @@ from kai_trader.strategy.covered_calls import (
 from kai_trader.strategy.drawdown import check_and_trip as check_drawdown
 from kai_trader.strategy.earnings import get_earnings_status
 from kai_trader.strategy.iv_percentile import compute_iv_percentile_rank
-from kai_trader.strategy.iv_rv import compute_realized_vol_30d
+
+# Phase 5 retuning (2026-05-09): IV/RV gate is no longer wired into
+# the build_intents call (see ``Phase 5 retuning`` comment below) but
+# the import stays so the function is reachable for tests and for a
+# future re-enable. The deliberate-unused suppression makes ruff
+# happy while preserving the module-level binding test fixtures
+# monkeypatch against.
+from kai_trader.strategy.iv_rv import compute_realized_vol_30d  # noqa: F401
 from kai_trader.strategy.profit_take import CloseIntent, evaluate_profit_takes
 from kai_trader.strategy.regime import RegimeSnapshot, compute_and_record
 from kai_trader.strategy.render import (
@@ -301,7 +308,12 @@ class StrategyWorker:
             existing_short_puts=existing_shorts,
             today_already_deployed=today_already_deployed,
             cooldown_symbols=cooldown_symbols,
-            rv30_provider=compute_realized_vol_30d,
+            # Phase 5 retuning (2026-05-09): IV/RV gate disabled. The
+            # IV percentile filter is the primary VRP signal; running
+            # both gates double-rejected candidates in the 8-name
+            # universe. compute_realized_vol_30d stays imported for
+            # future re-enabling.
+            # rv30_provider=compute_realized_vol_30d,
             iv_percentile_provider=compute_iv_percentile_rank,
         )
 

@@ -337,7 +337,12 @@ async def _run_csp_entries(
         existing_short_puts=state.list_short_option_positions(),
         today_already_deployed=state.today_deployed,
         cooldown_symbols={s for s in state.cooldown_symbols},
-        rv30_provider=_make_rv30_provider(asof),
+        # Phase 5 retuning (2026-05-09): IV/RV gate disabled in favour
+        # of IV percentile alone. Running both was double-gating the
+        # candidate stream into 80% rejection. The percentile rank is
+        # the proper VRP signal; IV/RV stays available in the codebase
+        # but is no longer wired to the runner.
+        # rv30_provider=_make_rv30_provider(asof),
         iv_percentile_provider=_make_iv_percentile_provider(asof),
     )
     filled = 0

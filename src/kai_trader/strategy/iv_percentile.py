@@ -43,12 +43,14 @@ from kai_trader.logging import get_logger
 
 _log = get_logger(__name__)
 
-# P3 default floor: trade only when current IV is in the top 60% of
-# its 252-day history (rank >= 40th percentile). Below this floor the
-# vol is closer to its own median and the VRP edge is thin. The
-# default is conservative; it can be tuned by the operator at
-# runtime via a future settings hook.
-IV_PERCENTILE_FLOOR_DEFAULT: Final[Decimal] = Decimal("40.0")
+# P3 default floor: trade only when current IV is in the top 75% of
+# its 252-day history (rank >= 25th percentile). Phase 5 lowered this
+# from 40 to 25: the 40th-percentile floor rejected too many viable
+# trades when the regime had compressed IV across the universe. 25
+# still rules out the bottom-quartile entries (where IV is below
+# normal and selling vol is the wrong trade) without strangling the
+# strategy's deployment rate.
+IV_PERCENTILE_FLOOR_DEFAULT: Final[Decimal] = Decimal("25.0")
 IV_PERCENTILE_LOOKBACK_DAYS: Final[int] = 252
 IV_PERCENTILE_MIN_OBSERVATIONS: Final[int] = 30
 

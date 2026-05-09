@@ -55,9 +55,12 @@ _DEFAULT_SLEEVE_CONFIG: list[dict[str, Any]] = [
         "profit_take_pct": "0.30",
         "roll_trigger_delta": "0.35",
         "symbol_whitelist": [
-            # P1 (migration 023): 8-name high-IV cohort.
+            # Phase 5 (migration 025): 8 high-IV + 4 moderate-IV
+            # for deployment continuity. The IV percentile gate
+            # routes flow to wherever vol is rich on each tick.
             "MARA", "RIOT", "SOFI", "HOOD",
             "PLTR", "MU", "SNAP", "RIVN",
+            "F", "INTC", "GM", "KMI",
         ],
         "enabled": True,
         "earnings_blackout_enabled": True,
