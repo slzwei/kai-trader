@@ -1,11 +1,15 @@
 """Historical earnings calendar fetcher.
 
-Sourcing decision: the user's EODHD subscription does not include the
-Calendar API addon (the dedicated ``/api/calendar/earnings`` endpoint
-returns HTTP 403). The fallback is yfinance's ``get_earnings_dates``,
-which has documented quality issues for current and near-future dates
-but is reliable for historical (already-occurred) dates that the
-backtest needs.
+Sourcing decision (2026-05-10): EODHD Calendar API as primary,
+yfinance ``get_earnings_dates`` as fallback. Earlier this project
+hit 403 on the EODHD Calendar endpoint and dropped to yfinance only;
+the user has since added the Calendar add-on so EODHD is wired
+back as primary.
+
+Real-world catch: yfinance reported RIVN earnings as 2026-05-01
+(stale, already past); EODHD correctly reported 2026-05-12. The
+backtest harness now uses the same EODHD-primary path so backtest
+results don't bake in yfinance's stale-date bias.
 
 The async ``earnings_status`` function matches the
 ``EarningsStatusProvider`` signature consumed by
@@ -14,14 +18,16 @@ code can be invoked unchanged.
 
 Cache: one JSON file per symbol at
 ``backtest_cache/earnings/{symbol}.json``. Cache layout matches the
-EODHD shape so a future swap to EODHD when the addon is purchased is
-a one-function rewrite.
+EODHD shape (always has — was a forward-looking design choice).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -30,6 +36,7 @@ from typing import Any, Final, Literal
 import yfinance as yf
 
 from kai_trader.backtest.data.rates import LeakageError
+from kai_trader.config import get_settings
 from kai_trader.logging import get_logger
 
 _log = get_logger(__name__)
@@ -92,6 +99,49 @@ def _save_cache(symbol: str, rows: list[dict[str, Any]]) -> None:
     with tmp.open("w", encoding="utf-8") as fh:
         json.dump(rows, fh, sort_keys=True)
     tmp.replace(path)
+
+
+_EODHD_CALENDAR_URL: Final[str] = "https://eodhd.com/api/calendar/earnings"
+_EODHD_TIMEOUT_S: Final[int] = 15
+
+
+def _fetch_eodhd_sync(symbol: str, start: date, end: date) -> list[dict[str, Any]]:
+    """Primary fetcher: EODHD Calendar API in [start, end] window.
+
+    Returns events in the same shape the cache stores (matching the
+    EODHD response), so callers can persist directly. Empty list when
+    no events; raises on HTTP error so the caller can decide between
+    fallback and skip.
+    """
+    settings = get_settings()
+    if settings.eodhd_api_key is None:
+        return []
+    key = settings.eodhd_api_key.get_secret_value()
+    params = urllib.parse.urlencode({
+        "api_token": key,
+        "symbols": f"{symbol.upper()}.US",
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "fmt": "json",
+    })
+    url = f"{_EODHD_CALENDAR_URL}?{params}"
+    with urllib.request.urlopen(url, timeout=_EODHD_TIMEOUT_S) as resp:
+        body = resp.read().decode("utf-8")
+    payload = json.loads(body)
+    events = payload.get("earnings") or []
+    out: list[dict[str, Any]] = []
+    for e in events:
+        rd = e.get("report_date")
+        if not isinstance(rd, str):
+            continue
+        out.append({
+            "code": e.get("code", f"{symbol.upper()}.US"),
+            "report_date": rd,
+            "before_after_market": e.get("before_after_market") or "Unknown",
+            "actual": e.get("actual"),
+            "estimate": e.get("estimate"),
+        })
+    return out
 
 
 def _fetch_yfinance_sync(symbol: str) -> list[dict[str, Any]]:
@@ -177,21 +227,45 @@ async def warm_cache(
     """Populate the per-symbol earnings cache. Returns rows added.
 
     No-op for hard-coded non-earnings symbols (ETFs and indexes).
-    ``start`` / ``end`` are accepted for interface compatibility; yfinance
-    returns a fixed-size historical window so the dates are advisory.
+    EODHD primary, yfinance fallback. EODHD honors the ``[start, end]``
+    window (returns events in range); yfinance returns its own ~25-row
+    historical window regardless of dates passed.
     """
     upper = symbol.upper()
     if upper in _HARD_CODED_NON_EARNINGS_SYMBOLS:
         return 0
+    # Union of EODHD + yfinance: EODHD has cleaner forward-looking
+    # data (97.25% accuracy on official announcement dates), yfinance
+    # has the historical record. Merging both via dedupe key
+    # (code, report_date) gives the most-complete coverage. EODHD
+    # is queried for the full backtest window plus a 1-year forward
+    # pad so the live filter has upcoming dates ready too.
+    eodhd_raw: list[dict[str, Any]] = []
     try:
-        raw = await asyncio.to_thread(_fetch_yfinance_sync, upper)
-    except Exception as exc:
+        eodhd_end = end + timedelta(days=365)
+        eodhd_raw = await asyncio.to_thread(_fetch_eodhd_sync, upper, start, eodhd_end)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
         _log.warning(
-            "backtest.earnings.fetch_failed",
+            "backtest.earnings.eodhd_failed",
             symbol=upper,
             error=str(exc),
         )
-        return 0
+    yf_raw: list[dict[str, Any]] = []
+    try:
+        yf_raw = await asyncio.to_thread(_fetch_yfinance_sync, upper)
+    except Exception as exc:
+        _log.warning(
+            "backtest.earnings.yfinance_failed",
+            symbol=upper,
+            error=str(exc),
+        )
+    # Merge: EODHD wins on conflicts (it's the higher-quality source).
+    fetched_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in yf_raw:
+        fetched_by_key[(r.get("code", ""), r.get("report_date", ""))] = r
+    for r in eodhd_raw:  # eodhd second so it overwrites yfinance
+        fetched_by_key[(r.get("code", ""), r.get("report_date", ""))] = r
+    raw = list(fetched_by_key.values())
     existing = _load_cache(upper)
     by_key: dict[tuple[str, str], dict[str, Any]] = {
         (r.get("code", ""), r.get("report_date", "")): r for r in existing
