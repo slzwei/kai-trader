@@ -28,7 +28,7 @@ from kai_trader.broker.alpaca import PositionSnapshot
 from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.logging import get_logger
-from kai_trader.strategy.earnings import EarningsStatus
+from kai_trader.strategy.earnings import EARNINGS_BLACKOUT_DAYS, EarningsStatus
 from kai_trader.strategy.regime import RegimeSnapshot
 
 ChainFetcher = Callable[[str, date | None], Awaitable[list[OptionContract]]]
@@ -299,7 +299,7 @@ async def build_call_intents(
             ):
                 try:
                     status = await earnings_status(
-                        position.symbol, today, sleeve.target_dte_max
+                        position.symbol, today, EARNINGS_BLACKOUT_DAYS
                     )
                 except Exception as exc:
                     _log.warning(

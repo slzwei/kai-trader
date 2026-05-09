@@ -39,7 +39,7 @@ from kai_trader.strategy.candidates import (
     _target_delta_for,
     _within_dte_band,
 )
-from kai_trader.strategy.earnings import EarningsStatus
+from kai_trader.strategy.earnings import EARNINGS_BLACKOUT_DAYS, EarningsStatus
 from kai_trader.strategy.regime import RegimeSnapshot
 
 _log = get_logger(__name__)
@@ -216,10 +216,9 @@ async def evaluate_rolls(
             earnings_status is not None
             and sleeve.earnings_blackout_enabled
         ):
-            new_dte_days = (candidate.expiration - today).days
             try:
                 status = await earnings_status(
-                    underlying, today, max(new_dte_days, 1)
+                    underlying, today, EARNINGS_BLACKOUT_DAYS
                 )
             except Exception as exc:
                 _log.warning(

@@ -61,6 +61,14 @@ _quote_type_cache: dict[str, tuple[str | None, datetime]] = {}
 
 EarningsStatus = Literal["in_window", "outside_window", "unknown"]
 
+# Forward-looking blackout window applied to all entry, roll, and CC paths.
+# Sized to ~the post-announcement IV-crush window plus a buffer; tighter
+# than the sleeve DTE band so the filter does not over-block. Why 3:
+# earnings IV crush is a same-day event; trades that close within 3 days
+# of a confirmed announcement carry the bulk of the gap risk while older
+# horizons recover their premium budget.
+EARNINGS_BLACKOUT_DAYS = 3
+
 # Instrument types that never report earnings. yfinance returns these
 # strings in fast_info.quote_type. For any of them the earnings filter
 # must short-circuit to "outside_window"; treating "no upcoming row" as

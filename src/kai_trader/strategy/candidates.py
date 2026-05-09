@@ -21,7 +21,7 @@ from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
 from kai_trader.broker.options_data import OptionContract, parse_occ_symbol
 from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.logging import get_logger
-from kai_trader.strategy.earnings import EarningsStatus
+from kai_trader.strategy.earnings import EARNINGS_BLACKOUT_DAYS, EarningsStatus
 from kai_trader.strategy.iv_rv import IV_RV_RATIO_MIN, passes_iv_rv_floor
 from kai_trader.strategy.regime import RegimeSnapshot
 
@@ -870,7 +870,7 @@ async def build_intents_with_diagnostics(
                 status: EarningsStatus
                 try:
                     status = await earnings_status(
-                        symbol, today, sleeve.target_dte_max
+                        symbol, today, EARNINGS_BLACKOUT_DAYS
                     )
                 except ImportError:
                     # Missing deploy dep (e.g. lxml) must not be hidden
