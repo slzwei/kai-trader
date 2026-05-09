@@ -666,6 +666,12 @@ def _score_candidate(contract: OptionContract, today: date) -> Decimal | None:
 
 EarningsStatusProvider = Callable[[str, date, int], Awaitable[EarningsStatus]]
 RV30Provider = Callable[[str], Awaitable["Decimal | None"]]
+# P3 (Phase 3c): IV percentile rank provider. Given (symbol,
+# current_iv) returns the percentile rank (0-100) of current_iv in
+# the symbol's trailing 252-day IV history. Returns None when
+# history is too thin to compute. Fail-open when None.
+IVPercentileProvider = Callable[[str, "Decimal"], Awaitable["Decimal | None"]]
+IV_PERCENTILE_FLOOR_DEFAULT = Decimal("40.0")
 
 
 async def build_intents(
@@ -680,6 +686,8 @@ async def build_intents(
     today_already_deployed: Decimal | None = None,
     cooldown_symbols: set[str] | None = None,
     rv30_provider: RV30Provider | None = None,
+    iv_percentile_provider: IVPercentileProvider | None = None,
+    iv_percentile_floor: Decimal = IV_PERCENTILE_FLOOR_DEFAULT,
 ) -> list[TradeIntent]:
     """Walk active sleeves and produce intent rows up to the cap matrix.
 
@@ -697,6 +705,8 @@ async def build_intents(
         today_already_deployed=today_already_deployed,
         cooldown_symbols=cooldown_symbols,
         rv30_provider=rv30_provider,
+        iv_percentile_provider=iv_percentile_provider,
+        iv_percentile_floor=iv_percentile_floor,
     )
     return intents
 
@@ -713,6 +723,8 @@ async def build_intents_with_diagnostics(
     today_already_deployed: Decimal | None = None,
     cooldown_symbols: set[str] | None = None,
     rv30_provider: RV30Provider | None = None,
+    iv_percentile_provider: IVPercentileProvider | None = None,
+    iv_percentile_floor: Decimal = IV_PERCENTILE_FLOOR_DEFAULT,
 ) -> tuple[list[TradeIntent], BuildDiagnostics]:
     """Build intents and return the per-sleeve diagnostic counters alongside.
 
@@ -909,6 +921,43 @@ async def build_intents_with_diagnostics(
                         symbol=contract.underlying,
                         iv=str(contract.implied_volatility),
                         rv30=str(rv30),
+                    )
+                    continue
+            # P3 (Phase 3c): IV percentile gate. The IV/RV ratio above
+            # is a relative-vol check (forward IV vs trailing realized);
+            # the percentile rank below is an absolute richness check
+            # (where does today's IV sit in its OWN 252-day history).
+            # Both fail-open when their data sources can't produce a
+            # signal. The percentile gate is the primary VRP filter
+            # for the income recalibration; IV/RV stays as defense-
+            # in-depth for the transition.
+            if (
+                iv_percentile_provider is not None
+                and contract.implied_volatility is not None
+            ):
+                try:
+                    iv_rank = await iv_percentile_provider(
+                        contract.underlying, contract.implied_volatility
+                    )
+                except Exception as exc:
+                    _log.warning(
+                        "strategy.iv_percentile_provider.failed",
+                        sleeve=sleeve.sleeve,
+                        symbol=contract.underlying,
+                        error=str(exc),
+                    )
+                    iv_rank = None
+                if iv_rank is not None and iv_rank < iv_percentile_floor:
+                    symbols_skipped_for_iv_rv_floor += 1
+                    if contract.underlying not in iv_rv_floor_symbols:
+                        iv_rv_floor_symbols.append(contract.underlying)
+                    _log.info(
+                        "strategy.iv_percentile.skipped",
+                        sleeve=sleeve.sleeve,
+                        symbol=contract.underlying,
+                        iv=str(contract.implied_volatility),
+                        iv_rank=str(iv_rank),
+                        floor=str(iv_percentile_floor),
                     )
                     continue
             score = _score_candidate(contract, today)

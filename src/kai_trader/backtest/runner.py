@@ -301,6 +301,23 @@ def _make_rv30_provider(asof: date) -> Callable[[str], Awaitable[Decimal | None]
     return _provider
 
 
+def _make_iv_percentile_provider(
+    asof: date,
+) -> Callable[[str, Decimal], Awaitable[Decimal | None]]:
+    """Build an asof-bounded IV-percentile provider for the runner.
+
+    Wraps ``backtest.data.iv_history.iv_percentile_rank`` so the
+    strategy code's IV/RV-style filter pattern can call into the
+    backtest's pre-built IV history cache. Returns None when fewer
+    than 30 prior observations exist (matches production fail-open).
+    """
+    from kai_trader.backtest.data import iv_history
+
+    async def _provider(symbol: str, current_iv: Decimal) -> Decimal | None:
+        return iv_history.iv_percentile_rank(symbol, asof, current_iv)
+    return _provider
+
+
 async def _run_csp_entries(
     state: BacktestState,
     broker: BacktestBroker,
@@ -321,6 +338,7 @@ async def _run_csp_entries(
         today_already_deployed=state.today_deployed,
         cooldown_symbols={s for s in state.cooldown_symbols},
         rv30_provider=_make_rv30_provider(asof),
+        iv_percentile_provider=_make_iv_percentile_provider(asof),
     )
     filled = 0
     for intent in intents:

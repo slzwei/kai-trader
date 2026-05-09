@@ -77,6 +77,7 @@ from kai_trader.strategy.covered_calls import (
 )
 from kai_trader.strategy.drawdown import check_and_trip as check_drawdown
 from kai_trader.strategy.earnings import get_earnings_status
+from kai_trader.strategy.iv_percentile import compute_iv_percentile_rank
 from kai_trader.strategy.iv_rv import compute_realized_vol_30d
 from kai_trader.strategy.profit_take import CloseIntent, evaluate_profit_takes
 from kai_trader.strategy.regime import RegimeSnapshot, compute_and_record
@@ -301,6 +302,7 @@ class StrategyWorker:
             today_already_deployed=today_already_deployed,
             cooldown_symbols=cooldown_symbols,
             rv30_provider=compute_realized_vol_30d,
+            iv_percentile_provider=compute_iv_percentile_rank,
         )
 
         submitted: list[str] = []

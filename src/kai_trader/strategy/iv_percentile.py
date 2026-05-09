@@ -143,7 +143,7 @@ def get_history_until(
     return [iv for _iso, iv in selected[-lookback_days:]]
 
 
-def compute_iv_percentile_rank(
+async def compute_iv_percentile_rank(
     symbol: str,
     current_iv: Decimal,
     *,
@@ -156,6 +156,11 @@ def compute_iv_percentile_rank(
     ``IV_PERCENTILE_MIN_OBSERVATIONS`` observations are available.
     Fail-open default: when None, callers should let the trade
     through (the IV history is too thin to gate on).
+
+    Async signature matches the IVPercentileProvider type alias in
+    candidates.py — the lookup is synchronous (in-memory dict) but
+    the protocol is async-future-proof for swap-in implementations
+    that hit an external store.
     """
     history = get_history_until(symbol, asof=asof, lookback_days=lookback_days)
     if len(history) < IV_PERCENTILE_MIN_OBSERVATIONS:
