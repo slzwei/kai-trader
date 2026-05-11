@@ -189,11 +189,14 @@ class StrategyWorker:
         flags = await get_all_flags()
 
         # Drawdown circuit breaker runs before strategy logic so a fresh
-        # breach trips the kill switch and short-circuits this tick.
+        # breach trips the kill switch and short-circuits this tick. The
+        # account_number scopes the snapshot lookup so a previous Alpaca
+        # account's equity history cannot poison the high-water mark.
         account = await get_account()
         dd_check = await check_drawdown(
             current_equity=account.equity,
             kill_switch_already_on=flags.get("kill_switch", False),
+            current_account_number=account.account_number or None,
         )
         if dd_check.breached and not flags.get("kill_switch", False):
             # We just tripped the breaker. Re-read flags so the rest of

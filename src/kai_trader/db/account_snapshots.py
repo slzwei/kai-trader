@@ -30,6 +30,9 @@ class StoredSnapshot:
     day_pl: Decimal
     status: str
     paper: bool
+    # Nullable: pre-migration-033 rows have no value. Defaulted so test
+    # fixtures continue to construct without supplying it.
+    account_number: str | None = None
 
 
 async def record_snapshot(snapshot: AccountSnapshot) -> str:
@@ -40,8 +43,8 @@ async def record_snapshot(snapshot: AccountSnapshot) -> str:
             """
             insert into account_snapshots
                 (equity, last_equity, cash, buying_power, portfolio_value,
-                 day_pl, status, paper)
-            values ($1, $2, $3, $4, $5, $6, $7, $8)
+                 day_pl, status, paper, account_number)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             returning id
             """,
             snapshot.equity,
@@ -52,26 +55,55 @@ async def record_snapshot(snapshot: AccountSnapshot) -> str:
             snapshot.day_pl,
             snapshot.status,
             snapshot.paper,
+            snapshot.account_number or None,
         )
     return str(row["id"])
 
 
-async def recent_snapshots(limit: int = 10) -> list[StoredSnapshot]:
-    """Return the most recent ``limit`` snapshots, newest first."""
+async def recent_snapshots(
+    limit: int = 10,
+    *,
+    account_number: str | None = None,
+) -> list[StoredSnapshot]:
+    """Return the most recent ``limit`` snapshots, newest first.
+
+    When ``account_number`` is supplied the result is filtered to rows
+    tagged with that Alpaca account, so an account swap cannot pollute
+    drawdown or history queries with the previous account's equity
+    curve. Legacy rows (NULL account_number) are excluded by the filter,
+    which is the intended behaviour: they belong to an account the
+    caller is not asking about.
+    """
     if limit < 1:
         raise ValueError(f"limit must be >= 1, got {limit}")
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            select id, captured_at, equity, last_equity, cash, buying_power,
-                   portfolio_value, day_pl, status, paper
-              from account_snapshots
-             order by captured_at desc
-             limit $1
-            """,
-            limit,
-        )
+        if account_number is None:
+            rows = await conn.fetch(
+                """
+                select id, captured_at, equity, last_equity, cash,
+                       buying_power, portfolio_value, day_pl, status,
+                       paper, account_number
+                  from account_snapshots
+                 order by captured_at desc
+                 limit $1
+                """,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                select id, captured_at, equity, last_equity, cash,
+                       buying_power, portfolio_value, day_pl, status,
+                       paper, account_number
+                  from account_snapshots
+                 where account_number = $1
+                 order by captured_at desc
+                 limit $2
+                """,
+                account_number,
+                limit,
+            )
     return [
         StoredSnapshot(
             id=str(row["id"]),
@@ -84,6 +116,7 @@ async def recent_snapshots(limit: int = 10) -> list[StoredSnapshot]:
             day_pl=row["day_pl"],
             status=row["status"],
             paper=row["paper"],
+            account_number=row["account_number"],
         )
         for row in rows
     ]

@@ -70,14 +70,25 @@ async def check_and_trip(
     *,
     current_equity: Decimal,
     kill_switch_already_on: bool,
+    current_account_number: str | None = None,
 ) -> DrawdownCheck:
     """Read recent snapshots, evaluate drawdown, trip the kill switch if needed.
 
     Returns the check result so the worker can include the numbers in its
     tick summary. When the breach is fresh (kill switch was off), this also
     fires a critical-priority notification.
+
+    ``current_account_number`` scopes the snapshot lookup to the Alpaca
+    account currently in use. Without it, swapping Alpaca accounts (e.g.
+    replacing a 100k paper account with a fresh 30k one) leaves the old
+    account's high-water mark in the table and trips a phantom drawdown
+    on the next tick. When the worker passes the live account number,
+    legacy or other-account rows are filtered out at the SQL layer.
     """
-    snapshots = await recent_snapshots(limit=200)
+    snapshots = await recent_snapshots(
+        limit=200,
+        account_number=current_account_number,
+    )
     # Filter to the lookback window. The cutoff is anchored to NOW
     # rather than to the most-recent snapshot's timestamp: if the bot
     # was offline for a few days, anchoring to the latest snapshot

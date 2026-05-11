@@ -43,6 +43,7 @@ def _sample_snapshot() -> AccountSnapshot:
         day_pl=Decimal("500.00"),
         status="ACTIVE",
         paper=True,
+        account_number="PA-TEST-123",
     )
 
 
@@ -60,6 +61,7 @@ async def test_record_snapshot_inserts_and_returns_id() -> None:
     assert args[6] == Decimal("500.00")     # day_pl
     assert args[7] == "ACTIVE"
     assert args[8] is True
+    assert args[9] == "PA-TEST-123"          # account_number
 
 
 async def test_recent_snapshots_returns_typed_rows() -> None:
@@ -76,6 +78,7 @@ async def test_recent_snapshots_returns_typed_rows() -> None:
             "day_pl": Decimal("500"),
             "status": "ACTIVE",
             "paper": True,
+            "account_number": "PA-TEST-123",
         }
     ])
 
@@ -88,6 +91,24 @@ async def test_recent_snapshots_returns_typed_rows() -> None:
     assert snap.equity == Decimal("100000")
     assert snap.day_pl == Decimal("500")
     assert snap.paper is True
+    assert snap.account_number == "PA-TEST-123"
+
+
+async def test_recent_snapshots_filters_by_account_number() -> None:
+    """When account_number is supplied, only rows for that account return."""
+    pool = _fake_pool()
+    pool._conn.fetch = AsyncMock(return_value=[])
+
+    with patch("kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)):
+        await account_snapshots.recent_snapshots(
+            limit=200, account_number="PA-NEW"
+        )
+
+    args, _ = pool._conn.fetch.await_args
+    # The filtered query takes (sql, account_number, limit).
+    assert "where account_number" in args[0]
+    assert args[1] == "PA-NEW"
+    assert args[2] == 200
 
 
 async def test_recent_snapshots_passes_limit_to_query() -> None:

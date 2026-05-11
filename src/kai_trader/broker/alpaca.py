@@ -45,6 +45,10 @@ class AccountSnapshot:
     day_pl: Decimal
     status: str
     paper: bool
+    # Alpaca's stable per-account identifier. Defaulted to "" so legacy
+    # test fixtures and any pre-2026-05-11 code paths keep constructing
+    # cleanly; production callers (``get_account``) always populate it.
+    account_number: str = ""
 
 
 @dataclass(frozen=True)
@@ -184,6 +188,7 @@ async def get_account() -> AccountSnapshot:
         day_pl=equity - last_equity,
         status=_enum_value(account.status),
         paper=get_settings().alpaca_paper,
+        account_number=str(getattr(account, "account_number", "") or ""),
     )
 
 
