@@ -103,12 +103,32 @@ def _is_stale_connection(error_str: str) -> bool:
 # to short, queryable reason strings. Anything not listed here falls back to
 # the generic ``submit_exception`` so the unknown error still gets surfaced
 # with full text via ``SubmitResult.error``.
+#
+# 42210000 is intentionally absent. Alpaca uses it for several
+# distinct validation failures (wash trade, limit price >2 decimals,
+# strike not on the OCC grid). Mapping it to any single label was
+# silently mis-classifying real failures (a price-format rejection
+# would show up as ``wash_trade_blocked`` in /recent_trades, which is
+# actively misleading). Let it fall through to ``submit_exception``
+# so the full Alpaca message text survives on ``SubmitResult.error``.
 _ALPACA_ERROR_CODE_REASONS: dict[int, str] = {
     40310000: "insufficient_options_buying_power",
     40310001: "insufficient_buying_power",
     40010001: "invalid_order_request",
-    42210000: "wash_trade_blocked",
 }
+
+
+# Options limit prices must carry at most 2 decimal places (Alpaca code
+# 42210000 with "limit price must be limited to 2 decimal places"
+# message). The strategy's chain-mid path produces half-cent prices
+# (e.g. bid 0.10 / ask 0.15 -> mid 0.125), so quantize at the broker
+# layer so every submit path benefits uniformly. ROUND_HALF_UP biases
+# sells slightly in our favour without changing fills materially: an
+# 8-contract SNAP CSP rounded 0.125 -> 0.13 asks for $4 more premium
+# vs 0.12, well inside spread noise.
+def _quantize_limit_price(price: Decimal) -> Decimal:
+    from decimal import ROUND_HALF_UP
+    return price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def _classify_submit_error(exc: BaseException) -> str:
@@ -343,7 +363,7 @@ async def submit_short_put(
         qty=qty,
         side=OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
-        limit_price=float(limit_price),
+        limit_price=float(_quantize_limit_price(limit_price)),
         client_order_id=client_order_id,
     )
     try:
@@ -447,7 +467,7 @@ async def submit_short_call(
         qty=qty,
         side=OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
-        limit_price=float(limit_price),
+        limit_price=float(_quantize_limit_price(limit_price)),
         client_order_id=client_order_id,
     )
     try:
@@ -611,7 +631,7 @@ async def submit_buy_to_close(
         qty=qty,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
-        limit_price=float(limit_price),
+        limit_price=float(_quantize_limit_price(limit_price)),
         client_order_id=client_order_id,
     )
     try:

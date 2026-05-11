@@ -406,6 +406,67 @@ async def test_classify_submit_error_falls_back_to_generic() -> None:
     assert broker._classify_submit_error(RuntimeError("boom")) == "submit_exception"
 
 
+async def test_classify_42210000_falls_through_to_generic() -> None:
+    """42210000 covers multiple validation cases. The raw message wins.
+
+    Pre-2026-05-11 the mapping forced "wash_trade_blocked" for every
+    42210000, which mislabelled the real cause when Alpaca rejected a
+    half-cent limit price. Confirm the code no longer maps so the full
+    error text survives on SubmitResult.error.
+    """
+    class _FakeAPIError(Exception):
+        def __init__(self, code: int) -> None:
+            super().__init__("limit price must be limited to 2 decimal places")
+            self.code = code
+
+    assert broker._classify_submit_error(_FakeAPIError(42210000)) == "submit_exception"
+
+
+def test_quantize_limit_price_rounds_half_cent_up() -> None:
+    """Half-cent mids must round to a price Alpaca will accept (2dp)."""
+    from decimal import Decimal as D
+    assert broker._quantize_limit_price(D("0.125")) == D("0.13")
+    assert broker._quantize_limit_price(D("0.124")) == D("0.12")
+    # Already 2dp values pass through unchanged.
+    assert broker._quantize_limit_price(D("1.10")) == D("1.10")
+    assert broker._quantize_limit_price(D("5.07")) == D("5.07")
+
+
+async def test_submit_short_put_quantizes_half_cent_mid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 0.125 mid must reach Alpaca as 0.13, not 0.125."""
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+
+    class _FakeOrder:
+        id = "alpaca-uuid"
+        status = "accepted"
+
+    fake = MagicMock()
+    fake.submit_order.return_value = _FakeOrder()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={
+            "kill_switch": False, "trading_enabled": True,
+            "new_entries_enabled": True,
+        }),
+    )
+
+    result = await broker.submit_short_put(
+        option_symbol="SNAP260522P00005500",
+        qty=8,
+        limit_price=Decimal("0.125"),
+    )
+
+    assert result.submitted is True
+    request = fake.submit_order.call_args.args[0]
+    # 0.125 rounded to 2dp half-up = 0.13. Round-trip float == Decimal.
+    assert request.limit_price == 0.13
+
+
 async def test_close_position_refused_when_kill_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
