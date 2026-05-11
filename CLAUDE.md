@@ -177,6 +177,7 @@ kai-trader/
 | WEEKLY_CHART_UTC_DAY  | no       | Weekday for the weekly equity chart, 0=Mon..6=Sun. Default `0`. |
 | WEEKLY_CHART_UTC_TIME | no       | `HH:MM` UTC for the weekly chart post. Default `00:00`. |
 | WEEKLY_CHART_ENABLED  | no       | `true` (default) or `false` to suppress the weekly chart entirely. |
+| EODHD_API_KEY         | strongly recommended | EODHD Calendar API key. Primary earnings source for the live bot (`src/kai_trader/strategy/earnings.py`) with yfinance as fallback, and required by the backtest harness. Without it the live bot falls through to yfinance only; coverage gaps trigger fail-closed unknown-skips across the universe. |
 
 ## Conventions
 

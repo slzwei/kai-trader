@@ -125,6 +125,20 @@ class Settings(BaseSettings):
         ),
     )
 
+    eodhd_api_key: SecretStr | None = Field(
+        default=None,
+        alias="EODHD_API_KEY",
+        description=(
+            "EODHD Calendar API key. Used as the PRIMARY earnings source by "
+            "the live bot (src/kai_trader/strategy/earnings.py), with "
+            "yfinance as fallback, and by the backtest harness "
+            "(src/kai_trader/backtest/). Without it the live bot falls "
+            "through to yfinance only, which has documented coverage gaps "
+            "and triggers fail-closed unknown-skips across the universe. "
+            "Sign up at https://eodhd.com/."
+        ),
+    )
+
     env: Environment = Field(default="dev", alias="ENV")
     log_level: LogLevel = Field(default="INFO", alias="LOG_LEVEL")
     timezone: str = Field(default="Asia/Singapore", alias="TIMEZONE")

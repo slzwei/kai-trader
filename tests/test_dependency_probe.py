@@ -212,3 +212,67 @@ def test_alpaca_key_probe_raises_on_empty_string(
         dependency_probe.AlpacaKeyConfigError, match="empty string"
     ):
         dependency_probe.assert_alpaca_keys_resolvable()
+
+
+def test_eodhd_key_probe_warns_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No key set: must log warning event so deploy logs surface the gap."""
+    captured: list[dict[str, object]] = []
+
+    class _FakeLog:
+        def error(self, event: str, **kwargs: object) -> None:
+            captured.append({"event": event, **kwargs, "level": "error"})
+
+        def warning(self, event: str, **kwargs: object) -> None:
+            captured.append({"event": event, **kwargs, "level": "warning"})
+
+        def info(self, event: str, **kwargs: object) -> None:
+            captured.append({"event": event, **kwargs, "level": "info"})
+
+    class _Stub:
+        eodhd_api_key = None
+
+    monkeypatch.setattr("kai_trader.config.get_settings", lambda: _Stub())
+    monkeypatch.setattr(dependency_probe, "_log", _FakeLog())
+
+    dependency_probe.log_eodhd_key_status()
+
+    events = [c for c in captured if c["event"] == "eodhd_key_probe.missing"]
+    assert len(events) == 1
+    assert events[0]["level"] == "warning"
+
+
+def test_eodhd_key_probe_logs_present_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Key set: log length + 6-char prefix so the operator can spot a typo."""
+    captured: list[dict[str, object]] = []
+
+    class _FakeLog:
+        def error(self, event: str, **kwargs: object) -> None:
+            captured.append({"event": event, **kwargs, "level": "error"})
+
+        def warning(self, event: str, **kwargs: object) -> None:
+            captured.append({"event": event, **kwargs, "level": "warning"})
+
+        def info(self, event: str, **kwargs: object) -> None:
+            captured.append({"event": event, **kwargs, "level": "info"})
+
+    class _Secret:
+        def get_secret_value(self) -> str:
+            return "682e16bc7c4ad7.88056657"
+
+    class _Stub:
+        eodhd_api_key = _Secret()
+
+    monkeypatch.setattr("kai_trader.config.get_settings", lambda: _Stub())
+    monkeypatch.setattr(dependency_probe, "_log", _FakeLog())
+
+    dependency_probe.log_eodhd_key_status()
+
+    events = [c for c in captured if c["event"] == "eodhd_key_probe.present"]
+    assert len(events) == 1
+    assert events[0]["level"] == "info"
+    assert events[0]["length"] == len("682e16bc7c4ad7.88056657")
+    assert events[0]["prefix"] == "682e16"

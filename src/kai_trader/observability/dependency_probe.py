@@ -182,3 +182,33 @@ def assert_alpaca_keys_resolvable() -> None:
         "alpaca_key_probe.passed",
         paper=settings.alpaca_paper,
     )
+
+
+def log_eodhd_key_status() -> None:
+    """Log whether EODHD_API_KEY made it into the live process at boot.
+
+    Non-fatal on purpose: the earnings module has yfinance as a fallback,
+    so a missing EODHD key degrades the strategy rather than killing
+    boot. The log line exists because diagnosing "EODHD not being read"
+    from tick output alone is painful: this surfaces the truth in deploy
+    logs the moment the new container starts.
+    """
+    from kai_trader.config import get_settings
+
+    settings = get_settings()
+    if settings.eodhd_api_key is None:
+        _log.warning(
+            "eodhd_key_probe.missing",
+            note=(
+                "EODHD_API_KEY not set; earnings filter will run on "
+                "yfinance only. Expect 'unknown, fail-closed' skips "
+                "across the universe."
+            ),
+        )
+        return
+    raw = settings.eodhd_api_key.get_secret_value()
+    _log.info(
+        "eodhd_key_probe.present",
+        length=len(raw),
+        prefix=raw[:6] if len(raw) >= 6 else raw,
+    )
