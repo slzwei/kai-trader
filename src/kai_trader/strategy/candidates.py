@@ -85,14 +85,19 @@ MAX_CONTRACTS_PER_SYMBOL = 10
 # names. Three reinforcing controls:
 #
 #   * PER_TICK_DEPLOYMENT_CAP_PCT: total new collateral committed in any
-#     single tick is capped at 10% of equity. Blocks single-tick blow-out.
+#     single tick is capped at this fraction of equity. Blocks
+#     single-tick blow-out. Current value below.
 #   * PER_DAY_NEW_DEPLOYMENT_PCT: cumulative new collateral since UTC
-#     midnight is capped at 30% of equity. Blocks 4-hour blow-out across
-#     many ticks even when each individual tick is under the per-tick cap.
-#   * COOLDOWN_TICKS: a symbol entered (filled or submitted) in the last 6
-#     ticks (default = 30 minutes at 5-min cadence) is excluded from
-#     candidate selection. Forces the strategy to diversify across the
-#     pool rather than greedy-stacking the same top-scored names.
+#     midnight is capped at this fraction of equity. Blocks multi-hour
+#     blow-out across many ticks even when each individual tick is
+#     under the per-tick cap. Current value below.
+#   * COOLDOWN_TICKS: a symbol entered (filled or submitted) in the
+#     last N ticks is excluded from candidate selection. Forces the
+#     strategy to diversify across the pool rather than greedy-stacking
+#     the same top-scored names.
+# Current values are sized for live capital under Variant A safety;
+# the constants below are the source of truth. Read these directly
+# rather than trusting any narrative percentage in surrounding docs.
 # Phase 11: revert Phase 10's overly aggressive caps. Phase 10's
 # 50% per-tick + 1-tick cooldown caused cash-exhaustion broker
 # rejections that crashed monthly return to 0.37%. Phase 8's caps
@@ -257,7 +262,8 @@ class BuildDiagnostics:
         if self.intents_dropped_for_per_tick_cap > 0:
             warnings.append(
                 f"{self.intents_dropped_for_per_tick_cap} intent(s) dropped by "
-                f"per-tick deployment cap (10% of equity)."
+                f"per-tick deployment cap "
+                f"({PER_TICK_DEPLOYMENT_CAP_PCT:.0%} of equity)."
             )
         if self.intents_dropped_for_per_day_cap > 0:
             warnings.append(
