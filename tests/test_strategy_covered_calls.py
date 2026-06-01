@@ -91,7 +91,12 @@ def _put_for_filter() -> OptionContract:
     )
 
 
-def _equity(symbol: str = "AMZN", qty: str = "100") -> PositionSnapshot:
+def _equity(
+    symbol: str = "AMZN",
+    qty: str = "100",
+    *,
+    qty_available: str | None = None,
+) -> PositionSnapshot:
     return PositionSnapshot(
         symbol=symbol,
         qty=Decimal(qty),
@@ -101,6 +106,7 @@ def _equity(symbol: str = "AMZN", qty: str = "100") -> PositionSnapshot:
         market_value=None,
         unrealized_pl=None,
         unrealized_intraday_pl=None,
+        qty_available=Decimal(qty_available) if qty_available is not None else None,
     )
 
 
@@ -219,6 +225,50 @@ async def test_build_call_intents_multiple_contracts_per_position() -> None:
     )
     assert len(intents) == 1
     assert intents[0].qty == 3
+
+
+async def test_build_call_intents_no_intent_when_shares_fully_committed() -> None:
+    """A working CC drops qty_available to 0; no duplicate CC is proposed.
+
+    Regression for the KMI duplicate-order failure: sizing off total ``qty``
+    re-proposed the same CC every tick, and Alpaca rejected each as an
+    uncovered call because the shares were already reserved by the working
+    order. Sizing off ``qty_available`` yields qty 0, so nothing is built.
+    """
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_call(strike=260, delta=0.30, expiration=expiry)]
+
+    intents, _diag = await build_call_intents(
+        long_equity_positions=[_equity("AMZN", "100", qty_available="0")],
+        sleeves=[_sleeve(whitelist=["AMZN"])],
+        regime=_regime("neutral"),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert intents == []
+
+
+async def test_build_call_intents_sizes_off_available_not_total() -> None:
+    """qty derives from uncommitted shares, not the full holding."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [_call(strike=260, delta=0.30, expiration=expiry)]
+
+    # 300 shares held, but 100 already committed to a working CC -> 1 free lot.
+    intents, _diag = await build_call_intents(
+        long_equity_positions=[_equity("AMZN", "300", qty_available="100")],
+        sleeves=[_sleeve(whitelist=["AMZN"])],
+        regime=_regime("neutral"),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert len(intents) == 1
+    assert intents[0].qty == 1
 
 
 async def test_build_call_intents_skips_position_below_round_lot() -> None:

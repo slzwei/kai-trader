@@ -49,6 +49,13 @@ class AccountSnapshot:
     # test fixtures and any pre-2026-05-11 code paths keep constructing
     # cleanly; production callers (``get_account``) always populate it.
     account_number: str = ""
+    # Broker buying power available for opening new options positions, net
+    # of collateral already locked by open positions. The CSP builder
+    # clamps its equity-based deployment cap to this so it never attempts
+    # a put the broker will reject for insufficient options buying power.
+    # Defaulted to None so legacy fixtures keep constructing; production
+    # ``get_account`` always populates it.
+    options_buying_power: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +70,13 @@ class PositionSnapshot:
     market_value: Decimal | None
     unrealized_pl: Decimal | None
     unrealized_intraday_pl: Decimal | None
+    # Shares not committed to an open order. Alpaca reduces this below
+    # ``qty`` whenever a working order (e.g. a still-open covered call)
+    # has reserved part of the position. The covered-call builder reads
+    # this rather than ``qty`` so it does not re-attempt a call against
+    # shares a prior CC order already claimed. Defaulted to None so legacy
+    # fixtures keep constructing; production ``list_positions`` populates it.
+    qty_available: Decimal | None = None
 
 
 def _build_client(cfg: Settings) -> TradingClient:
@@ -209,6 +223,9 @@ async def get_account() -> AccountSnapshot:
         status=_enum_value(account.status),
         paper=get_settings().alpaca_paper,
         account_number=str(getattr(account, "account_number", "") or ""),
+        options_buying_power=_to_decimal_or_none(
+            getattr(account, "options_buying_power", None)
+        ),
     )
 
 
@@ -229,6 +246,7 @@ async def list_positions() -> list[PositionSnapshot]:
                 market_value=_to_decimal_or_none(p.market_value),
                 unrealized_pl=_to_decimal_or_none(p.unrealized_pl),
                 unrealized_intraday_pl=_to_decimal_or_none(p.unrealized_intraday_pl),
+                qty_available=_to_decimal_or_none(getattr(p, "qty_available", None)),
             )
         )
     return snapshots

@@ -348,7 +348,21 @@ async def build_call_intents(
             if contract is None:
                 continue
 
-            qty = int(position.qty // Decimal("100"))
+            # Coverage-aware qty: size off shares NOT already committed to
+            # an open order, not the total holding. When a covered call from
+            # an earlier tick is still working, Alpaca reserves the shares it
+            # covers and drops ``qty_available`` toward zero. Sizing off the
+            # total ``qty`` instead made the builder re-propose the same CC
+            # every tick; the broker then rejected each re-attempt as an
+            # uncovered call ("not eligible to trade uncovered option
+            # contracts"). Falls back to total qty when the broker did not
+            # report availability (legacy fixtures pass qty_available=None).
+            available_shares = (
+                position.qty_available
+                if position.qty_available is not None
+                else position.qty
+            )
+            qty = int(available_shares // Decimal("100"))
             if qty < 1:
                 continue
 

@@ -126,7 +126,11 @@ def _put(
     )
 
 
-def _account(equity: float = 100_000.0) -> AccountSnapshot:
+def _account(
+    equity: float = 100_000.0,
+    *,
+    options_buying_power: float | None = None,
+) -> AccountSnapshot:
     return AccountSnapshot(
         equity=Decimal(str(equity)),
         last_equity=Decimal(str(equity)),
@@ -136,6 +140,11 @@ def _account(equity: float = 100_000.0) -> AccountSnapshot:
         day_pl=Decimal("0"),
         status="ACTIVE",
         paper=True,
+        options_buying_power=(
+            Decimal(str(options_buying_power))
+            if options_buying_power is not None
+            else None
+        ),
     )
 
 
@@ -454,6 +463,73 @@ async def test_build_intents_respects_total_deployment_cap(_legacy_caps: None) -
     assert len(intents) == 1
     total_collateral = sum(i.collateral for i in intents)
     assert total_collateral == Decimal("100000")
+
+
+async def test_build_intents_clamps_to_options_buying_power() -> None:
+    """New collateral is clamped to broker options buying power.
+
+    Regression for the RIVN 2026-06-01 failure: the equity-based cap let
+    the builder size a put the broker would not fund, and Alpaca rejected
+    it for insufficient options buying power. Here options buying power
+    ($100k) is below the per-tick equity cap (25% of $1M = $250k), so it
+    becomes the binding constraint and only one $100k-collateral contract
+    is built instead of two.
+    """
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(strike=1000, delta=-0.30, expiration=expiry, underlying=symbol)
+        ]
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "opportunistic",
+            whitelist=[f"SYM{i}" for i in range(3)],
+            target_pct=Decimal("1.0"),
+            max_new_entries_per_tick=10,
+        )],
+        account=_account(equity=1_000_000, options_buying_power=100_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert len(intents) == 1
+    assert sum(i.collateral for i in intents) == Decimal("100000")
+    assert diag.deployment_limited_by_buying_power is True
+    assert diag.options_buying_power_usd == Decimal("100000")
+    assert any(
+        "broker options buying power" in line for line in diag.warning_lines()
+    )
+
+
+async def test_build_intents_no_buying_power_clamp_when_ample() -> None:
+    """Ample options buying power leaves the equity cap as the binding one."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _put(strike=1000, delta=-0.30, expiration=expiry, underlying=symbol)
+        ]
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve(
+            "opportunistic",
+            whitelist=[f"SYM{i}" for i in range(3)],
+            target_pct=Decimal("1.0"),
+            max_new_entries_per_tick=10,
+        )],
+        account=_account(equity=1_000_000, options_buying_power=10_000_000),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    # Buying power well above the equity-based caps: it never binds, and
+    # more than the clamped single contract gets through.
+    assert diag.deployment_limited_by_buying_power is False
+    assert len(intents) >= 2
 
 
 async def test_build_intents_ranks_by_yield_within_sleeve() -> None:

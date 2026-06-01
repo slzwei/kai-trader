@@ -239,8 +239,8 @@ def _this_tick_section(inputs: TickRenderInputs) -> str:
         )
     if inputs.cc_skipped:
         lines.append(
-            f"{len(inputs.cc_skipped)} covered call(s) skipped by flags: "
-            f"{', '.join(inputs.cc_skipped)}."
+            f"{len(inputs.cc_skipped)} covered call(s) skipped by flags or "
+            f"prior-failure suppression: {', '.join(inputs.cc_skipped)}."
         )
 
     rolled_intents = [r for r in inputs.rolls if r.reason == "rolled"]

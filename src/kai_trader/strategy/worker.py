@@ -457,7 +457,15 @@ class StrategyWorker:
             },
             gating_decision={"trading_enabled": True, "kill_switch": False},
         )
-        close_result = await close_position(roll.underlying)
+        # Close the OPTION leg, not the underlying. ``roll.underlying`` is
+        # the equity ticker (e.g. "RIOT"); the position being rolled is the
+        # short put (e.g. "RIOT260605P00027500"). Passing the ticker made
+        # Alpaca look for an equity position that does not exist and fail
+        # with position_not_found every tick, so the roll never completed
+        # (and for an assigned name that DOES hold shares, it risked closing
+        # the shares instead of the put). close_position accepts the OCC
+        # option symbol and buys the short put back to close it.
+        close_result = await close_position(roll.current_option_symbol)
         if close_result.submitted and close_result.alpaca_order_id:
             await mark_submitted(
                 close_row_id,
@@ -743,6 +751,30 @@ class StrategyWorker:
         flags: dict[str, bool],
     ) -> str:
         """Record + submit one CC intent. Returns 'submitted', 'skipped', 'failed'."""
+        # Suppress retry storms, mirroring the CSP path. If this exact call
+        # contract already has a failed open_covered_call row from earlier
+        # today, skip without writing a new row or hitting Alpaca. The
+        # coverage-aware qty fix stops the usual duplicate (a working CC
+        # drops qty_available to zero), but this is the belt-and-suspenders
+        # backstop for any other repeating CC rejection so the 5-minute tick
+        # does not re-submit the same failing contract indefinitely.
+        today_start = datetime.combine(
+            datetime.now(UTC).date(),
+            datetime.min.time(),
+            tzinfo=UTC,
+        )
+        if await has_failed_since(
+            option_symbol=intent.option_symbol,
+            action="open_covered_call",
+            since=today_start,
+        ):
+            _log.info(
+                "strategy.submit_call.skipped_prior_failure",
+                option_symbol=intent.option_symbol,
+                symbol=intent.symbol,
+            )
+            return "skipped"
+
         # Mirror the CSP path: submit at mid, not bid. See _submit_intent
         # for the rationale and the fill-quality data.
         limit_price = intent.mid

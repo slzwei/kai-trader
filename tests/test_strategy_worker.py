@@ -19,6 +19,7 @@ from kai_trader.db.orders import OrderRow
 from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.strategy import worker as worker_module
 from kai_trader.strategy.clock import ClockSnapshot
+from kai_trader.strategy.covered_calls import CallIntent
 from kai_trader.strategy.regime import RegimeSnapshot
 
 
@@ -604,7 +605,11 @@ async def test_tick_executes_rolls_when_flags_green(
     assert "Rolled 1 position(s)" in summary
     # Two record_intent calls: one for the close, one for the new short put.
     assert _patch_dependencies["record_intent"].await_count == 2
-    _patch_dependencies["close_position"].assert_awaited_once_with("SPY")
+    # The roll closes the OPTION leg (the short put), not the underlying
+    # ticker. Passing "SPY" would make Alpaca fail with position_not_found.
+    _patch_dependencies["close_position"].assert_awaited_once_with(
+        "SPY260504P00050000"
+    )
     _patch_dependencies["submit_short_put"].assert_awaited_once()
 
 
@@ -836,6 +841,48 @@ async def test_tick_skips_cc_when_no_shares_held(
     assert "covered call" not in summary
     _patch_dependencies["submit_short_call"].assert_not_awaited()
     _patch_dependencies["record_assignment"].assert_not_awaited()
+
+
+async def test_submit_call_intent_suppresses_prior_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CC contract that already failed today is skipped, not re-submitted.
+
+    Mirrors the CSP prior-failure suppression so a repeating covered-call
+    rejection does not spam Alpaca and the orders table every tick.
+    """
+    monkeypatch.setattr(
+        worker_module, "has_failed_since", AsyncMock(return_value=True)
+    )
+    submit = AsyncMock()
+    record = AsyncMock()
+    monkeypatch.setattr(worker_module, "submit_short_call", submit)
+    monkeypatch.setattr(worker_module, "record_intent", record)
+
+    intent = CallIntent(
+        sleeve="stable_largecap",
+        symbol="KMI",
+        option_symbol="KMI260612C00032000",
+        strike=Decimal("32"),
+        expiration=date(2026, 6, 12),
+        target_delta=Decimal("0.30"),
+        actual_delta=Decimal("0.28"),
+        bid=Decimal("0.20"),
+        ask=Decimal("0.30"),
+        mid=Decimal("0.25"),
+        qty=1,
+        expected_premium=Decimal("25"),
+    )
+    flags = {
+        "trading_enabled": True,
+        "kill_switch": False,
+        "new_entries_enabled": True,
+    }
+    outcome = await worker_module.StrategyWorker()._submit_call_intent(intent, flags)
+
+    assert outcome == "skipped"
+    submit.assert_not_awaited()
+    record.assert_not_awaited()
 
 
 # ------------- Phase 5b: profit-take execution -------------

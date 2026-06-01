@@ -240,6 +240,8 @@ class BuildDiagnostics:
     today_deployment_remaining_usd: Decimal = Decimal("0")
     per_tick_cap_remaining_usd: Decimal = Decimal("0")
     contract_ceiling: int = MAX_CONTRACTS_PER_SYMBOL
+    deployment_limited_by_buying_power: bool = False
+    options_buying_power_usd: Decimal = Decimal("0")
 
     def warning_lines(self) -> list[str]:
         active = [
@@ -271,6 +273,12 @@ class BuildDiagnostics:
                 f"per-day deployment cap "
                 f"({self.today_deployment_used_pct:.0%} of equity used today, "
                 f"${self.today_deployment_remaining_usd:.0f} remaining)."
+            )
+        if self.deployment_limited_by_buying_power:
+            warnings.append(
+                f"Deployment capped by broker options buying power "
+                f"(${self.options_buying_power_usd:.0f} available), below the "
+                f"equity-based cap. New entries paused until capital frees up."
             )
         if not active:
             return warnings
@@ -784,6 +792,28 @@ async def build_intents_with_diagnostics(
     total_remaining = max(
         equity * TOTAL_DEPLOYMENT_CAP_PCT - committed_total, Decimal("0")
     )
+    # Clamp the equity-based headroom to the broker's real options buying
+    # power. The equity cap is a policy ceiling; it does not know how much
+    # collateral the broker will actually fund right now. Without this the
+    # builder emitted intents whose total collateral exceeded options
+    # buying power, and Alpaca rejected each one with "insufficient options
+    # buying power" every tick (previously caught only by per-contract
+    # prior-failure suppression). options_buying_power is already net of
+    # collateral locked by open positions, so it is the binding constraint;
+    # take the min. None means the caller did not supply it (legacy
+    # fixtures / pre-2026-06 callers), in which case the equity cap stands.
+    deployment_limited_by_buying_power = False
+    options_buying_power_usd = Decimal("0")
+    if account.options_buying_power is not None:
+        options_buying_power_usd = Decimal(str(account.options_buying_power))
+        if options_buying_power_usd < total_remaining:
+            deployment_limited_by_buying_power = True
+            _log.info(
+                "strategy.deployment.buying_power_clamp",
+                equity_cap_remaining=str(total_remaining),
+                options_buying_power=str(options_buying_power_usd),
+            )
+        total_remaining = min(total_remaining, options_buying_power_usd)
     per_symbol_cap_dollars = equity * per_symbol_cap_pct(equity)
     # P7: per-symbol contract ceiling tiered on equity. Smaller books
     # see 10; $150k+ books see 25; $500k+ books see 50.
@@ -1157,6 +1187,8 @@ async def build_intents_with_diagnostics(
         today_deployment_remaining_usd=per_day_remaining,
         per_tick_cap_remaining_usd=per_tick_remaining,
         contract_ceiling=contract_ceiling,
+        deployment_limited_by_buying_power=deployment_limited_by_buying_power,
+        options_buying_power_usd=options_buying_power_usd,
     )
 
 
