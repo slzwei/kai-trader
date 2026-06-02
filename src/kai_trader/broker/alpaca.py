@@ -16,7 +16,7 @@ import json
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -762,12 +762,14 @@ def _activities_request_sync(
     base_url: str,
     headers: dict[str, str],
     params: dict[str, str],
+    activity_type: str,
 ) -> list[dict[str, Any]]:
     """Synchronous GET against Alpaca's account/activities endpoint.
 
-    Caller wraps in asyncio.to_thread. Returns the parsed JSON list.
-    Pagination uses page_token; we fetch until the response is empty or
-    short. Activities API caps at 100 per page.
+    Caller wraps in asyncio.to_thread. ``activity_type`` selects the feed
+    (``FILL`` for trade fills, ``OPASN`` for option assignments). Returns
+    the parsed JSON list. Pagination uses page_token; we fetch until the
+    response is empty or short. Activities API caps at 100 per page.
     """
     out: list[dict[str, Any]] = []
     page_token: str | None = None
@@ -775,7 +777,10 @@ def _activities_request_sync(
         merged = dict(params)
         if page_token:
             merged["page_token"] = page_token
-        url = f"{base_url}/v2/account/activities/FILL?{urllib.parse.urlencode(merged)}"
+        url = (
+            f"{base_url}/v2/account/activities/{activity_type}"
+            f"?{urllib.parse.urlencode(merged)}"
+        )
         req = urllib.request.Request(url, method="GET", headers=headers)
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -816,6 +821,7 @@ async def get_fill_activities(
         _alpaca_base_url(settings),
         headers,
         params,
+        "FILL",
     )
     out: list[FillActivity] = []
     for r in raw:
@@ -838,3 +844,72 @@ def _parse_fill_activity(row: dict[str, Any]) -> FillActivity:
         order_id=str(row["order_id"]) if row.get("order_id") else None,
         activity_id=str(row["id"]),
     )
+
+
+@dataclass(frozen=True)
+class AssignmentActivity:
+    """A single option assignment event from Alpaca's OPASN activity feed.
+
+    OPASN ("Options Assignment") is the authoritative record that a short
+    option was assigned. A short put assigns shares TO the account (we go
+    long stock and the wheel rolls into covered calls); a short call
+    assigns shares AWAY. ``symbol`` is the OCC option contract that was
+    assigned, so the put/call distinction and the underlying are
+    recoverable via ``parse_occ_symbol``. ``activity_id`` is stable and
+    unique, which makes it the natural idempotency key for assignment
+    auditing.
+    """
+
+    activity_id: str
+    activity_date: date
+    symbol: str  # OCC option symbol of the assigned contract
+    qty: Decimal  # contracts assigned
+    status: str  # "executed", "correct", "canceled"
+
+
+def _parse_assignment_activity(row: dict[str, Any]) -> AssignmentActivity:
+    return AssignmentActivity(
+        activity_id=str(row["id"]),
+        activity_date=date.fromisoformat(str(row["date"])),
+        symbol=str(row["symbol"]),
+        qty=Decimal(str(row["qty"])),
+        status=str(row.get("status", "")),
+    )
+
+
+async def get_assignment_activities(
+    *, after: datetime | None = None
+) -> list[AssignmentActivity]:
+    """Return OPASN (option assignment) activities from the trading account.
+
+    Optionally bounded by ``after`` (inclusive). OPASN is the source of
+    truth for assignment detection: it fires exactly once per assignment
+    event, naming the assigned OCC contract, so it does not suffer the
+    ambiguity of inferring assignment from held shares plus a filled CSP
+    when a name has been wheeled more than once.
+    """
+    settings = get_settings()
+    headers = {
+        "APCA-API-KEY-ID": settings.effective_alpaca_api_key,
+        "APCA-API-SECRET-KEY": settings.effective_alpaca_secret_key,
+        "Accept": "application/json",
+    }
+    params: dict[str, str] = {"page_size": "100"}
+    if after is not None:
+        params["after"] = after.isoformat()
+    raw = await asyncio.to_thread(
+        _activities_request_sync,
+        _alpaca_base_url(settings),
+        headers,
+        params,
+        "OPASN",
+    )
+    out: list[AssignmentActivity] = []
+    for r in raw:
+        try:
+            out.append(_parse_assignment_activity(r))
+        except (KeyError, ValueError) as exc:
+            _log.warning(
+                "alpaca.assignments.parse_failed", error=str(exc), raw=r
+            )
+    return out

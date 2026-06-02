@@ -929,3 +929,54 @@ async def test_submit_buy_to_close_handles_alpaca_exception(
     assert result.submitted is False
     assert result.reason == "submit_exception"
     assert result.error == "boom"
+
+
+# ------------- OPASN assignment activities -------------
+
+
+def test_parse_assignment_activity_maps_fields() -> None:
+    from datetime import date
+
+    raw = {
+        "id": "20260529000000000::6263d17b",
+        "activity_type": "OPASN",
+        "date": "2026-05-29",
+        "symbol": "KMI260529P00033000",
+        "qty": "1",
+        "status": "executed",
+    }
+    activity = broker._parse_assignment_activity(raw)
+    assert activity.activity_id == "20260529000000000::6263d17b"
+    assert activity.activity_date == date(2026, 5, 29)
+    assert activity.symbol == "KMI260529P00033000"
+    assert activity.qty == Decimal("1")
+    assert activity.status == "executed"
+
+
+async def test_get_assignment_activities_parses_and_skips_bad_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        {
+            "id": "opasn-1",
+            "date": "2026-05-29",
+            "symbol": "KMI260529P00033000",
+            "qty": "1",
+            "status": "executed",
+        },
+        {"id": "opasn-bad", "date": "not-a-date", "symbol": "X", "qty": "1"},
+    ]
+
+    def _fake_request(
+        base_url: str,
+        headers: dict[str, str],
+        params: dict[str, str],
+        activity_type: str,
+    ) -> list[dict[str, Any]]:
+        assert activity_type == "OPASN"
+        return rows
+
+    monkeypatch.setattr(broker, "_activities_request_sync", _fake_request)
+    out = await broker.get_assignment_activities()
+    assert len(out) == 1  # the unparseable date row is skipped
+    assert out[0].symbol == "KMI260529P00033000"

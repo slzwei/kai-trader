@@ -32,6 +32,7 @@ from kai_trader.broker.alpaca import (
     SubmitResult,
     close_position,
     get_account,
+    get_assignment_activities,
     get_order_status,
     list_long_equity_positions,
     list_positions,
@@ -108,6 +109,12 @@ _TERMINAL_ALPACA_STATUSES = {"filled", "canceled", "expired", "rejected"}
 # risk_off, and a 0.10 drift means the contract is materially closer to
 # the money than the rule book intended.
 DELTA_TOLERANCE = Decimal("0.10")
+
+# Assignment detection lookback. OPASN activities are sparse, so a generous
+# window is cheap, and the activity-id idempotency makes re-scanning the
+# same window every tick harmless. 60 days comfortably spans the monthly
+# option cycle plus any weekend/holiday detection lag.
+ASSIGNMENT_LOOKBACK_DAYS = 60
 
 
 def _format_error_text(result: SubmitResult) -> str | None:
@@ -333,17 +340,18 @@ class StrategyWorker:
             else:
                 skipped.append(label)
 
-        # Covered-call leg: detect put assignments, then build and submit
-        # CCs against any held shares. Assignment detection is idempotent;
-        # CC build skips if regime is risk_off.
-        # B10: fetch held equity once and pass into both consumers so we
-        # do not pay two Alpaca round trips for the same data.
+        # Covered-call leg. Assignment detection (OPASN-driven, idempotent)
+        # records the audit row for any newly assigned put; the CC builder
+        # then sells calls against shares actually on the books.
+        # B10: held equity is fetched once for the CC builder and the tick
+        # render. Assignment detection no longer keys off it (see
+        # _handle_assignments), so a wheeled name cannot be mis-flagged.
         try:
             held_equity = await list_long_equity_positions()
         except Exception as exc:
             _log.warning("strategy.held_equity.fetch_failed", error=str(exc))
             held_equity = []
-        assignments_recorded = await self._handle_assignments(held_equity)
+        assignments_recorded = await self._handle_assignments()
         call_intents, call_diagnostics = await self._build_call_intents(
             held=held_equity,
             sleeves=sleeves,
@@ -682,33 +690,51 @@ class StrategyWorker:
         await mark_status(row_id, "failed", error_text=_format_error_text(result))
         return "failed"
 
-    async def _handle_assignments(
-        self, held: list[PositionSnapshot]
-    ) -> int:
-        """Match held shares against recently-filled CSPs, audit any new ones.
+    async def _handle_assignments(self) -> int:
+        """Record audit rows for option assignments from Alpaca's OPASN feed.
 
-        Returns the count of newly recorded assignment rows. Idempotent:
-        previously-recorded assignments are not duplicated.
+        OPASN ("Options Assignment") is the authoritative assignment
+        signal: it fires once per assigned contract, naming the exact OCC
+        symbol. The previous heuristic ("a filled CSP whose underlying we
+        currently hold long") mis-fired on any name wheeled more than
+        once: a profit-closed put and a still-open put both counted as
+        assignments because the account also held shares of that name.
+        Driving off OPASN removes the ambiguity.
 
-        B10: ``held`` is fetched once at the tick level and passed in
-        rather than refetched here. The empty-input check below is the
-        natural early-exit when the operator holds no shares.
+        Returns the count of newly recorded assignment rows. Idempotent
+        via the OPASN activity id stored on each assignment row. Every
+        failure fails open (returns what we have) so the audit path never
+        takes the tick down.
         """
-        if not held:
+        cutoff = datetime.now(UTC) - timedelta(days=ASSIGNMENT_LOOKBACK_DAYS)
+        try:
+            activities = await get_assignment_activities(after=cutoff)
+        except Exception as exc:
+            _log.warning(
+                "strategy.assignments.activities_fetch_failed", error=str(exc)
+            )
             return 0
-        # Pull only filled-CSP and prior-assignment rows for the symbols
-        # we currently hold. The previous limit-200 scan silently stopped
-        # detecting assignments once the originating CSP scrolled past
-        # row 200; the targeted query stays correct regardless of how
-        # many unrelated orders sit in the table.
+        if not activities:
+            return 0
+        # Scope the orders lookup to the underlyings that actually have an
+        # assignment activity: filled CSPs supply sleeve attribution, and
+        # existing assignment rows supply idempotency.
+        underlyings: set[str] = set()
+        for act in activities:
+            try:
+                underlyings.add(parse_occ_symbol(act.symbol)[0])
+            except ValueError:
+                continue
+        if not underlyings:
+            return 0
         try:
             window = await filled_csps_and_assignments_for_symbols(
-                [p.symbol for p in held]
+                sorted(underlyings)
             )
         except Exception as exc:
             _log.warning("strategy.assignments.orders_fetch_failed", error=str(exc))
             return 0
-        assignments = detect_assignments(held, window)
+        assignments = detect_assignments(activities, window)
         recorded = 0
         for a in assignments:
             try:

@@ -11,6 +11,7 @@ import pytest
 
 from kai_trader.broker.alpaca import (
     AccountSnapshot,
+    AssignmentActivity,
     OrderStatusSnapshot,
     SubmitResult,
 )
@@ -184,6 +185,9 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
         breached=False,
     ))
     evaluate_rolls = AsyncMock(return_value=[])
+    # OPASN-driven assignment detection: default to no assignment activities
+    # so ticks that do not exercise the assignment path are unaffected.
+    get_assignment_activities = AsyncMock(return_value=[])
     record_assignment = AsyncMock(return_value="asg-row-id")
     # W-1 fail-closed: tests want SPY-class names to fall through, so the
     # default earnings status is outside_window (= safe to trade). Tests
@@ -237,6 +241,9 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
         filled_csps_and_assignments_for_symbols,
     )
     monkeypatch.setattr(worker_module, "has_failed_since", has_failed_since)
+    monkeypatch.setattr(
+        worker_module, "get_assignment_activities", get_assignment_activities
+    )
     monkeypatch.setattr(worker_module, "record_assignment", record_assignment)
     monkeypatch.setattr(worker_module, "get_earnings_status", get_earnings_status)
     monkeypatch.setattr(
@@ -778,6 +785,15 @@ async def test_tick_records_assignment_when_shares_appear(
     _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
     _patch_dependencies["list_long_equity_positions"].return_value = [
         _equity_position()
+    ]
+    _patch_dependencies["get_assignment_activities"].return_value = [
+        AssignmentActivity(
+            activity_id="opasn-amzn-1",
+            activity_date=date(2026, 5, 6),
+            symbol="AMZN260506P00250000",
+            qty=Decimal("1"),
+            status="executed",
+        )
     ]
     _patch_dependencies["filled_csps_and_assignments_for_symbols"].return_value = [
         _filled_csp_for_amzn()
