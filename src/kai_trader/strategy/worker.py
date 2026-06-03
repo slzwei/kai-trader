@@ -379,7 +379,7 @@ class StrategyWorker:
                 regime_transitioned=transitioned,
                 equity=account.equity,
                 last_equity=account.last_equity,
-                short_puts=existing_shorts,
+                short_options=existing_shorts,
                 long_equity=held_equity,
                 reconciled=reconciled,
                 rolls=rolls,

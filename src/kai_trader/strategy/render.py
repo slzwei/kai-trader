@@ -63,7 +63,10 @@ class TickRenderInputs:
     regime_transitioned: bool
     equity: Decimal
     last_equity: Decimal
-    short_puts: list[PositionSnapshot]
+    # All short option positions, puts AND calls. Named short_options, not
+    # short_puts, because the covered-call leg lives here too and must be
+    # rendered; the collateral math below filters to puts on its own.
+    short_options: list[PositionSnapshot]
     long_equity: list[PositionSnapshot]
     reconciled: int
     rolls: list[RollIntent]
@@ -80,9 +83,9 @@ class TickRenderInputs:
     today: date | None = None
 
 
-def _committed_collateral(short_puts: list[PositionSnapshot]) -> Decimal:
+def _committed_collateral(short_options: list[PositionSnapshot]) -> Decimal:
     total = Decimal("0")
-    for p in short_puts:
+    for p in short_options:
         try:
             _under, _exp, opt_type, strike = parse_occ_symbol(p.symbol)
         except ValueError:
@@ -137,7 +140,7 @@ def _headline(inputs: TickRenderInputs) -> str:
 
 
 def _account_section(inputs: TickRenderInputs) -> str:
-    committed = _committed_collateral(inputs.short_puts)
+    committed = _committed_collateral(inputs.short_options)
     pct = (
         (committed / inputs.equity * Decimal("100")).quantize(Decimal("1"))
         if inputs.equity > 0
@@ -262,20 +265,31 @@ def _this_tick_section(inputs: TickRenderInputs) -> str:
 
 
 def _open_positions_section(inputs: TickRenderInputs) -> tuple[str, int]:
-    """Render shorts + held shares. Returns (block, total_count)."""
+    """Render short puts, short calls, then held shares. Returns (block, count).
+
+    Covered calls used to be dropped here (the loop skipped anything that
+    was not a put), which hid the wheel's call leg from the routine tick
+    message even though the position was live and managed. They now render
+    after the puts. The ``(held)`` marker stays put-only: it flags a
+    challenged short put being rolled or held to expiry, which has no
+    call-side meaning.
+    """
     held = _held_underlyings(inputs.rolls)
-    rows: list[str] = []
-    for p in inputs.short_puts:
+    put_rows: list[str] = []
+    call_rows: list[str] = []
+    for p in inputs.short_options:
         try:
             underlying, _exp, opt_type, _strike = parse_occ_symbol(p.symbol)
         except ValueError:
             continue
-        if opt_type != "put":
-            continue
         row = format_position_row(p)
-        if underlying in held:
-            row += HELD_MARKER
-        rows.append(row)
+        if opt_type == "put":
+            if underlying in held:
+                row += HELD_MARKER
+            put_rows.append(row)
+        else:
+            call_rows.append(row)
+    rows = put_rows + call_rows
     for p in inputs.long_equity:
         rows.append(format_position_row(p))
     return "\n".join(rows), len(rows)

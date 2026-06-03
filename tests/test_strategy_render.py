@@ -35,6 +35,25 @@ def _short_put(
     )
 
 
+def _short_call(
+    symbol: str = "AMZN260612C00260000",
+    qty: Decimal = Decimal("-1"),
+    avg: Decimal = Decimal("1.20"),
+    mark: Decimal | None = Decimal("1.35"),
+    pl: Decimal | None = Decimal("-15"),
+) -> PositionSnapshot:
+    return PositionSnapshot(
+        symbol=symbol,
+        qty=qty,
+        side="short",
+        avg_entry_price=avg,
+        current_price=mark,
+        market_value=None,
+        unrealized_pl=pl,
+        unrealized_intraday_pl=None,
+    )
+
+
 def _inputs(**overrides: object) -> TickRenderInputs:
     base: dict[str, object] = dict(
         timestamp_label="2026-05-07 00:06 SGT",
@@ -43,7 +62,7 @@ def _inputs(**overrides: object) -> TickRenderInputs:
         regime_transitioned=False,
         equity=Decimal("100000"),
         last_equity=Decimal("99500"),
-        short_puts=[],
+        short_options=[],
         long_equity=[],
         reconciled=0,
         rolls=[],
@@ -119,7 +138,7 @@ def test_headline_failed_takes_top_priority() -> None:
 
 
 def test_account_section_shows_committed_and_pct() -> None:
-    out = render_tick(_inputs(short_puts=[_short_put()]))
+    out = render_tick(_inputs(short_options=[_short_put()]))
     # 1 contract * $250 strike * 100 = $25,000 committed against $100k equity.
     assert "USD 25,000.00" in out
     assert "(25% of equity" in out
@@ -159,11 +178,49 @@ def test_held_position_marked_inline() -> None:
         reason="no_net_credit_candidate",
     )
     out = render_tick(
-        _inputs(short_puts=[_short_put()], rolls=[roll])
+        _inputs(short_options=[_short_put()], rolls=[roll])
     )
     # The position row gets the held marker appended, so the marker
     # appears next to the AMZN row in the open-positions block.
     assert HELD_MARKER in out
+
+
+# ----- open positions: covered calls -----
+
+
+def test_open_positions_includes_covered_calls() -> None:
+    out = render_tick(_inputs(short_options=[_short_put(), _short_call()]))
+    assert "Open positions (2)" in out
+    # Both legs render, distinguished by the put/call label.
+    assert "put" in out
+    assert "call" in out
+
+
+def test_covered_call_row_never_marked_held() -> None:
+    # A held roll on AMZN marks the short PUT row; the covered call on the
+    # same underlying must never carry the (held) marker.
+    roll = RollIntent(
+        sleeve="index_core",
+        underlying="AMZN",
+        current_option_symbol="AMZN260506P00250000",
+        current_strike=Decimal("250"),
+        current_expiration=date(2026, 5, 6),
+        current_delta=Decimal("-0.48"),
+        close_price=Decimal("5.05"),
+        new_option_symbol=None,
+        new_strike=None,
+        new_expiration=None,
+        new_delta=None,
+        new_credit=None,
+        net_credit=None,
+        reason="no_net_credit_candidate",
+    )
+    out = render_tick(
+        _inputs(short_options=[_short_put(), _short_call()], rolls=[roll])
+    )
+    call_line = next(ln for ln in out.splitlines() if "call" in ln)
+    assert HELD_MARKER.strip() not in call_line
+    assert HELD_MARKER in out  # the put row still carries the marker
 
 
 # ----- empty-section omission -----
