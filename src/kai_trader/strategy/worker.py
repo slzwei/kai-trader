@@ -96,6 +96,7 @@ from kai_trader.strategy.render import (
     render_tick,
 )
 from kai_trader.strategy.rolls import RollIntent, evaluate_rolls
+from kai_trader.strategy.trend import get_trend_status
 
 _log = get_logger(__name__)
 
@@ -315,6 +316,7 @@ class StrategyWorker:
             chain_fetcher=get_chain,
             today=today,
             earnings_status=get_earnings_status,
+            trend_status=get_trend_status,
             existing_short_puts=existing_shorts,
             today_already_deployed=today_already_deployed,
             cooldown_symbols=cooldown_symbols,

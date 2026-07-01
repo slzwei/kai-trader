@@ -471,9 +471,10 @@ async def test_build_intents_clamps_to_options_buying_power() -> None:
     Regression for the RIVN 2026-06-01 failure: the equity-based cap let
     the builder size a put the broker would not fund, and Alpaca rejected
     it for insufficient options buying power. Here options buying power
-    ($100k) is below the per-tick equity cap (25% of $1M = $250k), so it
-    becomes the binding constraint and only one $100k-collateral contract
-    is built instead of two.
+    ($150k, haircut to $142.5k by the Variant A+ P3 5% safety buffer) is
+    below the per-tick equity cap (25% of $1M = $250k), so it becomes the
+    binding constraint and only one $100k-collateral contract is built
+    instead of two.
     """
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
@@ -491,14 +492,14 @@ async def test_build_intents_clamps_to_options_buying_power() -> None:
             target_pct=Decimal("1.0"),
             max_new_entries_per_tick=10,
         )],
-        account=_account(equity=1_000_000, options_buying_power=100_000),
+        account=_account(equity=1_000_000, options_buying_power=150_000),
         chain_fetcher=fetcher,
         today=today,
     )
     assert len(intents) == 1
     assert sum(i.collateral for i in intents) == Decimal("100000")
     assert diag.deployment_limited_by_buying_power is True
-    assert diag.options_buying_power_usd == Decimal("100000")
+    assert diag.options_buying_power_usd == Decimal("150000")
     assert any(
         "broker options buying power" in line for line in diag.warning_lines()
     )
@@ -759,28 +760,28 @@ def test_summarise_intents_includes_total_line() -> None:
 # ------------- per_symbol_cap_pct (dynamic by equity) -------------
 
 
-def test_per_symbol_cap_pct_tiny_account_capped_at_15pct() -> None:
-    """W-3: every equity tier is capped at 15% as the live-capital ceiling."""
-    assert per_symbol_cap_pct(Decimal("10000")) == Decimal("0.15")
-    assert per_symbol_cap_pct(Decimal("49999")) == Decimal("0.15")
+def test_per_symbol_cap_pct_tiny_account_capped_at_12pct() -> None:
+    """Variant A+ (P6): every equity tier is capped at 12% now."""
+    assert per_symbol_cap_pct(Decimal("10000")) == Decimal("0.12")
+    assert per_symbol_cap_pct(Decimal("49999")) == Decimal("0.12")
 
 
-def test_per_symbol_cap_pct_small_account_capped_at_15pct() -> None:
-    """W-3: the historical 60% tier is now capped at 15%."""
-    assert per_symbol_cap_pct(Decimal("50000")) == Decimal("0.15")
-    assert per_symbol_cap_pct(Decimal("99911")) == Decimal("0.15")
-    assert per_symbol_cap_pct(Decimal("149999")) == Decimal("0.15")
+def test_per_symbol_cap_pct_small_account_capped_at_12pct() -> None:
+    """Variant A+ (P6): the historical 60% tier is now capped at 12%."""
+    assert per_symbol_cap_pct(Decimal("50000")) == Decimal("0.12")
+    assert per_symbol_cap_pct(Decimal("99911")) == Decimal("0.12")
+    assert per_symbol_cap_pct(Decimal("149999")) == Decimal("0.12")
 
 
-def test_per_symbol_cap_pct_mid_account_capped_at_15pct() -> None:
-    """W-3: the historical 30% tier is now capped at 15%."""
-    assert per_symbol_cap_pct(Decimal("150000")) == Decimal("0.15")
-    assert per_symbol_cap_pct(Decimal("499999")) == Decimal("0.15")
+def test_per_symbol_cap_pct_mid_account_capped_at_12pct() -> None:
+    """Variant A+ (P6): the historical 30% tier is now capped at 12%."""
+    assert per_symbol_cap_pct(Decimal("150000")) == Decimal("0.12")
+    assert per_symbol_cap_pct(Decimal("499999")) == Decimal("0.12")
 
 
-def test_per_symbol_cap_pct_large_account_15pct() -> None:
-    assert per_symbol_cap_pct(Decimal("500000")) == Decimal("0.15")
-    assert per_symbol_cap_pct(Decimal("10_000_000")) == Decimal("0.15")
+def test_per_symbol_cap_pct_large_account_12pct() -> None:
+    assert per_symbol_cap_pct(Decimal("500000")) == Decimal("0.12")
+    assert per_symbol_cap_pct(Decimal("10_000_000")) == Decimal("0.12")
 
 
 async def test_build_intents_at_small_account_rejects_strike_over_15pct() -> None:
@@ -817,8 +818,8 @@ async def test_diagnostics_flag_cap_rejection() -> None:
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
-    # $1M equity, 15% per-name cap = $150k. $2000 strike → $200k collateral.
-    # Sleeve has plenty of room (target_pct=1.0) but the 15% cap blocks.
+    # $1M equity, 12% per-name cap = $120k. $2000 strike → $200k collateral.
+    # Sleeve has plenty of room (target_pct=1.0) but the 12% cap blocks.
     async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
         return [
             _put(strike=2000, delta=-0.30, expiration=expiry, underlying=symbol)
@@ -836,11 +837,98 @@ async def test_diagnostics_flag_cap_rejection() -> None:
     assert sleeve.candidates_cap_rejected == 1
     assert sleeve.symbols_skipped_for_per_name_dollar_cap == 1
     assert sleeve.per_name_dollar_cap_symbols == ("EXPENSIVE",)
-    assert sleeve.per_symbol_cap_dollars == Decimal("150000")
+    assert sleeve.per_symbol_cap_dollars == Decimal("120000")
     warnings = diag.warning_lines()
     assert len(warnings) == 1
-    assert "per-name 15% notional cap" in warnings[0]
-    assert "150000" in warnings[0]
+    assert "per-name 12% notional cap" in warnings[0]
+    assert "120000" in warnings[0]
+
+
+# ------------- 50-DMA trend filter (Variant A+ P1) -------------
+
+
+async def test_trend_status_skips_below_trend_symbol() -> None:
+    """A symbol below its 50-DMA is skipped before its chain is fetched."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    chain_calls: list[str] = []
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        chain_calls.append(symbol)
+        return [_put(strike=50, delta=-0.30, expiration=expiry, underlying=symbol)]
+
+    async def trend_status(symbol: str) -> str:
+        return "below" if symbol == "DOWN" else "above"
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["DOWN", "OK"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+        trend_status=trend_status,
+    )
+    assert chain_calls == ["OK"]
+    assert [i.symbol for i in intents] == ["OK"]
+    sleeve = diag.sleeves[0]
+    assert sleeve.symbols_skipped_for_trend == 1
+    assert sleeve.trend_skip_symbols == ("DOWN",)
+    assert sleeve.symbols_skipped_for_trend_unknown == 0
+    assert any("below 50-DMA" in w for w in diag.warning_lines())
+
+
+async def test_trend_status_unknown_is_fail_closed() -> None:
+    """An 'unknown' trend status is a skip and is counted separately."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    chain_calls: list[str] = []
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        chain_calls.append(symbol)
+        return [_put(strike=50, delta=-0.30, expiration=expiry, underlying=symbol)]
+
+    async def trend_status(symbol: str) -> str:
+        return "unknown" if symbol == "MYSTERY" else "above"
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["MYSTERY", "OK"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+        trend_status=trend_status,
+    )
+    assert chain_calls == ["OK"]
+    assert [i.symbol for i in intents] == ["OK"]
+    sleeve = diag.sleeves[0]
+    assert sleeve.symbols_skipped_for_trend == 1
+    assert sleeve.symbols_skipped_for_trend_unknown == 1
+    assert sleeve.trend_unknown_symbols == ("MYSTERY",)
+    assert any("unknown, fail-closed" in w for w in diag.warning_lines())
+
+
+async def test_trend_status_none_provider_does_not_filter() -> None:
+    """With no trend provider, every symbol's chain is fetched as before."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    chain_calls: list[str] = []
+
+    async def fetcher(symbol: str, _exp: Any) -> list[OptionContract]:
+        chain_calls.append(symbol)
+        return [_put(strike=50, delta=-0.30, expiration=expiry, underlying=symbol)]
+
+    _intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[_sleeve("index_core", whitelist=["DOWN", "OK"])],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert set(chain_calls) == {"DOWN", "OK"}
+    assert diag.sleeves[0].symbols_skipped_for_trend == 0
 
 
 # ------------- earnings blackout filter (Phase 5d) -------------
@@ -2044,8 +2132,8 @@ async def test_per_tick_cap_warning_surfaces() -> None:
     ) or diag.intents_dropped_for_per_tick_cap > 0
 
 
-async def test_per_name_dollar_cap_warning_uses_15pct_wording() -> None:
-    """W-3: tick warning surfaces the 15% per-name cap with symbol breakdown."""
+async def test_per_name_dollar_cap_warning_uses_12pct_wording() -> None:
+    """Variant A+ (P6): tick warning surfaces the 12% per-name cap with symbols."""
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)
 
@@ -2065,7 +2153,7 @@ async def test_per_name_dollar_cap_warning_uses_15pct_wording() -> None:
     )
     assert intents == []
     warnings = diag.warning_lines()
-    assert any("per-name 15% notional cap" in w for w in warnings)
+    assert any("per-name 12% notional cap" in w for w in warnings)
     assert any("EXPENSIVE" in w for w in warnings)
 
 

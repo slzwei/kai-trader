@@ -24,6 +24,7 @@ from kai_trader.logging import get_logger
 from kai_trader.strategy.earnings import EARNINGS_BLACKOUT_DAYS, EarningsStatus
 from kai_trader.strategy.iv_rv import IV_RV_RATIO_MIN, passes_iv_rv_floor
 from kai_trader.strategy.regime import RegimeSnapshot
+from kai_trader.strategy.trend import TrendStatus
 
 ChainFetcher = Callable[[str, date | None], Awaitable[list[OptionContract]]]
 
@@ -36,6 +37,15 @@ _log = get_logger(__name__)
 # Caps blow-up risk: with $30k equity, max $30k of strikes at risk,
 # matching cash on hand.
 TOTAL_DEPLOYMENT_CAP_PCT = Decimal("1.00")
+
+# Variant A+ (P3): deploy at most this fraction of the broker's reported
+# options buying power. options_buying_power is a point-in-time figure;
+# between the account fetch and the order submit it can drift down (an
+# earlier tick's fill settling, a mark moving), which is what still
+# produced occasional "insufficient options buying power" rejections even
+# after the equity-cap clamp. A 5% cushion absorbs that drift so the
+# builder stops proposing puts the broker will reject a moment later.
+OPTIONS_BP_SAFETY_FACTOR = Decimal("0.95")
 
 # P7 (2026-05-09): MAX_CONTRACTS_PER_SYMBOL tiered by equity. The
 # original flat 10-contract ceiling was sized for $50k-$150k accounts;
@@ -170,7 +180,11 @@ MIN_BID_YIELD_PER_DAY = Decimal("0")
 # to -$21k because multiple correlated names (MARA/RIOT/HOOD)
 # assigned simultaneously. 15% caps single-name losses to the
 # original W-3 ceiling.
-PER_NAME_NOTIONAL_CAP_PCT = Decimal("0.15")
+# Variant A+ (P6): 0.15 → 0.12. The live pool is all high-beta names
+# (MARA/RIOT/SNAP/RIVN) that gap down together in a risk-off spike;
+# the correlated-drawdown tail is the real threat to the return
+# target, so tighten single-name notional a further notch.
+PER_NAME_NOTIONAL_CAP_PCT = Decimal("0.12")
 
 _PER_SYMBOL_CAP_TIERS: tuple[tuple[Decimal, Decimal], ...] = (
     (Decimal("50000"), Decimal("1.00")),
@@ -183,7 +197,7 @@ _PER_SYMBOL_CAP_FLOOR = Decimal("0.15")
 def per_symbol_cap_pct(equity: Decimal) -> Decimal:
     """Return the per-symbol cap fraction for the given equity.
 
-    Always at most ``PER_NAME_NOTIONAL_CAP_PCT`` (15%). The internal tier
+    Always at most ``PER_NAME_NOTIONAL_CAP_PCT`` (12%). The internal tier
     table is preserved for future tightening (e.g., 5% at very large
     books) but the 15% ceiling is the live-capital guard rail and applies
     regardless of equity tier. The over-allocation incident on
@@ -220,6 +234,10 @@ class SleeveDiagnostic:
     per_name_dollar_cap_symbols: tuple[str, ...] = ()
     symbols_skipped_for_iv_rv_floor: int = 0
     iv_rv_floor_symbols: tuple[str, ...] = ()
+    symbols_skipped_for_trend: int = 0
+    trend_skip_symbols: tuple[str, ...] = ()
+    symbols_skipped_for_trend_unknown: int = 0
+    trend_unknown_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -280,6 +298,29 @@ class BuildDiagnostics:
                 f"(${self.options_buying_power_usd:.0f} available), below the "
                 f"equity-based cap. New entries paused until capital frees up."
             )
+        total_trend = sum(s.symbols_skipped_for_trend for s in self.sleeves)
+        if total_trend > 0:
+            trend_symbols = sorted({
+                sym for s in self.sleeves for sym in s.trend_skip_symbols
+            })
+            total_trend_unknown = sum(
+                s.symbols_skipped_for_trend_unknown for s in self.sleeves
+            )
+            sample = ", ".join(trend_symbols[:5])
+            more = (
+                f" (+{len(trend_symbols) - 5} more)"
+                if len(trend_symbols) > 5
+                else ""
+            )
+            unknown_note = (
+                f" ({total_trend_unknown} unknown, fail-closed)"
+                if total_trend_unknown > 0
+                else ""
+            )
+            warnings.append(
+                f"{total_trend} symbol(s) skipped below 50-DMA trend "
+                f"filter{unknown_note}: {sample}{more}"
+            )
         if not active:
             return warnings
         total_puts = sum(s.puts_seen for s in active)
@@ -334,7 +375,7 @@ class BuildDiagnostics:
                 )
                 warnings.append(
                     f"{total_per_name_dollar_cap} candidate(s) rejected by "
-                    f"per-name 15% notional cap (~${cap_dollars:.0f}): "
+                    f"per-name 12% notional cap (~${cap_dollars:.0f}): "
                     f"{sample}{more}."
                 )
             else:
@@ -704,6 +745,11 @@ def _score_candidate(contract: OptionContract, today: date) -> Decimal | None:
 
 
 EarningsStatusProvider = Callable[[str, date, int], Awaitable[EarningsStatus]]
+# Variant A+ (P1): 50-DMA trend provider. Given a symbol, returns
+# "above" / "below" / "unknown". Fail-closed: the builder skips any
+# symbol that is not confirmed "above" its moving average, so new puts
+# only open on names that are not actively falling.
+TrendStatusProvider = Callable[[str], Awaitable[TrendStatus]]
 RV30Provider = Callable[[str], Awaitable["Decimal | None"]]
 # P3 (Phase 3c): IV percentile rank provider. Given (symbol,
 # current_iv) returns the percentile rank (0-100) of current_iv in
@@ -727,6 +773,7 @@ async def build_intents(
     *,
     today: date | None = None,
     earnings_status: EarningsStatusProvider | None = None,
+    trend_status: TrendStatusProvider | None = None,
     existing_short_puts: list[PositionSnapshot] | None = None,
     today_already_deployed: Decimal | None = None,
     cooldown_symbols: set[str] | None = None,
@@ -746,6 +793,7 @@ async def build_intents(
         chain_fetcher=chain_fetcher,
         today=today,
         earnings_status=earnings_status,
+        trend_status=trend_status,
         existing_short_puts=existing_short_puts,
         today_already_deployed=today_already_deployed,
         cooldown_symbols=cooldown_symbols,
@@ -764,6 +812,7 @@ async def build_intents_with_diagnostics(
     *,
     today: date | None = None,
     earnings_status: EarningsStatusProvider | None = None,
+    trend_status: TrendStatusProvider | None = None,
     existing_short_puts: list[PositionSnapshot] | None = None,
     today_already_deployed: Decimal | None = None,
     cooldown_symbols: set[str] | None = None,
@@ -806,14 +855,20 @@ async def build_intents_with_diagnostics(
     options_buying_power_usd = Decimal("0")
     if account.options_buying_power is not None:
         options_buying_power_usd = Decimal(str(account.options_buying_power))
-        if options_buying_power_usd < total_remaining:
+        # Deploy against a 5% haircut on reported options buying power so
+        # normal intra-tick drift (a settling fill, a moving mark) does not
+        # push the next submit past the broker's real limit. See
+        # OPTIONS_BP_SAFETY_FACTOR.
+        bp_cap = options_buying_power_usd * OPTIONS_BP_SAFETY_FACTOR
+        if bp_cap < total_remaining:
             deployment_limited_by_buying_power = True
             _log.info(
                 "strategy.deployment.buying_power_clamp",
                 equity_cap_remaining=str(total_remaining),
                 options_buying_power=str(options_buying_power_usd),
+                buying_power_cap=str(bp_cap),
             )
-        total_remaining = min(total_remaining, options_buying_power_usd)
+        total_remaining = min(total_remaining, bp_cap)
     per_symbol_cap_dollars = equity * per_symbol_cap_pct(equity)
     # P7: per-symbol contract ceiling tiered on equity. Smaller books
     # see 10; $150k+ books see 25; $500k+ books see 50.
@@ -884,6 +939,10 @@ async def build_intents_with_diagnostics(
         contract_ceiling_symbols: list[str] = []
         per_name_dollar_cap_symbols: list[str] = []
         iv_rv_floor_symbols: list[str] = []
+        symbols_skipped_for_trend = 0
+        symbols_skipped_for_trend_unknown = 0
+        trend_skip_symbols: list[str] = []
+        trend_unknown_symbols: list[str] = []
 
         # Phase 1: walk the whitelist, fetch each chain, pick a strike.
         ranked: list[tuple[OptionContract, Decimal]] = []
@@ -932,6 +991,39 @@ async def build_intents_with_diagnostics(
                         sleeve=sleeve.sleeve,
                         symbol=symbol,
                         status=status,
+                    )
+                    continue
+            # Variant A+ (P1): 50-DMA trend filter. Refuse to open a new
+            # put on a symbol trading below its moving average, so an
+            # assignment lands in a name that is at least not actively
+            # falling. Fail-closed: an "unknown" status (data error or too
+            # little history) is a skip, mirroring the earnings filter's
+            # live-capital posture.
+            if trend_status is not None:
+                t_status: TrendStatus
+                try:
+                    t_status = await trend_status(symbol)
+                except ImportError:
+                    raise
+                except Exception as exc:
+                    _log.warning(
+                        "strategy.trend_status.failed",
+                        sleeve=sleeve.sleeve,
+                        symbol=symbol,
+                        error=str(exc),
+                    )
+                    t_status = "unknown"
+                if t_status != "above":
+                    symbols_skipped_for_trend += 1
+                    trend_skip_symbols.append(symbol)
+                    if t_status == "unknown":
+                        symbols_skipped_for_trend_unknown += 1
+                        trend_unknown_symbols.append(symbol)
+                    _log.info(
+                        "strategy.trend.skipped",
+                        sleeve=sleeve.sleeve,
+                        symbol=symbol,
+                        status=t_status,
                     )
                     continue
             try:
@@ -1174,6 +1266,10 @@ async def build_intents_with_diagnostics(
                 per_name_dollar_cap_symbols=tuple(per_name_dollar_cap_symbols),
                 symbols_skipped_for_iv_rv_floor=symbols_skipped_for_iv_rv_floor,
                 iv_rv_floor_symbols=tuple(iv_rv_floor_symbols),
+                symbols_skipped_for_trend=symbols_skipped_for_trend,
+                trend_skip_symbols=tuple(trend_skip_symbols),
+                symbols_skipped_for_trend_unknown=symbols_skipped_for_trend_unknown,
+                trend_unknown_symbols=tuple(trend_unknown_symbols),
             )
         )
 

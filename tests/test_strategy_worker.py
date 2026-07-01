@@ -193,6 +193,10 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     # default earnings status is outside_window (= safe to trade). Tests
     # that exercise the blackout path can override.
     get_earnings_status = AsyncMock(return_value="outside_window")
+    # Variant A+ (P1): 50-DMA trend filter. Default "above" so symbols pass
+    # the gate and tests focused on other paths are unaffected. Tests that
+    # exercise the trend skip can override.
+    get_trend_status = AsyncMock(return_value="above")
     # W-4: deployment-velocity helpers are queried from the DB; default to
     # zero/empty so the test path proceeds as if no recent activity.
     new_deployment_collateral_since = AsyncMock(return_value=Decimal("0"))
@@ -246,6 +250,7 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     )
     monkeypatch.setattr(worker_module, "record_assignment", record_assignment)
     monkeypatch.setattr(worker_module, "get_earnings_status", get_earnings_status)
+    monkeypatch.setattr(worker_module, "get_trend_status", get_trend_status)
     monkeypatch.setattr(
         worker_module,
         "new_deployment_collateral_since",
@@ -335,13 +340,13 @@ async def test_tick_submits_when_flags_green(
     # capturing zero spread on average; mid-priced limits aim for +0.05
     # better per share at the cost of some unfilled orders.
     assert submit_args.kwargs["limit_price"] == Decimal("1.15")
-    # Variant A constants (2026-05-09):
-    #   PER_NAME_NOTIONAL_CAP_PCT = 0.15 → 15% × $100k = $15k = 3 contracts
-    #   PER_TICK_DEPLOYMENT_CAP_PCT = 0.25 → 25% × $100k = $25k = 5 contracts
-    #   TOTAL_DEPLOYMENT_CAP_PCT = 1.00 → $100k = 20 contracts
+    # Variant A+ constants (P6, 2026-07-01):
+    #   PER_NAME_NOTIONAL_CAP_PCT = 0.12 -> 12% of $100k = $12k = 2 contracts
+    #   PER_TICK_DEPLOYMENT_CAP_PCT = 0.25 -> 25% of $100k = $25k = 5 contracts
+    #   TOTAL_DEPLOYMENT_CAP_PCT = 1.00 -> $100k = 20 contracts
     #   max_contracts_per_symbol(<$150k) = 10
-    # Per-name cap binds first at 3 contracts.
-    assert submit_args.kwargs["qty"] == 3
+    # Per-name cap binds first at 2 contracts ($50 strike -> $5k each).
+    assert submit_args.kwargs["qty"] == 2
 
 
 async def test_tick_post_profit_take_cooldown_disabled_phase6() -> None:

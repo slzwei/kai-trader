@@ -209,6 +209,91 @@ async def test_build_call_intents_one_position_one_intent() -> None:
     assert sleeve_diag.intents_built == 1
 
 
+# ------------- cost-basis floor (Variant A+ P5) -------------
+
+
+def test_select_call_strike_respects_min_strike() -> None:
+    """A min_strike floor excludes strikes below cost basis."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+    chain = [
+        _call(strike=240, delta=0.35, expiration=expiry),
+        _call(strike=260, delta=0.20, expiration=expiry),
+    ]
+    # Without a floor the 240 strike (closest to the 0.30 target) wins even
+    # though it is below the 250 cost basis.
+    unfloored = select_call_strike(chain, Decimal("0.30"), _sleeve(), today)
+    assert unfloored is not None and unfloored.strike == Decimal("240")
+    # With a 250 floor, 240 is excluded and the 260 strike wins.
+    floored = select_call_strike(
+        chain, Decimal("0.30"), _sleeve(), today, min_strike=Decimal("250")
+    )
+    assert floored is not None and floored.strike == Decimal("260")
+
+
+def test_select_call_strike_min_strike_excludes_all() -> None:
+    """A floor above every strike returns None."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+    chain = [_call(strike=240, delta=0.35, expiration=expiry)]
+    assert (
+        select_call_strike(
+            chain, Decimal("0.30"), _sleeve(), today, min_strike=Decimal("300")
+        )
+        is None
+    )
+
+
+async def test_build_call_intents_floors_call_at_cost_basis() -> None:
+    """The chosen CC strike is at or above the share lot's cost basis."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        # 240 is closest to the 0.30 target but below the 250 basis; 260 is
+        # the nearest strike at or above basis.
+        return [
+            _call(strike=240, delta=0.35, expiration=expiry),
+            _call(strike=260, delta=0.20, expiration=expiry),
+        ]
+
+    intents, diag = await build_call_intents(
+        long_equity_positions=[_equity("AMZN", "100")],
+        sleeves=[_sleeve(whitelist=["AMZN"])],
+        regime=_regime("neutral"),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert len(intents) == 1
+    assert intents[0].strike == Decimal("260")
+    assert diag.sleeves[0].symbols_skipped_for_cost_basis_floor == 0
+
+
+async def test_build_call_intents_holds_back_cc_below_cost_basis() -> None:
+    """No CC is written when every in-band strike is below cost basis."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        # Only a 240 strike is available; the 250 basis blocks it.
+        return [_call(strike=240, delta=0.35, expiration=expiry)]
+
+    intents, diag = await build_call_intents(
+        long_equity_positions=[_equity("AMZN", "100")],
+        sleeves=[_sleeve(whitelist=["AMZN"])],
+        regime=_regime("neutral"),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+    assert intents == []
+    sleeve_diag = diag.sleeves[0]
+    assert sleeve_diag.symbols_skipped_for_cost_basis_floor == 1
+    assert sleeve_diag.cost_basis_floor_symbols == ("AMZN",)
+    assert any(
+        "cost basis" in w for w in diag.warning_lines()
+    )
+
+
 async def test_build_call_intents_multiple_contracts_per_position() -> None:
     today = date(2026, 4, 27)
     expiry = today + timedelta(days=8)

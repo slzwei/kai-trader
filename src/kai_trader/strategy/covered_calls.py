@@ -68,6 +68,8 @@ class CallDiagnostic:
     calls_in_dte_band: int
     calls_with_quotes: int
     intents_built: int
+    symbols_skipped_for_cost_basis_floor: int = 0
+    cost_basis_floor_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -80,32 +82,58 @@ class CallBuildDiagnostics:
         active = [s for s in self.sleeves if s.symbols_evaluated > 0]
         if not active:
             return []
+        lines: list[str] = []
+        # Cost-basis-floor note (Variant A+ P5) is surfaced even when other
+        # underlyings did write a call, because "why is there no CC on my
+        # underwater name" is exactly the question it answers.
+        total_floor = sum(
+            s.symbols_skipped_for_cost_basis_floor for s in self.sleeves
+        )
+        if total_floor > 0:
+            floor_symbols = sorted({
+                sym for s in self.sleeves for sym in s.cost_basis_floor_symbols
+            })
+            sample = ", ".join(floor_symbols[:5])
+            more = (
+                f" (+{len(floor_symbols) - 5} more)"
+                if len(floor_symbols) > 5
+                else ""
+            )
+            lines.append(
+                f"{total_floor} covered call(s) held back: no strike at or "
+                f"above cost basis in DTE band: {sample}{more}"
+            )
         total_intents = sum(s.intents_built for s in active)
         if total_intents > 0:
-            return []
+            return lines
         total_calls = sum(s.calls_seen for s in active)
         total_with_delta = sum(s.calls_with_delta for s in active)
         total_in_band = sum(s.calls_in_dte_band for s in active)
         total_with_quotes = sum(s.calls_with_quotes for s in active)
         if total_calls == 0:
             return [
+                *lines,
                 "covered-call eval: held shares present but option chains "
-                "returned no calls"
+                "returned no calls",
             ]
         if total_with_delta == 0:
             return [
-                f"covered-call eval: {total_calls} calls seen, none had delta"
+                *lines,
+                f"covered-call eval: {total_calls} calls seen, none had delta",
             ]
         if total_in_band == 0:
             return [
+                *lines,
                 f"covered-call eval: {total_with_delta} calls had delta, "
-                f"none in sleeve DTE band"
+                f"none in sleeve DTE band",
             ]
         if total_with_quotes == 0:
             return [
-                f"covered-call eval: {total_in_band} calls in band, none had bid+ask"
+                *lines,
+                f"covered-call eval: {total_in_band} calls in band, "
+                f"none had bid+ask",
             ]
-        return []
+        return lines
 
 
 def _within_dte_band(expiration: date, today: date, sleeve: SleeveConfig) -> bool:
@@ -118,12 +146,20 @@ def select_call_strike(
     target_delta: Decimal,
     sleeve: SleeveConfig,
     today: date,
+    *,
+    min_strike: Decimal | None = None,
 ) -> OptionContract | None:
     """Return the call closest to ``target_delta`` within the sleeve DTE band.
 
     Pure function. ``target_delta`` is positive for calls. Filters to call
     contracts that report a delta and whose expiration falls within the
     sleeve's preferred DTE window.
+
+    ``min_strike`` (Variant A+ P5) floors the eligible strikes: contracts
+    struck below it are excluded. The builder passes the share lot's cost
+    basis so a covered call can never be written below what the shares
+    cost, which would crystallise the stock loss if the call assigns. When
+    ``None`` (the default, and every pre-existing caller) no floor applies.
     """
     typed_candidates: list[tuple[OptionContract, Decimal]] = []
     for c in chain:
@@ -132,6 +168,8 @@ def select_call_strike(
         if c.delta is None:
             continue
         if not _within_dte_band(c.expiration, today, sleeve):
+            continue
+        if min_strike is not None and c.strike < min_strike:
             continue
         typed_candidates.append((c, c.delta))
     if not typed_candidates:
@@ -284,6 +322,8 @@ async def build_call_intents(
         calls_in_dte_band = 0
         calls_with_quotes = 0
         intents_built_for_sleeve = 0
+        symbols_skipped_for_cost_basis_floor = 0
+        cost_basis_floor_symbols: list[str] = []
 
         for _sleeve_match, position in positions_for_sleeve:
             # Earnings filter (2026-05-10): skip the symbol if its next
@@ -344,8 +384,30 @@ async def build_call_intents(
                     continue
                 calls_with_quotes += 1
 
-            contract = select_call_strike(chain, target_delta, sleeve, today)
+            # Variant A+ (P5): never write a covered call struck below the
+            # share lot's cost basis. If the target-delta strike would land
+            # below basis, hold the call back rather than lock in the stock
+            # loss on assignment. The fallback select (no floor) tells us
+            # whether the skip was the floor specifically, so the operator
+            # sees "no strike at/above basis" distinctly from "no viable
+            # strike at all".
+            cost_basis = position.avg_entry_price
+            contract = select_call_strike(
+                chain, target_delta, sleeve, today, min_strike=cost_basis
+            )
             if contract is None:
+                if (
+                    select_call_strike(chain, target_delta, sleeve, today)
+                    is not None
+                ):
+                    symbols_skipped_for_cost_basis_floor += 1
+                    cost_basis_floor_symbols.append(position.symbol)
+                    _log.info(
+                        "strategy.cc.cost_basis_floor",
+                        sleeve=sleeve.sleeve,
+                        symbol=position.symbol,
+                        cost_basis=str(cost_basis),
+                    )
                 continue
 
             # Coverage-aware qty: size off shares NOT already committed to
@@ -383,6 +445,10 @@ async def build_call_intents(
                 calls_in_dte_band=calls_in_dte_band,
                 calls_with_quotes=calls_with_quotes,
                 intents_built=intents_built_for_sleeve,
+                symbols_skipped_for_cost_basis_floor=(
+                    symbols_skipped_for_cost_basis_floor
+                ),
+                cost_basis_floor_symbols=tuple(cost_basis_floor_symbols),
             )
         )
 
