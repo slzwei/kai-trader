@@ -126,6 +126,50 @@ async def test_evaluate_rolls_returns_rolled_when_net_credit_available() -> None
     assert intent.reason == "rolled"
     assert intent.new_strike == Decimal("48")
     assert intent.net_credit == Decimal("0.40")  # 3.00 bid - 2.60 ask
+    assert intent.qty == 1
+
+
+async def test_evaluate_rolls_carries_multi_lot_position_qty() -> None:
+    """close_position buys back the whole lot, so the intent must carry
+    the position size or the worker's reopen leg halves a 2-lot roll."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=7)
+    pos = _short_put_position("SPY260504P00050000", qty=-2)
+    chain = [
+        _put(strike=50, delta=-0.55, expiration=expiry, bid=2.50, ask=2.60),
+        _put(strike=48, delta=-0.30, expiration=expiry, bid=3.00, ask=3.10),
+    ]
+
+    rolls = await evaluate_rolls(
+        positions=[pos],
+        sleeves=[_sleeve()],
+        regime=_regime("risk_on"),
+        chain_fetcher=AsyncMock(return_value=chain),
+        today=today,
+    )
+    assert len(rolls) == 1
+    assert rolls[0].qty == 2
+
+
+async def test_evaluate_rolls_skips_disabled_sleeve() -> None:
+    """A roll opens new short exposure; an operator-disabled sleeve holds
+    the challenged put and accepts assignment instead."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=7)
+    pos = _short_put_position("SPY260504P00050000")
+    chain = [
+        _put(strike=50, delta=-0.55, expiration=expiry, bid=2.50, ask=2.60),
+        _put(strike=48, delta=-0.30, expiration=expiry, bid=3.00, ask=3.10),
+    ]
+
+    rolls = await evaluate_rolls(
+        positions=[pos],
+        sleeves=[_sleeve(enabled=False)],
+        regime=_regime("risk_on"),
+        chain_fetcher=AsyncMock(return_value=chain),
+        today=today,
+    )
+    assert rolls == []
 
 
 async def test_evaluate_rolls_holds_when_no_net_credit() -> None:

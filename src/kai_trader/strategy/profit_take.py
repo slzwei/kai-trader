@@ -152,8 +152,22 @@ async def evaluate_profit_takes(
             continue
 
         # qty in PositionSnapshot is negative for short; size the close at abs.
-        qty = int(abs(position.qty))
+        # Size off qty_available, not qty: Alpaca reduces qty_available
+        # when a working order (a still-open buy-to-close from a prior
+        # tick) has already reserved contracts. Sizing off the total qty
+        # re-submitted duplicate closes that the broker rejected with
+        # "insufficient qty available ... held_for_orders" (observed
+        # twice in production). Falls back to qty when the broker did
+        # not report availability (legacy fixtures pass None).
+        available = (
+            position.qty_available
+            if position.qty_available is not None
+            else position.qty
+        )
+        qty = int(abs(available))
         if qty < 1:
+            # Zero available with a live position means a close order is
+            # already working for every contract; nothing left to close.
             continue
 
         captured_pct = Decimal("1") - (ask / original_credit)

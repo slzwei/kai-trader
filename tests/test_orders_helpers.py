@@ -151,6 +151,32 @@ async def test_mark_status_with_error_text() -> None:
     assert args[5] == "alpaca down"
 
 
+async def test_mark_stale_unsubmitted_returns_swept_count() -> None:
+    pool = _fake_pool()
+    pool._conn.execute = AsyncMock(return_value="UPDATE 2")
+    cutoff = datetime(2026, 7, 14, 0, 0, tzinfo=UTC)
+
+    with patch("kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)):
+        swept = await orders.mark_stale_unsubmitted(cutoff)
+
+    assert swept == 2
+    args, _ = pool._conn.execute.await_args
+    assert "alpaca_order_id is null" in args[0]
+    assert args[1] == cutoff
+
+
+async def test_mark_stale_unsubmitted_handles_unparseable_tag() -> None:
+    pool = _fake_pool()
+    pool._conn.execute = AsyncMock(return_value="")
+
+    with patch("kai_trader.db.client.asyncpg.create_pool", AsyncMock(return_value=pool)):
+        swept = await orders.mark_stale_unsubmitted(
+            datetime(2026, 7, 14, 0, 0, tzinfo=UTC)
+        )
+
+    assert swept == 0
+
+
 async def test_recent_orders_passes_limit() -> None:
     pool = _fake_pool()
     pool._conn.fetch = AsyncMock(return_value=[_row()])

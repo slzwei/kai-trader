@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -39,13 +40,14 @@ from kai_trader.bot.formatting import (
 from kai_trader.bot.handlers._common import run_command
 from kai_trader.broker.alpaca import (
     PositionSnapshot,
+    SubmitResult,
     close_position,
     list_positions,
 )
 from kai_trader.broker.options_data import parse_occ_symbol
 from kai_trader.config import get_settings
 from kai_trader.db.client import mark_command_response
-from kai_trader.db.orders import record_intent
+from kai_trader.db.orders import mark_status, mark_submitted, record_intent
 from kai_trader.db.pending_close import (
     consume as _db_consume,
 )
@@ -379,16 +381,58 @@ async def _edit_message(query: Any, text: str) -> None:
         _log.warning("bot.close_callback.edit_failed", error=str(exc))
 
 
-async def _execute_close(query: Any, user_id: int, symbol: str) -> None:
-    result = await close_position(symbol)
+async def _record_close_outcome(
+    result: SubmitResult,
+    *,
+    symbol: str,
+    intent_payload: dict[str, Any],
+) -> str:
+    """Write the orders audit row for a manual close, faithfully.
+
+    The old inline version had two real bugs, both visible in prod data:
+
+    - It never persisted ``result.alpaca_order_id``, so every manual
+      close sat in ``status='submitted'`` with a NULL id forever
+      (reconciliation only polls rows that carry an id). Two such
+      zombies from 2026-05-01 were still "in flight" ten weeks later.
+    - It collapsed every non-submitted outcome to ``skipped_by_flag``,
+      so a genuine broker failure (position_not_found, close_exception)
+      was audited as if a flag had blocked it.
+
+    Returns the audit row id.
+    """
     row_id = await record_intent(
         sleeve="manual",
         symbol=symbol,
         option_symbol=symbol,
         action="close",
-        intent_payload={"trigger": "telegram_close_button", "user_id": user_id},
+        intent_payload=intent_payload,
         gating_decision={"kill_switch": result.flags.get("kill_switch", False)},
-        status="submitted" if result.submitted else "skipped_by_flag",
+    )
+    if result.submitted and result.alpaca_order_id:
+        await mark_submitted(
+            row_id,
+            alpaca_order_id=result.alpaca_order_id,
+            submitted_at=datetime.now(UTC),
+        )
+    elif result.reason == "kill_switch_engaged":
+        await mark_status(row_id, "skipped_by_flag", error_text=result.reason)
+    else:
+        error_text = (
+            f"{result.reason}: {result.error}"
+            if result.reason and result.error
+            else result.reason or result.error
+        )
+        await mark_status(row_id, "failed", error_text=error_text)
+    return row_id
+
+
+async def _execute_close(query: Any, user_id: int, symbol: str) -> None:
+    result = await close_position(symbol)
+    row_id = await _record_close_outcome(
+        result,
+        symbol=symbol,
+        intent_payload={"trigger": "telegram_close_button", "user_id": user_id},
     )
     if result.submitted:
         outcome = (
@@ -432,14 +476,10 @@ async def _build_confirm(_update: Update, ctx: Any) -> str:
         )
 
     result = await close_position(symbol)
-    row_id = await record_intent(
-        sleeve="manual",
+    row_id = await _record_close_outcome(
+        result,
         symbol=symbol,
-        option_symbol=symbol,
-        action="close",
         intent_payload={"trigger": "telegram_close", "user_id": ctx.telegram_user_id},
-        gating_decision={"kill_switch": result.flags.get("kill_switch", False)},
-        status="submitted" if result.submitted else "skipped_by_flag",
     )
 
     if result.submitted:

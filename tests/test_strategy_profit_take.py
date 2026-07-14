@@ -14,7 +14,9 @@ from kai_trader.strategy.profit_take import evaluate_profit_takes
 
 
 def _short_put_position(
-    symbol: str = "AMZN260506P00250000", qty: str = "-1"
+    symbol: str = "AMZN260506P00250000",
+    qty: str = "-1",
+    qty_available: str | None = None,
 ) -> PositionSnapshot:
     return PositionSnapshot(
         symbol=symbol,
@@ -25,6 +27,9 @@ def _short_put_position(
         market_value=None,
         unrealized_pl=None,
         unrealized_intraday_pl=None,
+        qty_available=(
+            Decimal(qty_available) if qty_available is not None else None
+        ),
     )
 
 
@@ -115,6 +120,44 @@ async def test_emits_close_intent_when_threshold_hit() -> None:
     assert intent.original_credit == Decimal("1.10")
     # captured = 1 - (0.50 / 1.10) = ~0.5454
     assert intent.captured_pct > Decimal("0.50")
+
+
+async def test_sizes_close_off_qty_available() -> None:
+    """One of two contracts is already reserved by a working close order;
+    the new close must only cover the free contract, not re-close the
+    reserved one (broker rejects with 'insufficient qty available')."""
+
+    async def fetcher(_underlying: str, _exp: Any) -> list[OptionContract]:
+        return [_put_contract(ask=0.50)]
+
+    intents = await evaluate_profit_takes(
+        short_option_positions=[
+            _short_put_position(qty="-2", qty_available="-1")
+        ],
+        orders=[_filled_csp_order()],
+        sleeves=[_sleeve()],
+        chain_fetcher=fetcher,
+    )
+    assert len(intents) == 1
+    assert intents[0].qty == 1
+
+
+async def test_skips_when_no_qty_available() -> None:
+    """Every contract is already reserved by a working close order; a
+    second close would duplicate it."""
+
+    async def fetcher(_underlying: str, _exp: Any) -> list[OptionContract]:
+        return [_put_contract(ask=0.50)]
+
+    intents = await evaluate_profit_takes(
+        short_option_positions=[
+            _short_put_position(qty="-2", qty_available="0")
+        ],
+        orders=[_filled_csp_order()],
+        sleeves=[_sleeve()],
+        chain_fetcher=fetcher,
+    )
+    assert intents == []
 
 
 async def test_skips_when_below_threshold() -> None:

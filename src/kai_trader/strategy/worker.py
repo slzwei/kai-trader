@@ -28,6 +28,7 @@ from decimal import Decimal
 
 from kai_trader.bot.formatting import format_sgt_timestamp
 from kai_trader.broker.alpaca import (
+    OrderStatusSnapshot,
     PositionSnapshot,
     SubmitResult,
     close_position,
@@ -52,6 +53,7 @@ from kai_trader.db.orders import (
     latest_profit_take_at_per_symbol,
     latest_submission_at_per_symbol,
     mark_actual_delta,
+    mark_stale_unsubmitted,
     mark_status,
     mark_submitted,
     new_deployment_collateral_since,
@@ -116,6 +118,23 @@ DELTA_TOLERANCE = Decimal("0.10")
 # same window every tick harmless. 60 days comfortably spans the monthly
 # option cycle plus any weekend/holiday detection lag.
 ASSIGNMENT_LOOKBACK_DAYS = 60
+
+# Roll close-leg fill wait. The close leg must FILL (not merely submit)
+# before the reopen leg goes out: collateral locked by the old put is
+# only freed on fill, and submitting the new put against unfreed
+# collateral got rejected with insufficient options buying power
+# (observed 2026-07-01 on RIOT: paid $0.46 to close, reopen died, the
+# roll delivered nothing). A market buy-to-close on a liquid weekly
+# fills in seconds; 90s is a generous ceiling before we give up and
+# leave the close working without reopening.
+ROLL_CLOSE_FILL_TIMEOUT_SECONDS = 90.0
+ROLL_CLOSE_FILL_POLL_SECONDS = 3.0
+
+# Stale-order sweep cutoff. Rows created without an Alpaca order id are
+# normally marked submitted-with-id or failed within seconds; anything
+# id-less and non-terminal after this long is a zombie that
+# reconciliation can never resolve (it only polls rows with an id).
+STALE_UNSUBMITTED_MAX_AGE = timedelta(hours=1)
 
 
 def _format_error_text(result: SubmitResult) -> str | None:
@@ -241,12 +260,18 @@ class StrategyWorker:
 
         # Open short puts hold cash collateral; subtract them from sleeve,
         # total, and per-symbol caps so the strategy does not re-attempt
-        # to open the same contracts every tick.
+        # to open the same contracts every tick. A failed fetch FAILS
+        # CLOSED for new entries: with unknown existing positions the cap
+        # math would treat committed collateral as zero and re-attempt
+        # held strikes (the exact pre-Phase-5e re-submission storm), so
+        # the tick skips the CSP build instead and says so in the summary.
+        shorts_fetch_failed = False
         try:
             existing_shorts = await list_short_option_positions()
         except Exception as exc:
             _log.warning("strategy.existing_shorts.fetch_failed", error=str(exc))
             existing_shorts = []
+            shorts_fetch_failed = True
 
         # W-4: feed the deployment-velocity caps and cool-down into the
         # builder. today_already_deployed is the running daily total of
@@ -283,11 +308,14 @@ class StrategyWorker:
             for symbol, last_at in recent_submissions.items()
             if last_at >= cooldown_cutoff
         }
-        # Layer the longer post-profit-take cool-down on top: if a
-        # symbol just profit-took inside the last 4 hours, suppress
-        # re-entry even if the base 30-min cool-down has expired.
-        # Prevents the close-and-immediately-reopen-same-strike churn
-        # observed on F 11.5P (close $0.20 → close $0.09 → reopen
+        # Layer the post-profit-take cool-down on top: if a symbol just
+        # profit-took inside POST_PROFIT_TAKE_COOLDOWN_MINUTES, suppress
+        # re-entry even if the base cool-down has expired. NOTE: the
+        # constant is currently 0 (Phase 6 max-aggression disabled it),
+        # which makes this block a no-op until it is tuned back up; the
+        # wiring stays so re-enabling is a one-line constant change.
+        # Original motivation: close-and-immediately-reopen-same-strike
+        # churn observed on F 11.5P (close $0.20 → close $0.09 → reopen
         # $0.09 → close $0.04 over 3 days, with the bottom round-trip
         # capturing only $10 across 2 contracts).
         post_pt_cutoff = now_utc - timedelta(
@@ -309,25 +337,33 @@ class StrategyWorker:
             if last_at >= post_pt_cutoff
         )
 
-        intents, diagnostics = await build_intents_with_diagnostics(
-            regime=regime,
-            sleeves=sleeves,
-            account=account,
-            chain_fetcher=get_chain,
-            today=today,
-            earnings_status=get_earnings_status,
-            trend_status=get_trend_status,
-            existing_short_puts=existing_shorts,
-            today_already_deployed=today_already_deployed,
-            cooldown_symbols=cooldown_symbols,
-            # Phase 5 retuning (2026-05-09): IV/RV gate disabled. The
-            # IV percentile filter is the primary VRP signal; running
-            # both gates double-rejected candidates in the 8-name
-            # universe. compute_realized_vol_30d stays imported for
-            # future re-enabling.
-            # rv30_provider=compute_realized_vol_30d,
-            iv_percentile_provider=compute_iv_percentile_rank,
-        )
+        if shorts_fetch_failed:
+            intents: list[TradeIntent] = []
+            diagnostic_warnings = [
+                "Existing-positions fetch failed; new entries skipped "
+                "this tick (fail-closed)."
+            ]
+        else:
+            intents, diagnostics = await build_intents_with_diagnostics(
+                regime=regime,
+                sleeves=sleeves,
+                account=account,
+                chain_fetcher=get_chain,
+                today=today,
+                earnings_status=get_earnings_status,
+                trend_status=get_trend_status,
+                existing_short_puts=existing_shorts,
+                today_already_deployed=today_already_deployed,
+                cooldown_symbols=cooldown_symbols,
+                # Phase 5 retuning (2026-05-09): IV/RV gate disabled. The
+                # IV percentile filter is the primary VRP signal; running
+                # both gates double-rejected candidates in the 8-name
+                # universe. compute_realized_vol_30d stays imported for
+                # future re-enabling.
+                # rv30_provider=compute_realized_vol_30d,
+                iv_percentile_provider=compute_iv_percentile_rank,
+            )
+            diagnostic_warnings = diagnostics.warning_lines()
 
         submitted: list[str] = []
         skipped: list[str] = []
@@ -393,7 +429,7 @@ class StrategyWorker:
                 cc_submitted=cc_submitted,
                 cc_skipped=cc_skipped,
                 cc_failed=cc_failed,
-                diagnostic_warnings=diagnostics.warning_lines(),
+                diagnostic_warnings=diagnostic_warnings,
                 cc_diagnostic_warnings=call_diagnostics.warning_lines(),
                 today=today,
             )
@@ -440,7 +476,19 @@ class StrategyWorker:
                     current_delta=str(roll.current_delta),
                 )
                 continue
-            if not flags.get("trading_enabled", False) or flags.get("kill_switch", False):
+            # new_entries_enabled gates rolls too: the reopen leg is a
+            # brand-new short put and submit_short_put refuses it when
+            # the flag is off. Checking here keeps the roll atomic; the
+            # alternative was closing the old leg and then having the
+            # reopen refused, leaving a half-done roll (the same broken
+            # shape as the 2026-07-01 buying-power failure). With the
+            # flag off the challenged put simply rides to expiry and
+            # the wheel accepts assignment, which is the design intent.
+            if (
+                not flags.get("trading_enabled", False)
+                or not flags.get("new_entries_enabled", False)
+                or flags.get("kill_switch", False)
+            ):
                 _log.info(
                     "strategy.roll.skipped_by_flag",
                     underlying=roll.underlying,
@@ -451,7 +499,17 @@ class StrategyWorker:
         return rolls
 
     async def _execute_roll(self, roll: RollIntent) -> None:
-        """Submit close + new-open pair, recording both as orders rows."""
+        """Submit close + new-open pair, recording both as orders rows.
+
+        Sequencing matters. The old put's collateral is only freed when
+        the close leg FILLS, so the reopen leg waits for that fill (with
+        a timeout) before going out. Skipping the wait got the reopen
+        rejected for insufficient options buying power on 2026-07-01:
+        the bot paid the close debit and never collected the new credit.
+        If the close ends terminal-but-not-filled (rejected/canceled)
+        the old position still exists, so reopening would DOUBLE the
+        short exposure; the roll aborts instead.
+        """
         assert roll.new_option_symbol is not None
         assert roll.new_credit is not None
 
@@ -464,6 +522,7 @@ class StrategyWorker:
                 "trigger": "roll",
                 "current_delta": str(roll.current_delta),
                 "close_price": str(roll.close_price),
+                "qty": roll.qty,
             },
             gating_decision={"trading_enabled": True, "kill_switch": False},
         )
@@ -488,6 +547,39 @@ class StrategyWorker:
             )
             return
 
+        close_status = await self._wait_for_terminal(
+            close_result.alpaca_order_id,
+            timeout_seconds=ROLL_CLOSE_FILL_TIMEOUT_SECONDS,
+        )
+        if close_status is None:
+            # Close still working at timeout. Leave it; reconciliation
+            # picks up the eventual fill. Do NOT reopen: collateral is
+            # not yet freed and the position state is ambiguous.
+            await self._notify_roll_interrupted(
+                roll,
+                detail=(
+                    "close leg did not fill within "
+                    f"{int(ROLL_CLOSE_FILL_TIMEOUT_SECONDS)}s; reopen deferred. "
+                    "The close order is still working. If it fills, the "
+                    "position is closed WITHOUT a replacement put."
+                ),
+            )
+            return
+        if close_status.status.lower() != "filled":
+            # Rejected or canceled: the old put is still on the books.
+            # Reopening now would double the short exposure. Abort.
+            await mark_status(
+                close_row_id,
+                "cancelled",
+                error_text=f"close_terminal_{close_status.status.lower()}",
+            )
+            _log.warning(
+                "strategy.roll.close_not_filled",
+                underlying=roll.underlying,
+                status=close_status.status,
+            )
+            return
+
         new_row_id = await record_intent(
             sleeve=roll.sleeve,
             symbol=roll.underlying,
@@ -497,12 +589,15 @@ class StrategyWorker:
                 "from_strike": str(roll.current_strike),
                 "to_strike": str(roll.new_strike),
                 "net_credit": str(roll.net_credit),
+                "qty": roll.qty,
             },
             gating_decision={"trading_enabled": True, "kill_switch": False},
         )
+        # Reopen at the position's full size: close_position bought back
+        # every contract, so qty=1 here would silently halve a 2-lot roll.
         new_result = await submit_short_put(
             option_symbol=roll.new_option_symbol,
-            qty=1,
+            qty=roll.qty,
             limit_price=roll.new_credit,
             client_order_id=f"kai-roll-{new_row_id[:8]}",
         )
@@ -515,6 +610,73 @@ class StrategyWorker:
         else:
             await mark_status(
                 new_row_id, "failed", error_text=_format_error_text(new_result)
+            )
+            # The old leg is GONE (close filled) and the new leg did not
+            # go out: the roll is half-done and the book is lighter than
+            # the strategy intended. Loud alert so the operator can
+            # decide whether to re-enter manually.
+            await self._notify_roll_interrupted(
+                roll,
+                detail=(
+                    f"close leg filled but reopen was refused: "
+                    f"{_format_error_text(new_result) or 'unknown'}. The "
+                    "challenged put is closed with no replacement."
+                ),
+            )
+
+    async def _wait_for_terminal(
+        self,
+        alpaca_order_id: str,
+        *,
+        timeout_seconds: float,
+    ) -> OrderStatusSnapshot | None:
+        """Poll an order until it reaches a terminal state or timeout.
+
+        Returns the final ``OrderStatusSnapshot`` when terminal, ``None``
+        on timeout or persistent fetch errors. First poll is immediate so
+        a market order that filled instantly costs no wait.
+        """
+        deadline = (
+            datetime.now(UTC).timestamp() + timeout_seconds
+        )
+        while True:
+            try:
+                snap = await get_order_status(alpaca_order_id)
+            except Exception as exc:
+                _log.warning(
+                    "strategy.roll.close_status_fetch_failed",
+                    alpaca_order_id=alpaca_order_id,
+                    error=str(exc),
+                )
+                snap = None
+            if snap is not None and snap.status.lower() in _TERMINAL_ALPACA_STATUSES:
+                return snap
+            if datetime.now(UTC).timestamp() >= deadline:
+                return None
+            await asyncio.sleep(ROLL_CLOSE_FILL_POLL_SECONDS)
+
+    async def _notify_roll_interrupted(
+        self, roll: RollIntent, *, detail: str
+    ) -> None:
+        """Alert the operator that a roll did not complete both legs."""
+        message = (
+            f"ROLL INTERRUPTED: {roll.underlying} "
+            f"{roll.current_option_symbol} -> "
+            f"{roll.new_option_symbol or '?'} x{roll.qty}. {detail}"
+        )
+        _log.error(
+            "strategy.roll.interrupted",
+            underlying=roll.underlying,
+            current=roll.current_option_symbol,
+            new=roll.new_option_symbol,
+            qty=roll.qty,
+            detail=detail,
+        )
+        try:
+            await enqueue(message, "alert", channel="telegram")
+        except Exception as exc:
+            _log.error(
+                "strategy.roll.interrupted_notify_failed", error=str(exc)
             )
 
     async def _submit_intent(
@@ -864,6 +1026,23 @@ class StrategyWorker:
         every fill whose delta drifted more than ``DELTA_TOLERANCE``
         from the recorded target.
         """
+        # Sweep zombies first: rows that never got an Alpaca order id can
+        # never be resolved by the polling loop below (it needs an id to
+        # ask the broker about). Anything id-less and non-terminal past
+        # the cutoff is marked failed so the table stops accumulating
+        # phantom in-flight orders. Failures fail open: a DB hiccup here
+        # must not take down reconciliation of real orders.
+        try:
+            swept = await mark_stale_unsubmitted(
+                datetime.now(UTC) - STALE_UNSUBMITTED_MAX_AGE
+            )
+            if swept:
+                _log.warning("strategy.reconcile.swept_stale", count=swept)
+        except Exception as exc:
+            _log.warning(
+                "strategy.reconcile.stale_sweep_failed", error=str(exc)
+            )
+
         rows: list[OrderRow] = await pending_orders()
         out_of_band: list[tuple[OrderRow, Decimal, Decimal]] = []
         for row in rows:
@@ -883,6 +1062,20 @@ class StrategyWorker:
             if status not in _TERMINAL_ALPACA_STATUSES:
                 continue
             mapped = _map_alpaca_status(status)
+            # A DAY limit order canceled at end-of-day with a partial
+            # fill DID open (or close) real contracts and collect real
+            # premium. Recording it as 'cancelled' hid the credit from
+            # profit-take's source-CSP lookup (status='filled' filter),
+            # so the partially-filled position could never profit-take.
+            # The position itself is the qty truth source; the row's
+            # job is carrying the fill price.
+            if mapped == "cancelled" and snap.filled_qty > 0:
+                _log.info(
+                    "strategy.reconcile.partial_fill_on_cancel",
+                    row_id=row.id,
+                    filled_qty=str(snap.filled_qty),
+                )
+                mapped = "filled"
             await mark_status(
                 row.id,
                 mapped,

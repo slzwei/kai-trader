@@ -216,6 +216,40 @@ async def pending_orders() -> list[OrderRow]:
     return [_row_to_order(dict(row)) for row in rows]
 
 
+async def mark_stale_unsubmitted(cutoff: datetime) -> int:
+    """Fail rows stuck in pending/submitted with no Alpaca order id.
+
+    A row can be created at ``pending`` (or flipped to ``submitted`` by a
+    code path that forgot to persist the broker's order id) and then never
+    progress: reconciliation only polls rows that carry an
+    ``alpaca_order_id``, so an id-less row sits in a non-terminal state
+    forever (two such zombies from the 2026-05-01 manual-close path sat
+    unresolved for 10 weeks). The sweep runs each reconcile pass with a
+    generous cutoff so a row that is mid-flight between ``record_intent``
+    and ``mark_submitted`` (a window of seconds) is never touched.
+
+    Returns the number of rows swept.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            update orders
+               set status = 'failed',
+                   error_text = coalesce(error_text, 'stale_never_submitted')
+             where alpaca_order_id is null
+               and status in ('pending', 'submitted')
+               and created_at < $1
+            """,
+            cutoff,
+        )
+    # asyncpg returns e.g. "UPDATE 2"; parse the count defensively.
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
 async def has_failed_since(
     *,
     option_symbol: str,

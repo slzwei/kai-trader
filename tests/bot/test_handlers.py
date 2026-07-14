@@ -1344,6 +1344,8 @@ def _patch_close_audit(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(close_mod, "mark_command_response", AsyncMock())
     monkeypatch.setattr(close_mod, "record_intent", AsyncMock(return_value="audit"))
+    monkeypatch.setattr(close_mod, "mark_submitted", AsyncMock())
+    monkeypatch.setattr(close_mod, "mark_status", AsyncMock())
     monkeypatch.setattr(close_mod, "_db_stage", AsyncMock(return_value=1))
     monkeypatch.setattr(close_mod, "_db_consume", AsyncMock(return_value=None))
 

@@ -209,6 +209,9 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     # W-9: post-fill delta persistence. Default no-op so reconciliation
     # tests focused on other paths are unaffected.
     mark_actual_delta = AsyncMock()
+    # Stale-order sweep. Default zero swept so reconciliation tests
+    # focused on other paths are unaffected.
+    mark_stale_unsubmitted = AsyncMock(return_value=0)
 
     monkeypatch.setattr(worker_module, "enqueue", enqueue)
     monkeypatch.setattr(worker_module, "get_account", get_account)
@@ -270,6 +273,9 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
         worker_module, "compute_realized_vol_30d", compute_realized_vol_30d
     )
     monkeypatch.setattr(worker_module, "mark_actual_delta", mark_actual_delta)
+    monkeypatch.setattr(
+        worker_module, "mark_stale_unsubmitted", mark_stale_unsubmitted
+    )
     return locals()
 
 
@@ -592,7 +598,8 @@ async def test_tick_executes_rolls_when_flags_green(
         AsyncMock(return_value=_clock(is_open=True)),
     )
     _patch_dependencies["get_flags"].return_value = {
-        "trading_enabled": True, "kill_switch": False,
+        "trading_enabled": True, "new_entries_enabled": True,
+        "kill_switch": False,
     }
     _patch_dependencies["evaluate_rolls"].return_value = [RollIntent(
         sleeve="index_core",
@@ -609,6 +616,7 @@ async def test_tick_executes_rolls_when_flags_green(
         new_credit=Decimal("3.00"),
         net_credit=Decimal("0.40"),
         reason="rolled",
+        qty=2,
     )]
 
     summary = await worker_module.StrategyWorker().tick()
@@ -622,7 +630,11 @@ async def test_tick_executes_rolls_when_flags_green(
     _patch_dependencies["close_position"].assert_awaited_once_with(
         "SPY260504P00050000"
     )
+    # The reopen leg carries the position's full size. qty=1 here would
+    # silently halve a 2-lot roll (close_position buys back everything).
     _patch_dependencies["submit_short_put"].assert_awaited_once()
+    reopen_kwargs = _patch_dependencies["submit_short_put"].await_args.kwargs
+    assert reopen_kwargs["qty"] == 2
 
 
 async def test_tick_skips_roll_execution_when_flag_off(
@@ -695,6 +707,235 @@ async def test_tick_logs_held_rolls_without_executing(
     assert "Watching SPY" in summary
     assert "Holding 1 challenged" in summary
     _patch_dependencies["close_position"].assert_not_awaited()
+
+
+def _rollable_intent(qty: int = 1) -> Any:
+    from kai_trader.strategy.rolls import RollIntent
+
+    return RollIntent(
+        sleeve="index_core",
+        underlying="SPY",
+        current_option_symbol="SPY260504P00050000",
+        current_strike=Decimal("50"),
+        current_expiration=date(2026, 5, 4),
+        current_delta=Decimal("-0.55"),
+        close_price=Decimal("2.60"),
+        new_option_symbol="SPY260504P00048000",
+        new_strike=Decimal("48"),
+        new_expiration=date(2026, 5, 4),
+        new_delta=Decimal("-0.30"),
+        new_credit=Decimal("3.00"),
+        net_credit=Decimal("0.40"),
+        reason="rolled",
+        qty=qty,
+    )
+
+
+async def test_tick_skips_roll_when_new_entries_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """The reopen leg is a new entry; rolling with the gate off would
+    half-complete (close refused-reopen) so the whole roll is held."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": False,
+        "kill_switch": False,
+    }
+    _patch_dependencies["evaluate_rolls"].return_value = [_rollable_intent()]
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["close_position"].assert_not_awaited()
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+
+
+async def test_roll_defers_reopen_when_close_never_fills(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """2026-07-01 regression: the reopen must wait for the close FILL
+    (collateral is only freed then). If the close never fills, no reopen
+    goes out and the operator is alerted."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    monkeypatch.setattr(worker_module, "ROLL_CLOSE_FILL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(worker_module, "ROLL_CLOSE_FILL_POLL_SECONDS", 0.01)
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": True,
+        "kill_switch": False,
+    }
+    _patch_dependencies["evaluate_rolls"].return_value = [_rollable_intent()]
+    working = OrderStatusSnapshot(
+        alpaca_order_id="close-uuid",
+        status="accepted",
+        filled_qty=Decimal("0"),
+        filled_avg_price=None,
+        filled_at=None,
+        submitted_at=datetime(2026, 5, 4, 14, 30, tzinfo=UTC),
+        cancelled_at=None,
+        failed_at=None,
+    )
+    _patch_dependencies["get_order_status"].return_value = working
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    alert_messages = [
+        c.args[0] for c in _patch_dependencies["enqueue"].await_args_list
+        if len(c.args) > 1 and c.args[1] == "alert"
+    ]
+    assert any("ROLL INTERRUPTED" in m for m in alert_messages)
+
+
+async def test_roll_aborts_reopen_when_close_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """A rejected/canceled close means the old put is still on the books;
+    reopening would double the short exposure."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": True,
+        "kill_switch": False,
+    }
+    _patch_dependencies["evaluate_rolls"].return_value = [_rollable_intent()]
+    rejected = OrderStatusSnapshot(
+        alpaca_order_id="close-uuid",
+        status="rejected",
+        filled_qty=Decimal("0"),
+        filled_avg_price=None,
+        filled_at=None,
+        submitted_at=datetime(2026, 5, 4, 14, 30, tzinfo=UTC),
+        cancelled_at=None,
+        failed_at=None,
+    )
+    _patch_dependencies["get_order_status"].return_value = rejected
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    statuses = [
+        c.args[1] for c in _patch_dependencies["mark_status"].await_args_list
+    ]
+    assert "cancelled" in statuses
+
+
+async def test_roll_alerts_when_reopen_refused_after_close_fill(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Close filled but the new put was refused: the book is lighter than
+    intended and the operator must hear about it loudly."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": True,
+        "kill_switch": False,
+    }
+    _patch_dependencies["evaluate_rolls"].return_value = [_rollable_intent(qty=2)]
+    # Default get_order_status returns a filled snapshot -> close fills.
+    _patch_dependencies["submit_short_put"].return_value = SubmitResult(
+        submitted=False, alpaca_order_id=None, order_status=None,
+        reason="insufficient_options_buying_power", flags={},
+        error="required 4700, available 0",
+    )
+
+    await worker_module.StrategyWorker().tick()
+
+    alert_messages = [
+        c.args[0] for c in _patch_dependencies["enqueue"].await_args_list
+        if len(c.args) > 1 and c.args[1] == "alert"
+    ]
+    assert any("ROLL INTERRUPTED" in m for m in alert_messages)
+    statuses = [
+        c.args[1] for c in _patch_dependencies["mark_status"].await_args_list
+    ]
+    assert "failed" in statuses
+
+
+async def test_tick_fails_closed_when_existing_shorts_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Unknown existing positions -> cap math would treat committed
+    collateral as zero and re-attempt held strikes. Skip new entries."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": True,
+        "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
+    _patch_dependencies["get_chain"].return_value = [_put_contract()]
+    _patch_dependencies["list_short_option_positions"].side_effect = (
+        RuntimeError("alpaca positions endpoint down")
+    )
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "fail-closed" in summary
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+
+
+async def test_reconcile_partial_fill_on_cancel_marked_filled(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """A DAY order canceled at EOD with a partial fill collected real
+    premium; marking it 'cancelled' hid the credit from profit-take."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=False)),
+    )
+    _patch_dependencies["pending_orders"].return_value = [_pending_row()]
+    partial = OrderStatusSnapshot(
+        alpaca_order_id="alpaca-1",
+        status="canceled",
+        filled_qty=Decimal("1"),
+        filled_avg_price=Decimal("0.55"),
+        filled_at=datetime(2026, 4, 27, 20, 0, tzinfo=UTC),
+        submitted_at=datetime(2026, 4, 27, 14, 30, tzinfo=UTC),
+        cancelled_at=datetime(2026, 4, 27, 20, 0, tzinfo=UTC),
+        failed_at=None,
+    )
+    _patch_dependencies["get_order_status"].return_value = partial
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["mark_status"].assert_awaited_once()
+    call = _patch_dependencies["mark_status"].await_args
+    assert call.args[1] == "filled"
+    assert call.kwargs["filled_avg_price"] == Decimal("0.55")
+
+
+async def test_reconcile_sweeps_stale_unsubmitted(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=False)),
+    )
+    _patch_dependencies["mark_stale_unsubmitted"].return_value = 2
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["mark_stale_unsubmitted"].assert_awaited_once()
+    cutoff = _patch_dependencies["mark_stale_unsubmitted"].await_args.args[0]
+    assert isinstance(cutoff, datetime)
 
 
 # ------------- Phase 5a: assignments + covered calls -------------

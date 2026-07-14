@@ -65,6 +65,12 @@ class RollIntent:
     new_credit: Decimal | None
     net_credit: Decimal | None
     reason: str  # "rolled" | "no_net_credit_candidate" | "no_chain_match" | "earnings_blackout"
+    # Contracts in the challenged position. close_position buys back the
+    # ENTIRE position, so the reopen leg must match this qty or a
+    # multi-lot roll silently halves the position (observed risk: the
+    # worker hardcoded qty=1 while 2-lot positions existed in prod).
+    # Defaulted for back-compat with existing fixtures.
+    qty: int = 1
 
 
 def _find_current_in_chain(
@@ -153,13 +159,21 @@ async def evaluate_rolls(
             continue
         if option_type != "put":
             continue
+        # Size of the challenged position. The worker's close leg buys
+        # back every contract, so the reopen leg must carry the same
+        # qty to keep the roll size-neutral.
+        position_qty = int(abs(pos.qty))
+        if position_qty < 1:
+            continue
 
         sleeve = _matching_sleeve(sleeves, underlying)
         if sleeve is None or not _is_sleeve_active(sleeve, "neutral"):
-            # _is_sleeve_active in neutral mirrors the rolls policy:
-            # opportunistic still gets managed once entered.
-            sleeve = sleeve  # for clarity; if None we already continued
-        if sleeve is None:
+            # No sleeve owns the name, or the operator disabled the
+            # sleeve. A roll opens NEW short exposure (the reopen leg),
+            # so a disabled sleeve holds instead: the challenged put
+            # rides to expiry and the wheel accepts assignment. The
+            # regime never blocks here because _is_sleeve_active only
+            # checks the enabled flag (Phase 7 dropped regime gating).
             continue
 
         try:
@@ -203,6 +217,7 @@ async def evaluate_rolls(
                     new_credit=None,
                     net_credit=None,
                     reason="no_chain_match",
+                    qty=position_qty,
                 )
             )
             continue
@@ -250,6 +265,7 @@ async def evaluate_rolls(
                         new_credit=candidate.bid,
                         net_credit=None,
                         reason="earnings_blackout",
+                        qty=position_qty,
                     )
                 )
                 continue
@@ -273,6 +289,7 @@ async def evaluate_rolls(
                     new_credit=new_credit,
                     net_credit=net_credit,
                     reason="no_net_credit_candidate",
+                    qty=position_qty,
                 )
             )
             continue
@@ -293,6 +310,7 @@ async def evaluate_rolls(
                 new_credit=new_credit,
                 net_credit=net_credit,
                 reason="rolled",
+                qty=position_qty,
             )
         )
     return intents
