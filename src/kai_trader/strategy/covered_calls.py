@@ -36,6 +36,16 @@ EarningsStatusProvider = Callable[[str, date, int], Awaitable[EarningsStatus]]
 
 _log = get_logger(__name__)
 
+# Minimum bid for a covered call (2026-08-04, burn-in audit). A CC caps
+# the shares' upside for the whole DTE window; that cap must be paid
+# for. The audit found SOFI 8/7 C18 x2 sold at $0.05, i.e. $10 of
+# premium for freezing 200 shares for a week. Below this floor the
+# builder holds the symbol back for the tick and says so in the
+# diagnostics; the shares stay uncapped until a later tick prices the
+# call properly. $0.10 also clears round-trip fees (~$0.08-$0.13) with
+# margin, mirroring the put side's fee-protection rationale.
+MIN_CC_BID_PREMIUM = Decimal("0.10")
+
 
 @dataclass(frozen=True)
 class CallIntent:
@@ -70,6 +80,8 @@ class CallDiagnostic:
     intents_built: int
     symbols_skipped_for_cost_basis_floor: int = 0
     cost_basis_floor_symbols: tuple[str, ...] = ()
+    symbols_skipped_for_min_credit: int = 0
+    min_credit_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -102,6 +114,25 @@ class CallBuildDiagnostics:
             lines.append(
                 f"{total_floor} covered call(s) held back: no strike at or "
                 f"above cost basis in DTE band: {sample}{more}"
+            )
+        # Min-credit note surfaces the same way: "why is my stock still
+        # uncovered" deserves an answer even on ticks that wrote other CCs.
+        total_min_credit = sum(
+            s.symbols_skipped_for_min_credit for s in self.sleeves
+        )
+        if total_min_credit > 0:
+            mc_symbols = sorted({
+                sym for s in self.sleeves for sym in s.min_credit_symbols
+            })
+            sample = ", ".join(mc_symbols[:5])
+            more = (
+                f" (+{len(mc_symbols) - 5} more)"
+                if len(mc_symbols) > 5
+                else ""
+            )
+            lines.append(
+                f"{total_min_credit} covered call(s) held back: bid below "
+                f"${MIN_CC_BID_PREMIUM} minimum credit: {sample}{more}"
             )
         total_intents = sum(s.intents_built for s in active)
         if total_intents > 0:
@@ -324,6 +355,8 @@ async def build_call_intents(
         intents_built_for_sleeve = 0
         symbols_skipped_for_cost_basis_floor = 0
         cost_basis_floor_symbols: list[str] = []
+        symbols_skipped_for_min_credit = 0
+        min_credit_symbols: list[str] = []
 
         for _sleeve_match, position in positions_for_sleeve:
             # Earnings filter (2026-05-10): skip the symbol if its next
@@ -410,6 +443,22 @@ async def build_call_intents(
                     )
                 continue
 
+            # Minimum credit floor: capping the shares for the DTE window
+            # has to pay more than pocket change. A sub-floor bid holds
+            # the symbol back this tick; a later tick reprices.
+            if contract.bid is not None and contract.bid < MIN_CC_BID_PREMIUM:
+                symbols_skipped_for_min_credit += 1
+                min_credit_symbols.append(position.symbol)
+                _log.info(
+                    "strategy.cc.min_credit_floor",
+                    sleeve=sleeve.sleeve,
+                    symbol=position.symbol,
+                    option_symbol=contract.symbol,
+                    bid=str(contract.bid),
+                    floor=str(MIN_CC_BID_PREMIUM),
+                )
+                continue
+
             # Coverage-aware qty: size off shares NOT already committed to
             # an open order, not the total holding. When a covered call from
             # an earlier tick is still working, Alpaca reserves the shares it
@@ -449,6 +498,8 @@ async def build_call_intents(
                     symbols_skipped_for_cost_basis_floor
                 ),
                 cost_basis_floor_symbols=tuple(cost_basis_floor_symbols),
+                symbols_skipped_for_min_credit=symbols_skipped_for_min_credit,
+                min_credit_symbols=tuple(min_credit_symbols),
             )
         )
 

@@ -2247,3 +2247,78 @@ def test_max_contracts_per_symbol_tier_above_500k() -> None:
     assert max_contracts_per_symbol(Decimal("500000")) == 50
     assert max_contracts_per_symbol(Decimal("1000000")) == 50
     assert max_contracts_per_symbol(Decimal("10000000")) == 50
+
+
+# ------------- Layer B bid-yield floor (2026-08-04) -------------
+
+
+async def test_min_yield_floor_skips_thin_target_delta_contract() -> None:
+    """T-style thin premium: 24.5P bid 0.21 at 10 DTE = 0.086%/day.
+
+    Below the 0.10%/day floor the symbol is skipped outright. The
+    richer-but-higher-delta contract in the chain must NOT be chosen
+    instead: the floor skips, it does not hunt toward the money.
+    """
+    today = date(2026, 7, 28)
+    sleeve = _sleeve(whitelist=["T"])
+    thin = _put(
+        strike=24.5,
+        delta=-0.30,
+        expiration=today + timedelta(days=10),
+        bid=0.21,
+        ask=0.23,
+        underlying="T",
+    )
+    richer_higher_delta = _put(
+        strike=26.0,
+        delta=-0.55,
+        expiration=today + timedelta(days=10),
+        bid=1.20,
+        ask=1.30,
+        underlying="T",
+    )
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [thin, richer_higher_delta]
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[sleeve],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+
+    assert intents == []
+    assert diag.sleeves[0].symbols_skipped_for_min_yield == 1
+    assert diag.sleeves[0].min_yield_symbols == ("T",)
+    assert any("bid-yield floor" in w for w in diag.warning_lines())
+
+
+async def test_min_yield_floor_passes_adequate_yield() -> None:
+    """0.30 bid on the same strike/DTE = 0.122%/day, above the floor."""
+    today = date(2026, 7, 28)
+    sleeve = _sleeve(whitelist=["T"])
+    rich = _put(
+        strike=24.5,
+        delta=-0.30,
+        expiration=today + timedelta(days=10),
+        bid=0.30,
+        ask=0.34,
+        underlying="T",
+    )
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [rich]
+
+    intents, diag = await build_intents_with_diagnostics(
+        regime=_regime("risk_on"),
+        sleeves=[sleeve],
+        account=_account(),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+
+    assert len(intents) == 1
+    assert intents[0].symbol == "T"
+    assert diag.sleeves[0].symbols_skipped_for_min_yield == 0

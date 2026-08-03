@@ -150,6 +150,49 @@ def _format_error_text(result: SubmitResult) -> str | None:
     return result.reason or result.error
 
 
+def _working_csp_snapshots(rows: list[OrderRow]) -> list[PositionSnapshot]:
+    """Synthesise short-put position stubs for working (unfilled) CSP orders.
+
+    W-10: the cap math in ``build_intents_with_diagnostics`` counts
+    committed collateral from *positions*, but Alpaca only materialises a
+    position when an order fills. A working limit order already locks
+    buying power at the broker yet was invisible to the per-name, sleeve,
+    and total caps, so sequential ticks could stack the same underlying
+    far past the 12% per-name cap while earlier orders sat unfilled
+    (observed 2026-07-28: three T 24.5P submissions 16 minutes apart, all
+    filling 30+ minutes later, 24% of equity in one name; same pattern on
+    RIVN 2026-07-14 and F 2026-07-29).
+
+    Each stub carries only the fields the cap math reads (OCC symbol and
+    qty). A stub for a partially filled order double-counts the filled
+    part alongside the real position; that errs toward less deployment,
+    which is the safe direction.
+    """
+    stubs: list[PositionSnapshot] = []
+    for row in rows:
+        if row.action != "open_short_put":
+            continue
+        try:
+            qty = int(row.intent_payload.get("qty", 1))
+        except (TypeError, ValueError):
+            qty = 1
+        if qty < 1:
+            continue
+        stubs.append(
+            PositionSnapshot(
+                symbol=row.option_symbol,
+                qty=Decimal(-qty),
+                side="short",
+                avg_entry_price=Decimal("0"),
+                current_price=None,
+                market_value=None,
+                unrealized_pl=None,
+                unrealized_intraday_pl=None,
+            )
+        )
+    return stubs
+
+
 class StrategyWorker:
     """Polls market hours, reconciles open orders, and submits new trades."""
 
@@ -200,7 +243,9 @@ class StrategyWorker:
         """Run one strategy tick. Returns the human-readable summary."""
         # Reconciliation runs even when the market is closed: an order
         # filled overnight should be reflected on Monday morning.
-        reconciled = await self._reconcile_pending()
+        # ``working_orders`` are rows still live at the broker after the
+        # pass; their collateral feeds the cap math below (W-10).
+        reconciled, working_orders = await self._reconcile_pending()
 
         settings = get_settings()
         clock = await get_clock_snapshot()
@@ -272,6 +317,23 @@ class StrategyWorker:
             _log.warning("strategy.existing_shorts.fetch_failed", error=str(exc))
             existing_shorts = []
             shorts_fetch_failed = True
+
+        # W-10: collateral locked by working (submitted, unfilled) CSP
+        # orders is invisible to the position fetch above until the fill
+        # lands. Merge synthetic stubs for those rows into the list the
+        # cap math sees, so the per-name, sleeve, total, and contract-
+        # ceiling caps all count in-flight collateral. Without this, a
+        # slow-to-fill limit order let the next tick stack the same name
+        # past the caps. ``existing_shorts`` itself stays position-only
+        # because the tick render displays it as Open positions.
+        working_stubs = _working_csp_snapshots(working_orders)
+        if working_stubs:
+            _log.info(
+                "strategy.working_orders.collateral_counted",
+                count=len(working_stubs),
+                option_symbols=[s.symbol for s in working_stubs],
+            )
+        shorts_for_caps = [*existing_shorts, *working_stubs]
 
         # W-4: feed the deployment-velocity caps and cool-down into the
         # builder. today_already_deployed is the running daily total of
@@ -352,7 +414,7 @@ class StrategyWorker:
                 today=today,
                 earnings_status=get_earnings_status,
                 trend_status=get_trend_status,
-                existing_short_puts=existing_shorts,
+                existing_short_puts=shorts_for_caps,
                 today_already_deployed=today_already_deployed,
                 cooldown_symbols=cooldown_symbols,
                 # Phase 5 retuning (2026-05-09): IV/RV gate disabled. The
@@ -1016,7 +1078,7 @@ class StrategyWorker:
         await mark_status(row_id, "failed", error_text=_format_error_text(result))
         return "failed"
 
-    async def _reconcile_pending(self) -> int:
+    async def _reconcile_pending(self) -> tuple[int, list[OrderRow]]:
         """Check Alpaca for status updates on any non-terminal orders.
 
         W-9: when a row transitions to ``filled`` we additionally fetch
@@ -1025,6 +1087,14 @@ class StrategyWorker:
         ``priority='warning'`` Telegram notification per tick batching
         every fill whose delta drifted more than ``DELTA_TOLERANCE``
         from the recorded target.
+
+        Returns ``(polled_count, still_working)``. ``still_working`` is
+        the subset of rows that remain live at the broker after this
+        pass: status fetch failed (assume live), or the broker reported
+        a non-terminal status. W-10 feeds these into the CSP cap math so
+        collateral locked by working limit orders counts against the
+        per-name, sleeve, and total deployment caps before the fill
+        materialises a position.
         """
         # Sweep zombies first: rows that never got an Alpaca order id can
         # never be resolved by the polling loop below (it needs an id to
@@ -1044,6 +1114,7 @@ class StrategyWorker:
             )
 
         rows: list[OrderRow] = await pending_orders()
+        still_working: list[OrderRow] = []
         out_of_band: list[tuple[OrderRow, Decimal, Decimal]] = []
         for row in rows:
             if row.alpaca_order_id is None:
@@ -1057,9 +1128,13 @@ class StrategyWorker:
                     alpaca_order_id=row.alpaca_order_id,
                     error=str(exc),
                 )
+                # Unknown status = assume the order is still live so its
+                # collateral keeps counting against the caps (W-10).
+                still_working.append(row)
                 continue
             status = snap.status.lower()
             if status not in _TERMINAL_ALPACA_STATUSES:
+                still_working.append(row)
                 continue
             mapped = _map_alpaca_status(status)
             # A DAY limit order canceled at end-of-day with a partial
@@ -1088,7 +1163,7 @@ class StrategyWorker:
                     out_of_band.append(breach)
         if out_of_band:
             await self._notify_delta_breaches(out_of_band)
-        return len(rows)
+        return len(rows), still_working
 
     async def _record_post_fill_delta(
         self, row: OrderRow

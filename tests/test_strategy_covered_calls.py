@@ -596,3 +596,60 @@ async def test_build_call_intents_skips_earnings_check_when_sleeve_disabled() ->
 
     assert len(intents) == 1
     earnings_provider.assert_not_awaited()
+
+
+# ------------- minimum credit floor (2026-08-04) -------------
+
+
+async def test_build_call_intents_min_credit_floor_skips_nickel_call() -> None:
+    """A nickel call caps the shares for pocket change; hold it back.
+
+    Burn-in audit case: SOFI 8/7 C18 x2 sold at $0.05, $10 of premium
+    for freezing 200 shares for a week.
+    """
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _call(strike=260, delta=0.30, expiration=expiry, bid=0.05, ask=0.08)
+        ]
+
+    intents, diag = await build_call_intents(
+        long_equity_positions=[_equity("AMZN", "100")],
+        sleeves=[_sleeve(whitelist=["AMZN"])],
+        regime=_regime("neutral"),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+
+    assert intents == []
+    sleeve_diag = diag.sleeves[0]
+    assert sleeve_diag.symbols_skipped_for_min_credit == 1
+    assert sleeve_diag.min_credit_symbols == ("AMZN",)
+    assert any("minimum credit" in line for line in diag.warning_lines())
+
+
+async def test_build_call_intents_min_credit_floor_passes_at_floor() -> None:
+    """A bid exactly at the $0.10 floor still writes the call."""
+    today = date(2026, 4, 27)
+    expiry = today + timedelta(days=8)
+
+    async def fetcher(_symbol: str, _exp: Any) -> list[OptionContract]:
+        return [
+            _call(strike=260, delta=0.30, expiration=expiry, bid=0.10, ask=0.14)
+        ]
+
+    intents, diag = await build_call_intents(
+        long_equity_positions=[_equity("AMZN", "100")],
+        sleeves=[_sleeve(whitelist=["AMZN"])],
+        regime=_regime("neutral"),
+        chain_fetcher=fetcher,
+        today=today,
+    )
+
+    assert len(intents) == 1
+    assert diag.sleeves[0].symbols_skipped_for_min_credit == 0
+    assert not any(
+        "minimum credit" in line for line in diag.warning_lines()
+    )

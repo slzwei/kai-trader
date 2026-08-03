@@ -1555,3 +1555,116 @@ async def test_post_fill_delta_batches_multiple_breaches(
     msg = drift_calls[0].kwargs["message"]
     assert "SPY260505P00050000" in msg
     assert "QQQ260505P00040000" in msg
+
+
+# ------------- W-10 working-order collateral -------------
+
+
+def _working_row(
+    *,
+    option_symbol: str = "SPY260505P00050000",
+    action: str = "open_short_put",
+    qty: int | None = 2,
+) -> OrderRow:
+    """A submitted-but-unfilled order row, as pending_orders returns it."""
+    payload: dict[str, Any] = {"strike": "50"}
+    if qty is not None:
+        payload["qty"] = qty
+    return OrderRow(
+        id="row-w10",
+        created_at=datetime(2026, 4, 27, tzinfo=UTC),
+        sleeve="index_core",
+        symbol="SPY",
+        option_symbol=option_symbol,
+        action=action,  # type: ignore[arg-type]
+        intent_payload=payload,
+        alpaca_order_id="alpaca-w10",
+        status="submitted",
+        gating_decision=None,
+        submitted_at=datetime(2026, 4, 27, tzinfo=UTC),
+        filled_at=None,
+        filled_avg_price=None,
+        error_text=None,
+    )
+
+
+def test_working_csp_snapshots_builds_short_stubs() -> None:
+    stubs = worker_module._working_csp_snapshots([_working_row(qty=2)])
+    assert len(stubs) == 1
+    assert stubs[0].symbol == "SPY260505P00050000"
+    assert stubs[0].qty == Decimal("-2")
+    assert stubs[0].side == "short"
+
+
+def test_working_csp_snapshots_defaults_missing_qty_to_one() -> None:
+    stubs = worker_module._working_csp_snapshots([_working_row(qty=None)])
+    assert stubs[0].qty == Decimal("-1")
+
+
+def test_working_csp_snapshots_ignores_non_csp_actions() -> None:
+    rows = [
+        _working_row(action="open_covered_call"),
+        _working_row(action="close"),
+        _working_row(action="profit_take_close"),
+    ]
+    assert worker_module._working_csp_snapshots(rows) == []
+
+
+async def test_tick_counts_working_order_collateral_against_caps(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """W-10 acceptance: an unfilled CSP order's collateral binds the caps.
+
+    Equity $100k puts the per-name cap at $12k. A working SPY 50P x2
+    locks $10k; the $2k remainder cannot fund another $5k contract, so
+    no new SPY intent may go out while the order works. This is the
+    2026-07-28 T-stacking incident in miniature: three submissions 16
+    minutes apart, none yet filled, 24% of equity in one name.
+    """
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": True,
+        "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
+    _patch_dependencies["get_chain"].return_value = [_put_contract()]
+    _patch_dependencies["pending_orders"].return_value = [_working_row(qty=2)]
+    _patch_dependencies["get_order_status"].return_value = OrderStatusSnapshot(
+        alpaca_order_id="alpaca-w10",
+        status="accepted",
+        filled_qty=Decimal("0"),
+        filled_avg_price=None,
+        filled_at=None,
+        submitted_at=datetime(2026, 4, 27, tzinfo=UTC),
+        cancelled_at=None,
+        failed_at=None,
+    )
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+
+
+async def test_tick_builds_intent_when_no_working_orders(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Control for W-10: the same book with no working orders submits."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": True,
+        "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
+    _patch_dependencies["get_chain"].return_value = [_put_contract()]
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["submit_short_put"].assert_awaited()

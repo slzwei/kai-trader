@@ -159,10 +159,22 @@ POST_PROFIT_TAKE_COOLDOWN_MINUTES = 0
 # Will be tuned upward in Phase 3 once the universe is concentrated
 # to high-IV names where 0.30-0.50%/day is normal.
 MIN_BID_PREMIUM = Decimal("0.05")
-# Phase 7 (2026-05-09): yield floor disabled (0). The fee-protection
-# floor (MIN_BID_PREMIUM = $0.05) is the only remaining check; any
-# yield is a contribution at the income target.
-MIN_BID_YIELD_PER_DAY = Decimal("0")
+# Layer B re-enabled (2026-08-04) after the burn-in audit. Phase 7 had
+# disabled the yield floor entirely; the burn-in book then sold thin
+# premium on quiet names and wore full assignment risk for near-zero
+# pay: T 24.5P at 0.086%/day (three contracts, $65 total credit,
+# marked -$280 within a week), and the 2026-05-07 audit's KMI
+# 0.074%/day, KHC 0.061%/day, XLF 0.059%/day. 0.10%/day (~0.7%/week
+# on collateral) rejects all of those while passing normal candidates
+# (the F 15.5P entry ran 0.19%/day; test fixtures ~0.18%/day).
+#
+# Semantics: the floor is applied AFTER strike selection, to the
+# target-delta contract the sleeve actually wants. A thin bid there
+# skips the symbol for the tick. Filtering inside selection instead
+# would hunt for a richer strike, and for puts richer always means
+# higher delta, quietly drifting entries toward the money on low-vol
+# names. Skip, do not hunt.
+MIN_BID_YIELD_PER_DAY = Decimal("0.0010")
 
 # W-3: hard 15% per-name notional ceiling. The historical per-symbol cap
 # was tiered (60% at small accounts, 15% at large) because at $50k equity
@@ -234,6 +246,8 @@ class SleeveDiagnostic:
     per_name_dollar_cap_symbols: tuple[str, ...] = ()
     symbols_skipped_for_iv_rv_floor: int = 0
     iv_rv_floor_symbols: tuple[str, ...] = ()
+    symbols_skipped_for_min_yield: int = 0
+    min_yield_symbols: tuple[str, ...] = ()
     symbols_skipped_for_trend: int = 0
     trend_skip_symbols: tuple[str, ...] = ()
     symbols_skipped_for_trend_unknown: int = 0
@@ -402,6 +416,24 @@ class BuildDiagnostics:
                 f"{total_skipped_iv_rv} symbol(s) below IV/RV 1.10 floor: "
                 f"{sample}{more}"
             )
+        total_skipped_min_yield = sum(
+            s.symbols_skipped_for_min_yield for s in self.sleeves
+        )
+        if total_skipped_min_yield > 0:
+            min_yield_syms = sorted({
+                sym for s in self.sleeves for sym in s.min_yield_symbols
+            })
+            sample = ", ".join(min_yield_syms[:5])
+            more = (
+                f" (+{len(min_yield_syms) - 5} more)"
+                if len(min_yield_syms) > 5
+                else ""
+            )
+            warnings.append(
+                f"{total_skipped_min_yield} symbol(s) below "
+                f"{MIN_BID_YIELD_PER_DAY:.2%}/day bid-yield floor: "
+                f"{sample}{more}"
+            )
         total_skipped_ceiling = sum(
             s.symbols_skipped_for_contract_ceiling for s in self.sleeves
         )
@@ -511,19 +543,17 @@ def select_put_strike(
             continue
         if not _within_dte_band(c.expiration, today, sleeve):
             continue
-        # Two-layer per-contract floor (P6).
-        # Layer A: absolute fee-protection ($0.05 bid).
-        # Layer B: bid-yield per day floor (0.20%/day) — the trade
-        # must contribute meaningfully to the income target.
+        # Layer A fee-protection floor ($0.05 bid) applies inside
+        # selection: hunting past a garbage quote is harmless. Layer B
+        # (the bid-yield floor) is applied by the builder AFTER
+        # selection so a thin target-delta contract skips the symbol
+        # instead of pulling selection toward a higher-delta strike.
         if c.bid is None or c.bid < MIN_BID_PREMIUM:
             continue
         dte_days = (c.expiration - today).days
         if dte_days <= 0:
             continue  # already expired or settling today
         if c.strike <= 0:
-            continue
-        bid_yield_per_day = c.bid / c.strike / Decimal(dte_days)
-        if bid_yield_per_day < MIN_BID_YIELD_PER_DAY:
             continue
         typed_candidates.append((c, c.delta))
     if not typed_candidates:
@@ -934,11 +964,13 @@ async def build_intents_with_diagnostics(
         symbols_skipped_for_contract_ceiling = 0
         symbols_skipped_for_per_name_dollar_cap = 0
         symbols_skipped_for_iv_rv_floor = 0
+        symbols_skipped_for_min_yield = 0
         earnings_blackout_symbols: list[str] = []
         earnings_unknown_symbols: list[str] = []
         contract_ceiling_symbols: list[str] = []
         per_name_dollar_cap_symbols: list[str] = []
         iv_rv_floor_symbols: list[str] = []
+        min_yield_symbols: list[str] = []
         symbols_skipped_for_trend = 0
         symbols_skipped_for_trend_unknown = 0
         trend_skip_symbols: list[str] = []
@@ -1054,6 +1086,31 @@ async def build_intents_with_diagnostics(
             contract = select_put_strike(chain, target_delta, sleeve, today)
             if contract is None or contract.bid is None or contract.ask is None:
                 continue
+            # Layer B bid-yield floor, applied to the SELECTED contract.
+            # If the target-delta strike pays under the floor, the symbol
+            # is skipped for this tick rather than hunting a richer
+            # (necessarily higher-delta) strike toward the money. See the
+            # MIN_BID_YIELD_PER_DAY comment for the calibration data.
+            dte_days = max((contract.expiration - today).days, 1)
+            if contract.strike > 0:
+                bid_yield_per_day = (
+                    contract.bid / contract.strike / Decimal(dte_days)
+                )
+                if bid_yield_per_day < MIN_BID_YIELD_PER_DAY:
+                    symbols_skipped_for_min_yield += 1
+                    if contract.underlying not in min_yield_symbols:
+                        min_yield_symbols.append(contract.underlying)
+                    _log.info(
+                        "strategy.min_yield.skipped",
+                        sleeve=sleeve.sleeve,
+                        symbol=contract.underlying,
+                        bid=str(contract.bid),
+                        strike=str(contract.strike),
+                        dte=dte_days,
+                        bid_yield_per_day=str(bid_yield_per_day),
+                        floor=str(MIN_BID_YIELD_PER_DAY),
+                    )
+                    continue
             # W-8: IV/RV floor. Skip the candidate if implied vol is not
             # at least 1.10x recent realized vol; otherwise we are
             # selling vol cheaper than the underlying has traded
@@ -1266,6 +1323,8 @@ async def build_intents_with_diagnostics(
                 per_name_dollar_cap_symbols=tuple(per_name_dollar_cap_symbols),
                 symbols_skipped_for_iv_rv_floor=symbols_skipped_for_iv_rv_floor,
                 iv_rv_floor_symbols=tuple(iv_rv_floor_symbols),
+                symbols_skipped_for_min_yield=symbols_skipped_for_min_yield,
+                min_yield_symbols=tuple(min_yield_symbols),
                 symbols_skipped_for_trend=symbols_skipped_for_trend,
                 trend_skip_symbols=tuple(trend_skip_symbols),
                 symbols_skipped_for_trend_unknown=symbols_skipped_for_trend_unknown,
