@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from alpaca.data.enums import OptionsFeed
 
 from kai_trader.broker import options_data
 
@@ -180,3 +182,29 @@ def test_reset_client_forces_rebuild(monkeypatch: pytest.MonkeyPatch) -> None:
     options_data.reset_client()
     options_data._get_client()
     assert len(builds) == 2
+
+
+def test_options_feed_defaults_to_indicative(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Free indicative is the default so a lapsed subscription cannot stall ticks.
+
+    Regression guard: OPRA was previously hard-pinned, and without an
+    active subscription every chain fetch raised "subscription does not
+    permit querying OPRA data".
+    """
+    monkeypatch.setattr(
+        options_data,
+        "get_settings",
+        lambda: SimpleNamespace(alpaca_options_feed="indicative"),
+    )
+    assert options_data._options_feed() is OptionsFeed.INDICATIVE
+
+
+def test_options_feed_honours_opra_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        options_data,
+        "get_settings",
+        lambda: SimpleNamespace(alpaca_options_feed="opra"),
+    )
+    assert options_data._options_feed() is OptionsFeed.OPRA

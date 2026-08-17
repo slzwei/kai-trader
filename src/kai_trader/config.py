@@ -16,6 +16,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["dev", "staging", "prod"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+StockFeed = Literal["iex", "sip"]
+OptionsFeedName = Literal["indicative", "opra"]
 
 
 class Settings(BaseSettings):
@@ -87,6 +89,27 @@ class Settings(BaseSettings):
         description=(
             "If true, route through Alpaca paper. Live trading requires this "
             "flag plus the trading-enabled system flag flipped on."
+        ),
+    )
+
+    alpaca_stock_feed: StockFeed = Field(
+        default="iex",
+        alias="ALPACA_STOCK_FEED",
+        description=(
+            "Stock data feed. 'sip' is the full consolidated tape and needs a "
+            "paid Alpaca market-data subscription; requesting it without one "
+            "fails every call with 'subscription does not permit querying "
+            "recent SIP data'. 'iex' is free and is the safe default."
+        ),
+    )
+    alpaca_options_feed: OptionsFeedName = Field(
+        default="indicative",
+        alias="ALPACA_OPTIONS_FEED",
+        description=(
+            "Options chain feed. 'opra' is the real NBBO and needs a paid "
+            "subscription. 'indicative' is free but quotes are derived rather "
+            "than true NBBO, and greeks are absent on some contracts, so "
+            "strike selection has thinner coverage. Default 'indicative'."
         ),
     )
 

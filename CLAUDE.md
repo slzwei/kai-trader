@@ -163,6 +163,8 @@ kai-trader/
 | ALPACA_API_KEY_LIVE   | for live | Live-trading API key. Required when ALPACA_PAPER=false. The paper key is intentionally NOT a fallback in live mode. |
 | ALPACA_SECRET_KEY_LIVE | for live | Paired with ALPACA_API_KEY_LIVE. Required in live mode. |
 | ALPACA_PAPER          | no       | `true` (default) routes to Alpaca paper. `false` switches to live, but live trades still require the trading-enabled flag. |
+| ALPACA_STOCK_FEED     | no       | `iex` (free, default) or `sip` (paid). SIP needs an active Alpaca market-data subscription. Without one, every request raises "subscription does not permit querying recent SIP data" and the strategy tick throws. |
+| ALPACA_OPTIONS_FEED   | no       | `indicative` (free, default) or `opra` (paid). Same failure mode as above. Indicative quotes are derived rather than true NBBO and some contracts carry no greeks, so strike coverage is thinner. |
 | ENV                   | no       | `dev`, `staging`, or `prod`. Default `dev`.        |
 | LOG_LEVEL             | no       | `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default INFO. |
 | TIMEZONE              | no       | IANA name. Default `Asia/Singapore`.               |

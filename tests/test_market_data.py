@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from alpaca.data.enums import DataFeed
 
 from kai_trader.broker import market_data
 
@@ -125,3 +127,42 @@ def test_reset_client_forces_rebuild(monkeypatch: pytest.MonkeyPatch) -> None:
     market_data.reset_client()
     market_data._get_client()
     assert len(builds) == 2
+
+
+def test_feed_defaults_to_iex(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Free IEX is the default so a missing subscription cannot break ticks.
+
+    Regression guard: SIP was previously hard-pinned, so when the Alpaca
+    market-data subscription lapsed every bars request started raising
+    "subscription does not permit querying recent SIP data" and the
+    strategy loop stopped trading entirely.
+    """
+    monkeypatch.setattr(
+        market_data, "get_settings", lambda: SimpleNamespace(alpaca_stock_feed="iex")
+    )
+    assert market_data._feed() is DataFeed.IEX
+
+
+def test_feed_honours_sip_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        market_data, "get_settings", lambda: SimpleNamespace(alpaca_stock_feed="sip")
+    )
+    assert market_data._feed() is DataFeed.SIP
+
+
+@pytest.mark.asyncio
+async def test_daily_bars_request_uses_configured_feed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resolved feed must reach the actual outbound request object."""
+    fake = MagicMock()
+    fake.get_stock_bars.return_value = MagicMock(data={"SPY": []})
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        market_data, "get_settings", lambda: SimpleNamespace(alpaca_stock_feed="iex")
+    )
+
+    await market_data.get_daily_bars("SPY", lookback_days=70)
+
+    request = fake.get_stock_bars.call_args.args[0]
+    assert request.feed is DataFeed.IEX

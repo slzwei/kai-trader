@@ -7,6 +7,14 @@ The official ``alpaca-py`` client is sync, so each call is pushed through
 ``asyncio.to_thread`` to keep the bot's event loop responsive. Returned
 contracts are narrow dataclasses so handlers and strategy code do not
 depend on alpaca-py types directly.
+
+The chain feed is configurable via ``ALPACA_OPTIONS_FEED``. ``opra`` is the
+real NBBO and requires a paid Alpaca subscription; without one every call
+raises "subscription does not permit querying OPRA data". ``indicative`` is
+free and is the default, at the cost of derived rather than true NBBO quotes
+and missing greeks on a slice of contracts. Strike selection already skips
+contracts with no delta, so the practical effect is thinner candidate
+coverage rather than wrong picks.
 """
 
 from __future__ import annotations
@@ -95,6 +103,13 @@ def reset_client() -> None:
     _client = None
 
 
+def _options_feed() -> OptionsFeed:
+    """Resolve the configured options feed. Defaults to free indicative."""
+    if get_settings().alpaca_options_feed == "opra":
+        return OptionsFeed.OPRA
+    return OptionsFeed.INDICATIVE
+
+
 def _to_decimal_or_none(value: Any) -> Decimal | None:
     if value is None:
         return None
@@ -142,7 +157,7 @@ async def get_chain(
     client = _get_client()
     request_kwargs: dict[str, Any] = {
         "underlying_symbol": upper,
-        "feed": OptionsFeed.OPRA,
+        "feed": _options_feed(),
     }
     if expiration is not None:
         request_kwargs["expiration_date"] = expiration
@@ -185,7 +200,7 @@ async def get_option_quotes(symbols: list[str]) -> dict[str, OptionQuote]:
     client = _get_client()
     request = OptionLatestQuoteRequest(
         symbol_or_symbols=symbols,
-        feed=OptionsFeed.OPRA,
+        feed=_options_feed(),
     )
     result = await asyncio.to_thread(client.get_option_latest_quote, request)
     if not isinstance(result, dict):

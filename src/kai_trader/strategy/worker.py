@@ -193,6 +193,16 @@ def _working_csp_snapshots(rows: list[OrderRow]) -> list[PositionSnapshot]:
     return stubs
 
 
+# A tick that raises is logged and retried, which is correct for a
+# transient blip but indistinguishable from a quiet market to anyone
+# watching Telegram. Once the failures stack up this high, the loop
+# escalates to a critical notification. Six ticks is roughly half an
+# hour at the default poll interval: long enough to ride out an Alpaca
+# hiccup, short enough that a dead data subscription surfaces the same
+# session instead of after days of silence.
+TICK_FAILURE_ALERT_THRESHOLD = 6
+
+
 class StrategyWorker:
     """Polls market hours, reconciles open orders, and submits new trades."""
 
@@ -200,6 +210,8 @@ class StrategyWorker:
         self._poll_interval = poll_interval
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        self._consecutive_failures = 0
+        self._failure_alerted = False
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -226,12 +238,68 @@ class StrategyWorker:
                 raise
             except Exception as exc:
                 _log.error("strategy.worker.tick_error", error=str(exc))
+                await self._record_tick_failure(exc)
             else:
+                await self._record_tick_success()
                 # Out-of-band liveness ping. Only fires after a successful
                 # tick body, so a hang or tick error translates directly to
                 # a missed ping at the heartbeat target.
                 await ping_heartbeat()
             await self._wait_or_stop(self._poll_interval)
+
+    async def _record_tick_failure(self, exc: Exception) -> None:
+        """Count a failed tick and alert once the run gets long enough.
+
+        Alerting is edge-triggered: one critical notification per outage,
+        not one per tick, so a multi-day breakage does not flood Telegram
+        with hundreds of identical messages. The flag resets on the next
+        success, so a later outage alerts again.
+        """
+        self._consecutive_failures += 1
+        if self._consecutive_failures < TICK_FAILURE_ALERT_THRESHOLD:
+            return
+        if self._failure_alerted:
+            return
+        self._failure_alerted = True
+        # Best-effort: if the DB is the thing that is broken, the enqueue
+        # will fail too. Swallow it so the tick loop keeps running and
+        # keeps retrying rather than dying inside its own alarm.
+        try:
+            await enqueue(
+                f"Strategy tick has failed {self._consecutive_failures} times in a row. "
+                f"No trades are being placed. Latest error: {exc}",
+                "critical",
+                channel="telegram",
+            )
+        except Exception as notify_exc:
+            _log.warning(
+                "strategy.worker.failure_alert_failed",
+                error=str(notify_exc),
+            )
+
+    async def _record_tick_success(self) -> None:
+        """Clear the failure run, announcing recovery if we had alerted."""
+        if self._consecutive_failures == 0:
+            return
+        failures = self._consecutive_failures
+        alerted = self._failure_alerted
+        self._consecutive_failures = 0
+        self._failure_alerted = False
+        _log.info("strategy.worker.tick_recovered", after_failures=failures)
+        if not alerted:
+            return
+        try:
+            await enqueue(
+                f"Strategy tick recovered after {failures} consecutive failures. "
+                "Trading has resumed.",
+                "alert",
+                channel="telegram",
+            )
+        except Exception as notify_exc:
+            _log.warning(
+                "strategy.worker.recovery_alert_failed",
+                error=str(notify_exc),
+            )
 
     async def _wait_or_stop(self, seconds: float) -> None:
         try:
