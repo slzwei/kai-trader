@@ -22,6 +22,11 @@ services:
         value: Asia/Singapore
       - key: ALPACA_PAPER
         value: "true"
+      # Phase A1: AI decision layer governs new CSP entries. Flip to
+      # "off" to restore pure deterministic selection; every AI failure
+      # already fails closed for new entries either way.
+      - key: AI_DECISION_MODE
+        value: "filter"
       # Secrets: set in the Render dashboard, never committed.
       - key: TELEGRAM_BOT_TOKEN
         sync: false
