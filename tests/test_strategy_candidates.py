@@ -39,11 +39,18 @@ def _legacy_caps(monkeypatch: pytest.MonkeyPatch) -> None:
     testing the cap MECHANICS without breaking on every calibration
     change.
     """
-    monkeypatch.setattr(candidates_module, "TOTAL_DEPLOYMENT_CAP_PCT", Decimal("0.70"))
-    monkeypatch.setattr(candidates_module, "PER_TICK_DEPLOYMENT_CAP_PCT", Decimal("0.10"))
-    monkeypatch.setattr(candidates_module, "PER_DAY_NEW_DEPLOYMENT_PCT", Decimal("0.30"))
-    monkeypatch.setattr(candidates_module, "COOLDOWN_TICKS", 6)
-    monkeypatch.setattr(candidates_module, "COOLDOWN_MINUTES", 30)
+    # The cap math lives in kai_trader.risk.gate since Phase R1; the
+    # candidates module re-exports the names (its warning lines format
+    # with its own binding), so patch both modules to keep the mechanic
+    # tests and their rendered-warning assertions consistent.
+    from kai_trader.risk import gate as gate_module
+
+    for module in (candidates_module, gate_module):
+        monkeypatch.setattr(module, "TOTAL_DEPLOYMENT_CAP_PCT", Decimal("0.70"))
+        monkeypatch.setattr(module, "PER_TICK_DEPLOYMENT_CAP_PCT", Decimal("0.10"))
+        monkeypatch.setattr(module, "PER_DAY_NEW_DEPLOYMENT_PCT", Decimal("0.30"))
+        monkeypatch.setattr(module, "COOLDOWN_TICKS", 6)
+        monkeypatch.setattr(module, "COOLDOWN_MINUTES", 30)
 
 
 def _sleeve(
@@ -246,7 +253,7 @@ async def test_build_intents_proceeds_in_risk_off_phase7() -> None:
     chain_fetcher = AsyncMock(return_value=[
         _put(strike=50, delta=-0.30, expiration=expiry),
     ])
-    intents = await build_intents(
+    await build_intents(
         regime=_regime("risk_off"),
         sleeves=[_sleeve("index_core")],
         account=_account(),

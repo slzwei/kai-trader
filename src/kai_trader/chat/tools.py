@@ -40,7 +40,7 @@ from kai_trader.db.readonly import (
 from kai_trader.db.sleeve_config import get_all_sleeves
 from kai_trader.db.system_flags import get_all_flags
 from kai_trader.logging import get_logger
-from kai_trader.strategy.candidates import TOTAL_DEPLOYMENT_CAP_PCT
+from kai_trader.risk.gate import TOTAL_DEPLOYMENT_CAP_PCT
 
 _log = get_logger(__name__)
 

@@ -139,11 +139,29 @@ def _filled_status() -> OrderStatusSnapshot:
     )
 
 
+class FakeTickLockConn:
+    """Stub advisory-lock connection: grants the lock, accepts unlock."""
+
+    async def fetchval(self, _query: str, *_args: Any) -> bool:
+        return True
+
+
+class FakeTickLockPool:
+    """Stub asyncpg pool for the tick advisory lock."""
+
+    async def acquire(self) -> FakeTickLockConn:
+        return FakeTickLockConn()
+
+    async def release(self, _conn: FakeTickLockConn) -> None:
+        return None
+
+
 @pytest.fixture(autouse=True)
 def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
     """Stub every external coro the worker reaches for. Defaults: empty world."""
     from kai_trader.strategy.drawdown import DrawdownCheck
 
+    get_pool = AsyncMock(return_value=FakeTickLockPool())
     enqueue = AsyncMock(return_value="row-uuid")
     get_account = AsyncMock(return_value=_account())
     get_chain = AsyncMock(return_value=[])
@@ -213,6 +231,7 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     # focused on other paths are unaffected.
     mark_stale_unsubmitted = AsyncMock(return_value=0)
 
+    monkeypatch.setattr(worker_module, "get_pool", get_pool)
     monkeypatch.setattr(worker_module, "enqueue", enqueue)
     monkeypatch.setattr(worker_module, "get_account", get_account)
     monkeypatch.setattr(worker_module, "get_chain", get_chain)
@@ -1668,3 +1687,248 @@ async def test_tick_builds_intent_when_no_working_orders(
     await worker_module.StrategyWorker().tick()
 
     _patch_dependencies["submit_short_put"].assert_awaited()
+
+
+# ------------- Phase R1: tick advisory lock (H1) -------------
+
+
+class ContestedLockState:
+    """Shared in-memory advisory-lock model for concurrency tests."""
+
+    def __init__(self) -> None:
+        self.held = False
+        self.grants = 0
+        self.denials = 0
+        self.unlocks = 0
+
+
+class ContestedLockConn:
+    def __init__(self, state: ContestedLockState) -> None:
+        self._state = state
+
+    async def fetchval(self, query: str, *_args: Any) -> bool:
+        if "pg_try_advisory_lock" in query:
+            if self._state.held:
+                self._state.denials += 1
+                return False
+            self._state.held = True
+            self._state.grants += 1
+            return True
+        if "pg_advisory_unlock" in query:
+            self._state.held = False
+            self._state.unlocks += 1
+            return True
+        return True
+
+
+class ContestedLockPool:
+    def __init__(self, state: ContestedLockState) -> None:
+        self._state = state
+
+    async def acquire(self) -> ContestedLockConn:
+        return ContestedLockConn(self._state)
+
+    async def release(self, _conn: ContestedLockConn) -> None:
+        return None
+
+
+async def test_tick_skips_when_advisory_lock_held(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """A contended tick skips outright: no evaluation, no submission."""
+    state = ContestedLockState()
+    state.held = True  # someone else is mid-tick
+    import unittest.mock as mock
+
+    monkeypatch.setattr(
+        worker_module, "get_pool",
+        mock.AsyncMock(return_value=ContestedLockPool(state)),
+    )
+    worker = worker_module.StrategyWorker()
+
+    summary = await worker.tick()
+
+    assert "Tick skipped" in summary
+    assert "advisory lock" in summary
+    assert worker._last_tick_skipped_for_lock is True
+    _patch_dependencies["record_intent"].assert_not_awaited()
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    _patch_dependencies["enqueue"].assert_not_awaited()
+    # The denied tick must not release the other tick's lock.
+    assert state.unlocks == 0
+    assert state.held is True
+
+
+async def test_tick_releases_lock_when_body_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """The advisory lock frees on exception; the next tick can run."""
+    state = ContestedLockState()
+    import unittest.mock as mock
+
+    monkeypatch.setattr(
+        worker_module, "get_pool",
+        mock.AsyncMock(return_value=ContestedLockPool(state)),
+    )
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await worker_module.StrategyWorker().tick()
+
+    assert state.grants == 1
+    assert state.unlocks == 1
+    assert state.held is False
+
+    # A follow-up tick acquires the freed lock and completes normally.
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=False)),
+    )
+    summary = await worker_module.StrategyWorker().tick()
+    assert "Tick skipped" not in summary
+    assert state.grants == 2
+    assert state.held is False
+
+
+async def test_concurrent_ticks_exactly_one_submits(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Two overlapping ticks (scheduled + /trade_now shape): one runs, one skips."""
+    import asyncio
+
+    state = ContestedLockState()
+    import unittest.mock as mock
+
+    monkeypatch.setattr(
+        worker_module, "get_pool",
+        mock.AsyncMock(return_value=ContestedLockPool(state)),
+    )
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
+    _patch_dependencies["get_chain"].return_value = [_put_contract()]
+    _patch_dependencies["submit_short_put"].return_value = SubmitResult(
+        submitted=True, alpaca_order_id="alpaca-1", order_status="accepted",
+        reason=None, flags={"trading_enabled": True, "kill_switch": False},
+    )
+
+    # Force the first tick to suspend mid-body while holding the lock so
+    # the second tick genuinely overlaps instead of running after it.
+    async def slow_account() -> AccountSnapshot:
+        await asyncio.sleep(0.05)
+        return _account()
+
+    _patch_dependencies["get_account"].side_effect = slow_account
+
+    scheduled = worker_module.StrategyWorker()
+    manual = worker_module.StrategyWorker()  # /trade_now builds its own worker
+    summaries = await asyncio.gather(scheduled.tick(), manual.tick())
+
+    skips = [s for s in summaries if "Tick skipped" in s]
+    runs = [s for s in summaries if "Tick skipped" not in s]
+    assert len(skips) == 1
+    assert len(runs) == 1
+    assert "SPY P50" in runs[0]
+    assert state.grants == 1
+    assert state.denials == 1
+    assert state.held is False
+    # Exactly one submission reached the broker across both ticks.
+    _patch_dependencies["submit_short_put"].assert_awaited_once()
+    _patch_dependencies["record_intent"].assert_awaited_once()
+
+
+# ------------- Phase R1: decision lineage on the orders row -------------
+
+
+async def test_submitted_entry_persists_reason_and_scores(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Every new entry's payload carries the lineage fields."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
+    _patch_dependencies["get_chain"].return_value = [_put_contract()]
+    _patch_dependencies["submit_short_put"].return_value = SubmitResult(
+        submitted=True, alpaca_order_id="alpaca-1", order_status="accepted",
+        reason=None, flags={"trading_enabled": True, "kill_switch": False},
+    )
+
+    await worker_module.StrategyWorker().tick()
+
+    payload = _patch_dependencies["record_intent"].await_args.kwargs["intent_payload"]
+    assert "ranked 1/1" in payload["reason"]
+    assert "target -0.30" in payload["reason"]
+    scores = payload["scores"]
+    for key in (
+        "composite", "annualised_yield", "spread_quality", "spread_pct",
+        "dte", "regime", "iv", "bid", "ask", "mid",
+    ):
+        assert key in scores, f"missing lineage score {key!r}"
+        assert isinstance(scores[key], str)
+    assert scores["regime"] == "risk_on"
+    assert scores["bid"] == "1.10"
+    assert scores["mid"] == "1.15"
+    assert scores["dte"] == "8"
+    # Providers ran with safe defaults in this fixture, so their
+    # outcomes are part of the lineage too.
+    assert scores["earnings"] == "outside_window"
+    assert scores["trend"] == "above"
+
+
+# ------------- Phase R1: submission path is gate-only -------------
+
+
+def test_submit_intent_signature_requires_approved_intent() -> None:
+    """mypy-level contract: the parameter type is ApprovedIntent."""
+    from typing import get_type_hints
+
+    from kai_trader.risk.gate import ApprovedIntent
+
+    hints = get_type_hints(worker_module.StrategyWorker._submit_intent)
+    assert hints["approved"] is ApprovedIntent
+
+
+async def test_submit_intent_rejects_raw_trade_intent(
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Runtime guard: a raw TradeIntent is refused before any DB or broker call."""
+    from kai_trader.strategy.candidates import TradeIntent
+
+    raw = TradeIntent(
+        sleeve="index_core",
+        symbol="SPY",
+        option_symbol="SPY260904P00050000",
+        strike=Decimal("50"),
+        expiration=date(2026, 9, 4),
+        target_delta=Decimal("-0.30"),
+        actual_delta=Decimal("-0.30"),
+        bid=Decimal("1.10"),
+        ask=Decimal("1.20"),
+        mid=Decimal("1.15"),
+        qty=1,
+        collateral=Decimal("5000"),
+        expected_premium=Decimal("115"),
+        yield_pct=Decimal("2.3"),
+    )
+    worker = worker_module.StrategyWorker()
+    with pytest.raises(TypeError, match="apply_gate"):
+        await worker._submit_intent(raw, {})  # type: ignore[arg-type]
+    _patch_dependencies["record_intent"].assert_not_awaited()
+    _patch_dependencies["submit_short_put"].assert_not_awaited()

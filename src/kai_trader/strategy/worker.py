@@ -44,6 +44,7 @@ from kai_trader.broker.alpaca import (
 )
 from kai_trader.broker.options_data import get_chain, parse_occ_symbol
 from kai_trader.config import get_settings
+from kai_trader.db.client import get_pool
 from kai_trader.db.orders import (
     OrderRow,
     OrderStatus,
@@ -65,13 +66,13 @@ from kai_trader.db.system_flags import get_all_flags
 from kai_trader.logging import get_logger
 from kai_trader.notifications.producer import enqueue
 from kai_trader.observability.heartbeat import ping_heartbeat
-from kai_trader.strategy.assignment import detect_assignments, record_assignment
-from kai_trader.strategy.candidates import (
+from kai_trader.risk.gate import (
     COOLDOWN_MINUTES,
     POST_PROFIT_TAKE_COOLDOWN_MINUTES,
-    TradeIntent,
-    build_intents_with_diagnostics,
+    ApprovedIntent,
 )
+from kai_trader.strategy.assignment import detect_assignments, record_assignment
+from kai_trader.strategy.candidates import build_approved_intents_with_diagnostics
 from kai_trader.strategy.clock import get_clock_snapshot
 from kai_trader.strategy.covered_calls import (
     CallBuildDiagnostics,
@@ -135,6 +136,16 @@ ROLL_CLOSE_FILL_POLL_SECONDS = 3.0
 # id-less and non-terminal after this long is a zombie that
 # reconciliation can never resolve (it only polls rows with an id).
 STALE_UNSUBMITTED_MAX_AGE = timedelta(hours=1)
+
+# H1: strategy-tick mutex. Two code paths can otherwise run a tick
+# concurrently: the scheduled worker vs /trade_now (which constructs a
+# fresh StrategyWorker), and the old vs new container during a Render
+# deploy crossover. Overlapping ticks read the same DB snapshot and can
+# both submit the same top-ranked entries before either's orders row is
+# visible to the other. A Postgres advisory lock spans processes and is
+# tied to the holding connection, so a crash mid-tick releases it
+# automatically. The key is the ascii bytes of "KAI_TICK" as a bigint.
+TICK_ADVISORY_LOCK_KEY = int.from_bytes(b"KAI_TICK", "big", signed=True)
 
 
 def _format_error_text(result: SubmitResult) -> str | None:
@@ -212,6 +223,7 @@ class StrategyWorker:
         self._stopping = asyncio.Event()
         self._consecutive_failures = 0
         self._failure_alerted = False
+        self._last_tick_skipped_for_lock = False
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -243,8 +255,12 @@ class StrategyWorker:
                 await self._record_tick_success()
                 # Out-of-band liveness ping. Only fires after a successful
                 # tick body, so a hang or tick error translates directly to
-                # a missed ping at the heartbeat target.
-                await ping_heartbeat()
+                # a missed ping at the heartbeat target. A lock-contended
+                # skip does not ping either: a wedged lock holder must
+                # surface as missed heartbeats, not be masked by its
+                # skipping twin.
+                if not self._last_tick_skipped_for_lock:
+                    await ping_heartbeat()
             await self._wait_or_stop(self._poll_interval)
 
     async def _record_tick_failure(self, exc: Exception) -> None:
@@ -308,7 +324,50 @@ class StrategyWorker:
             pass
 
     async def tick(self) -> str:
-        """Run one strategy tick. Returns the human-readable summary."""
+        """Run one strategy tick. Returns the human-readable summary.
+
+        Serialised across processes by a Postgres advisory lock (H1):
+        the scheduled loop, /trade_now, and a deploy-crossover twin can
+        never run tick bodies concurrently. A contended tick is skipped
+        outright rather than queued, so a second tick cannot pile onto
+        the first's fills; the skip is visible in the returned summary
+        and does not ping the liveness heartbeat. The lock is released
+        in a ``finally`` so a tick that raises still frees it, and a
+        process crash frees it server-side when the connection dies.
+        """
+        pool = await get_pool()
+        conn = await pool.acquire()
+        try:
+            acquired = await conn.fetchval(
+                "select pg_try_advisory_lock($1)", TICK_ADVISORY_LOCK_KEY
+            )
+            if not acquired:
+                self._last_tick_skipped_for_lock = True
+                _log.info("strategy.tick.skipped_lock_held")
+                return (
+                    "Tick skipped: another strategy tick is already running "
+                    "(advisory lock held). Nothing was evaluated or submitted."
+                )
+            self._last_tick_skipped_for_lock = False
+            try:
+                return await self._tick_locked()
+            finally:
+                try:
+                    await conn.fetchval(
+                        "select pg_advisory_unlock($1)", TICK_ADVISORY_LOCK_KEY
+                    )
+                except Exception as exc:
+                    # A broken connection releases the lock server-side
+                    # when the pool discards it; never let the unlock
+                    # error mask the tick outcome.
+                    _log.warning(
+                        "strategy.tick.advisory_unlock_failed", error=str(exc)
+                    )
+        finally:
+            await pool.release(conn)
+
+    async def _tick_locked(self) -> str:
+        """Tick body. The caller holds the tick advisory lock."""
         # Reconciliation runs even when the market is closed: an order
         # filled overnight should be reflected on Monday morning.
         # ``working_orders`` are rows still live at the broker after the
@@ -468,13 +527,13 @@ class StrategyWorker:
         )
 
         if shorts_fetch_failed:
-            intents: list[TradeIntent] = []
+            approved: list[ApprovedIntent] = []
             diagnostic_warnings = [
                 "Existing-positions fetch failed; new entries skipped "
                 "this tick (fail-closed)."
             ]
         else:
-            intents, diagnostics = await build_intents_with_diagnostics(
+            approved, diagnostics = await build_approved_intents_with_diagnostics(
                 regime=regime,
                 sleeves=sleeves,
                 account=account,
@@ -498,9 +557,9 @@ class StrategyWorker:
         submitted: list[str] = []
         skipped: list[str] = []
         failed: list[str] = []
-        for intent in intents:
-            outcome = await self._submit_intent(intent, flags)
-            label = f"{intent.symbol} P{intent.strike}"
+        for item in approved:
+            outcome = await self._submit_intent(item, flags)
+            label = f"{item.intent.symbol} P{item.intent.strike}"
             if outcome == "submitted":
                 submitted.append(label)
             elif outcome == "failed":
@@ -811,10 +870,25 @@ class StrategyWorker:
 
     async def _submit_intent(
         self,
-        intent: TradeIntent,
+        approved: ApprovedIntent,
         flags: dict[str, bool],
     ) -> str:
-        """Record the intent then submit. Returns 'submitted', 'skipped', 'failed'."""
+        """Record then submit one gate-approved entry.
+
+        Returns 'submitted', 'skipped', 'failed'. Accepts ONLY a
+        gate-issued ``ApprovedIntent``: under ``mypy --strict`` a raw
+        ``TradeIntent`` does not type-check here, and the runtime guard
+        below refuses one outright, so no producer (present or future
+        AI layer) can reach the broker without passing
+        ``kai_trader.risk.gate.apply_gate``. Flag gating still happens
+        last, inside ``submit_short_put``.
+        """
+        if not isinstance(approved, ApprovedIntent):
+            raise TypeError(
+                "submission path accepts only gate-issued ApprovedIntent; "
+                "pass proposals through kai_trader.risk.gate.apply_gate"
+            )
+        intent = approved.intent
         # Suppress retry storms: if this exact contract already has a
         # failed open_short_put row from earlier today, skip without
         # writing a new row or hitting Alpaca. The 5-minute tick was
@@ -855,12 +929,18 @@ class StrategyWorker:
             "kill_switch": flags.get("kill_switch", False),
             "limit_price": str(limit_price),
         }
+        # Decision lineage (Phase R1): the reason sentence and the raw
+        # signal values the screener saw ride along in the same JSONB
+        # payload, so "why did the system propose this trade" is
+        # answerable from the orders row alone.
         intent_payload = {
             "strike": str(intent.strike),
             "expiration": intent.expiration.isoformat(),
             "qty": intent.qty,
             "target_delta": str(intent.target_delta),
             "actual_delta": str(intent.actual_delta),
+            "reason": intent.reason,
+            "scores": dict(intent.scores),
         }
         row_id = await record_intent(
             sleeve=intent.sleeve,

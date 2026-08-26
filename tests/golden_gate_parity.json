@@ -1,0 +1,407 @@
+{
+  "a": {
+    "diagnostics": {
+      "contract_ceiling": 10,
+      "cooldown_symbols": [
+        "DDD"
+      ],
+      "deployment_limited_by_buying_power": true,
+      "intents_dropped_for_per_day_cap": 0,
+      "intents_dropped_for_per_tick_cap": 1,
+      "options_buying_power_usd": "40000",
+      "per_tick_cap_remaining_usd": "6000.00",
+      "sleeves": [
+        {
+          "candidates_cap_rejected": 1,
+          "chain_errors": 0,
+          "chains_fetched": 6,
+          "contract_ceiling_symbols": [
+            "CCC"
+          ],
+          "earnings_blackout_symbols": [],
+          "earnings_unknown_symbols": [],
+          "intents_built": 2,
+          "iv_rv_floor_symbols": [],
+          "min_yield_symbols": [
+            "FFF"
+          ],
+          "per_name_dollar_cap_symbols": [
+            "BBB"
+          ],
+          "per_symbol_cap_dollars": "12000.00",
+          "puts_in_dte_band": 6,
+          "puts_seen": 6,
+          "puts_with_delta": 6,
+          "puts_with_quotes": 6,
+          "sleeve": "index_core",
+          "symbols_skipped_for_contract_ceiling": 1,
+          "symbols_skipped_for_earnings": 0,
+          "symbols_skipped_for_earnings_unknown": 0,
+          "symbols_skipped_for_iv_rv_floor": 0,
+          "symbols_skipped_for_min_yield": 1,
+          "symbols_skipped_for_per_name_dollar_cap": 1,
+          "symbols_skipped_for_trend": 0,
+          "symbols_skipped_for_trend_unknown": 0,
+          "trend_skip_symbols": [],
+          "trend_unknown_symbols": []
+        },
+        {
+          "candidates_cap_rejected": 1,
+          "chain_errors": 0,
+          "chains_fetched": 2,
+          "contract_ceiling_symbols": [],
+          "earnings_blackout_symbols": [],
+          "earnings_unknown_symbols": [],
+          "intents_built": 0,
+          "iv_rv_floor_symbols": [],
+          "min_yield_symbols": [],
+          "per_name_dollar_cap_symbols": [
+            "HHH"
+          ],
+          "per_symbol_cap_dollars": "12000.00",
+          "puts_in_dte_band": 2,
+          "puts_seen": 2,
+          "puts_with_delta": 2,
+          "puts_with_quotes": 2,
+          "sleeve": "stable_largecap",
+          "symbols_skipped_for_contract_ceiling": 0,
+          "symbols_skipped_for_earnings": 0,
+          "symbols_skipped_for_earnings_unknown": 0,
+          "symbols_skipped_for_iv_rv_floor": 0,
+          "symbols_skipped_for_min_yield": 0,
+          "symbols_skipped_for_per_name_dollar_cap": 1,
+          "symbols_skipped_for_trend": 0,
+          "symbols_skipped_for_trend_unknown": 0,
+          "trend_skip_symbols": [],
+          "trend_unknown_symbols": []
+        },
+        {
+          "candidates_cap_rejected": 0,
+          "chain_errors": 0,
+          "chains_fetched": 0,
+          "contract_ceiling_symbols": [],
+          "earnings_blackout_symbols": [],
+          "earnings_unknown_symbols": [],
+          "intents_built": 0,
+          "iv_rv_floor_symbols": [],
+          "min_yield_symbols": [],
+          "per_name_dollar_cap_symbols": [],
+          "per_symbol_cap_dollars": "12000.00",
+          "puts_in_dte_band": 0,
+          "puts_seen": 0,
+          "puts_with_delta": 0,
+          "puts_with_quotes": 0,
+          "sleeve": "opportunistic",
+          "symbols_skipped_for_contract_ceiling": 0,
+          "symbols_skipped_for_earnings": 0,
+          "symbols_skipped_for_earnings_unknown": 0,
+          "symbols_skipped_for_iv_rv_floor": 0,
+          "symbols_skipped_for_min_yield": 0,
+          "symbols_skipped_for_per_name_dollar_cap": 0,
+          "symbols_skipped_for_trend": 0,
+          "symbols_skipped_for_trend_unknown": 0,
+          "trend_skip_symbols": [],
+          "trend_unknown_symbols": []
+        }
+      ],
+      "symbols_skipped_for_cooldown": 1,
+      "today_deployment_remaining_usd": "6000.00",
+      "today_deployment_used_pct": "0.55"
+    },
+    "intents": [
+      {
+        "actual_delta": "-0.30",
+        "ask": "1.90",
+        "bid": "1.80",
+        "collateral": "9000",
+        "expected_premium": "185.00",
+        "expiration": "2026-09-03",
+        "mid": "1.85",
+        "option_symbol": "III260903P00090000",
+        "qty": 1,
+        "sleeve": "index_core",
+        "strike": "90",
+        "symbol": "III",
+        "target_delta": "-0.30",
+        "yield_pct": "2.055555555555555555555555556"
+      },
+      {
+        "actual_delta": "-0.30",
+        "ask": "1.20",
+        "bid": "1.10",
+        "collateral": "10000",
+        "expected_premium": "230.00",
+        "expiration": "2026-09-03",
+        "mid": "1.15",
+        "option_symbol": "AAA260903P00050000",
+        "qty": 2,
+        "sleeve": "index_core",
+        "strike": "50",
+        "symbol": "AAA",
+        "target_delta": "-0.30",
+        "yield_pct": "2.300"
+      }
+    ],
+    "warnings": [
+      "1 symbol(s) on cool-down: DDD",
+      "1 intent(s) dropped by per-tick deployment cap (25% of equity).",
+      "Deployment capped by broker options buying power ($40000 available), below the equity-based cap. New entries paused until capital frees up."
+    ]
+  },
+  "b": {
+    "diagnostics": {
+      "contract_ceiling": 10,
+      "cooldown_symbols": [],
+      "deployment_limited_by_buying_power": false,
+      "intents_dropped_for_per_day_cap": 0,
+      "intents_dropped_for_per_tick_cap": 1,
+      "options_buying_power_usd": "0",
+      "per_tick_cap_remaining_usd": "100.00",
+      "sleeves": [
+        {
+          "candidates_cap_rejected": 0,
+          "chain_errors": 0,
+          "chains_fetched": 4,
+          "contract_ceiling_symbols": [],
+          "earnings_blackout_symbols": [],
+          "earnings_unknown_symbols": [],
+          "intents_built": 3,
+          "iv_rv_floor_symbols": [],
+          "min_yield_symbols": [],
+          "per_name_dollar_cap_symbols": [],
+          "per_symbol_cap_dollars": "12000.00",
+          "puts_in_dte_band": 4,
+          "puts_seen": 4,
+          "puts_with_delta": 4,
+          "puts_with_quotes": 4,
+          "sleeve": "index_core",
+          "symbols_skipped_for_contract_ceiling": 0,
+          "symbols_skipped_for_earnings": 0,
+          "symbols_skipped_for_earnings_unknown": 0,
+          "symbols_skipped_for_iv_rv_floor": 0,
+          "symbols_skipped_for_min_yield": 0,
+          "symbols_skipped_for_per_name_dollar_cap": 0,
+          "symbols_skipped_for_trend": 0,
+          "symbols_skipped_for_trend_unknown": 0,
+          "trend_skip_symbols": [],
+          "trend_unknown_symbols": []
+        }
+      ],
+      "symbols_skipped_for_cooldown": 0,
+      "today_deployment_remaining_usd": "55100.00",
+      "today_deployment_used_pct": "0"
+    },
+    "intents": [
+      {
+        "actual_delta": "-0.30",
+        "ask": "3.65",
+        "bid": "3.55",
+        "collateral": "12000",
+        "expected_premium": "360.00",
+        "expiration": "2026-09-03",
+        "mid": "3.60",
+        "option_symbol": "PPP260903P00120000",
+        "qty": 1,
+        "sleeve": "index_core",
+        "strike": "120",
+        "symbol": "PPP",
+        "target_delta": "-0.30",
+        "yield_pct": "3.00"
+      },
+      {
+        "actual_delta": "-0.30",
+        "ask": "3.10",
+        "bid": "3.00",
+        "collateral": "12000",
+        "expected_premium": "305.00",
+        "expiration": "2026-09-03",
+        "mid": "3.05",
+        "option_symbol": "QQQ260903P00120000",
+        "qty": 1,
+        "sleeve": "index_core",
+        "strike": "120",
+        "symbol": "QQQ",
+        "target_delta": "-0.30",
+        "yield_pct": "2.541666666666666666666666667"
+      },
+      {
+        "actual_delta": "-0.30",
+        "ask": "0.17",
+        "bid": "0.15",
+        "collateral": "900",
+        "expected_premium": "16.00",
+        "expiration": "2026-09-03",
+        "mid": "0.16",
+        "option_symbol": "RRR260903P00009000",
+        "qty": 1,
+        "sleeve": "index_core",
+        "strike": "9",
+        "symbol": "RRR",
+        "target_delta": "-0.30",
+        "yield_pct": "1.777777777777777777777777778"
+      }
+    ],
+    "warnings": [
+      "1 intent(s) dropped by per-tick deployment cap (25% of equity)."
+    ]
+  },
+  "c": {
+    "diagnostics": {
+      "contract_ceiling": 10,
+      "cooldown_symbols": [],
+      "deployment_limited_by_buying_power": false,
+      "intents_dropped_for_per_day_cap": 1,
+      "intents_dropped_for_per_tick_cap": 0,
+      "options_buying_power_usd": "0",
+      "per_tick_cap_remaining_usd": "16000.00",
+      "sleeves": [
+        {
+          "candidates_cap_rejected": 0,
+          "chain_errors": 0,
+          "chains_fetched": 2,
+          "contract_ceiling_symbols": [],
+          "earnings_blackout_symbols": [],
+          "earnings_unknown_symbols": [],
+          "intents_built": 1,
+          "iv_rv_floor_symbols": [],
+          "min_yield_symbols": [],
+          "per_name_dollar_cap_symbols": [],
+          "per_symbol_cap_dollars": "12000.00",
+          "puts_in_dte_band": 2,
+          "puts_seen": 2,
+          "puts_with_delta": 2,
+          "puts_with_quotes": 2,
+          "sleeve": "index_core",
+          "symbols_skipped_for_contract_ceiling": 0,
+          "symbols_skipped_for_earnings": 0,
+          "symbols_skipped_for_earnings_unknown": 0,
+          "symbols_skipped_for_iv_rv_floor": 0,
+          "symbols_skipped_for_min_yield": 0,
+          "symbols_skipped_for_per_name_dollar_cap": 0,
+          "symbols_skipped_for_trend": 0,
+          "symbols_skipped_for_trend_unknown": 0,
+          "trend_skip_symbols": [],
+          "trend_unknown_symbols": []
+        }
+      ],
+      "symbols_skipped_for_cooldown": 0,
+      "today_deployment_remaining_usd": "1000.00",
+      "today_deployment_used_pct": "0.7"
+    },
+    "intents": [
+      {
+        "actual_delta": "-0.30",
+        "ask": "1.05",
+        "bid": "0.95",
+        "collateral": "9000",
+        "expected_premium": "300.00",
+        "expiration": "2026-09-03",
+        "mid": "1.00",
+        "option_symbol": "TTT260903P00030000",
+        "qty": 3,
+        "sleeve": "index_core",
+        "strike": "30",
+        "symbol": "TTT",
+        "target_delta": "-0.30",
+        "yield_pct": "3.333333333333333333333333333"
+      }
+    ],
+    "warnings": [
+      "1 intent(s) dropped by per-day deployment cap (70% of equity used today, $1000 remaining)."
+    ]
+  },
+  "d": {
+    "diagnostics": {
+      "contract_ceiling": 10,
+      "cooldown_symbols": [],
+      "deployment_limited_by_buying_power": false,
+      "intents_dropped_for_per_day_cap": 0,
+      "intents_dropped_for_per_tick_cap": 0,
+      "options_buying_power_usd": "0",
+      "per_tick_cap_remaining_usd": "2500.00",
+      "sleeves": [
+        {
+          "candidates_cap_rejected": 0,
+          "chain_errors": 1,
+          "chains_fetched": 5,
+          "contract_ceiling_symbols": [],
+          "earnings_blackout_symbols": [
+            "BBB",
+            "HHH"
+          ],
+          "earnings_unknown_symbols": [
+            "HHH"
+          ],
+          "intents_built": 2,
+          "iv_rv_floor_symbols": [
+            "FFF",
+            "GGG"
+          ],
+          "min_yield_symbols": [],
+          "per_name_dollar_cap_symbols": [],
+          "per_symbol_cap_dollars": "12000.00",
+          "puts_in_dte_band": 6,
+          "puts_seen": 6,
+          "puts_with_delta": 6,
+          "puts_with_quotes": 6,
+          "sleeve": "index_core",
+          "symbols_skipped_for_contract_ceiling": 0,
+          "symbols_skipped_for_earnings": 2,
+          "symbols_skipped_for_earnings_unknown": 1,
+          "symbols_skipped_for_iv_rv_floor": 2,
+          "symbols_skipped_for_min_yield": 0,
+          "symbols_skipped_for_per_name_dollar_cap": 0,
+          "symbols_skipped_for_trend": 2,
+          "symbols_skipped_for_trend_unknown": 1,
+          "trend_skip_symbols": [
+            "DDD",
+            "EEE"
+          ],
+          "trend_unknown_symbols": [
+            "DDD"
+          ]
+        }
+      ],
+      "symbols_skipped_for_cooldown": 0,
+      "today_deployment_remaining_usd": "57500.00",
+      "today_deployment_used_pct": "0"
+    },
+    "intents": [
+      {
+        "actual_delta": "-0.20",
+        "ask": "0.85",
+        "bid": "0.75",
+        "collateral": "10500",
+        "expected_premium": "240.00",
+        "expiration": "2026-09-03",
+        "mid": "0.80",
+        "option_symbol": "III260903P00035000",
+        "qty": 3,
+        "sleeve": "index_core",
+        "strike": "35",
+        "symbol": "III",
+        "target_delta": "-0.20",
+        "yield_pct": "2.285714285714285714285714286"
+      },
+      {
+        "actual_delta": "-0.20",
+        "ask": "0.75",
+        "bid": "0.65",
+        "collateral": "12000",
+        "expected_premium": "280.00",
+        "expiration": "2026-09-03",
+        "mid": "0.70",
+        "option_symbol": "JJJ260903P00030000",
+        "qty": 4,
+        "sleeve": "index_core",
+        "strike": "30",
+        "symbol": "JJJ",
+        "target_delta": "-0.20",
+        "yield_pct": "2.333333333333333333333333333"
+      }
+    ],
+    "warnings": [
+      "2 symbol(s) skipped below 50-DMA trend filter (1 unknown, fail-closed): DDD, EEE"
+    ]
+  }
+}

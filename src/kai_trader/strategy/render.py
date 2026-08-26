@@ -43,7 +43,7 @@ from kai_trader.bot.formatting import (
 )
 from kai_trader.broker.alpaca import PositionSnapshot
 from kai_trader.broker.options_data import parse_occ_symbol
-from kai_trader.strategy.candidates import TOTAL_DEPLOYMENT_CAP_PCT
+from kai_trader.risk.gate import TOTAL_DEPLOYMENT_CAP_PCT
 from kai_trader.strategy.rolls import RollIntent
 
 # When a held roll is the most-actionable thing on the tick, we name

@@ -7,7 +7,6 @@ between assignment_sim, drawdown_sim, broker, and state.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import tempfile
 from datetime import UTC, date, datetime
@@ -16,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from kai_trader.backtest import assignment_sim, runner
+from kai_trader.backtest import assignment_sim
 from kai_trader.backtest.broker import BacktestBroker
 from kai_trader.backtest.costs import DEFAULT_COST_MODEL
 from kai_trader.backtest.data import bars
@@ -115,7 +114,7 @@ class TestPutCycleAssignment:
         # Realized P&L on the put leg: just the +$50 premium kept.
         assert state.realized_pnl_total == Decimal("50.00")
         # End equity: cash $9050 + shares ($800 at $8) = $9850
-        # = $150 below starting ($10 strike - $8 close = $2 × 100 = $200 vs $50 premium = -$150).
+        # = $150 below starting ($10 strike - $8 close = $2 x 100 = $200 vs $50 premium = -$150).
         # The runner._mark_to_market would add ~$800 for the shares.
 
 

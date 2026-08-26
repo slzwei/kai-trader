@@ -196,3 +196,40 @@ async def test_schema_check_passes_post_migrations(
         await assert_schema_up_to_date(pool)  # raises on drift
     finally:
         await close_pool()
+
+
+@pytest.mark.skipif(not _enabled(), reason="KAI_SCHEMA_INTEGRATION_TEST != 1")
+async def test_tick_advisory_lock_mutual_exclusion(
+    _apply_migrations_once: None,
+) -> None:
+    """Real-Postgres semantics the H1 tick mutex relies on.
+
+    Two sessions contest ``pg_try_advisory_lock`` on the worker's key:
+    exactly one wins, the loser is refused without blocking, and the
+    lock frees on explicit unlock (and, implicitly, on disconnect).
+    """
+    from kai_trader.config import get_settings
+    from kai_trader.strategy.worker import TICK_ADVISORY_LOCK_KEY
+
+    dsn = get_settings().database_url
+    first = await asyncpg.connect(dsn=dsn)
+    second = await asyncpg.connect(dsn=dsn)
+    try:
+        assert await first.fetchval(
+            "select pg_try_advisory_lock($1)", TICK_ADVISORY_LOCK_KEY
+        ) is True
+        assert await second.fetchval(
+            "select pg_try_advisory_lock($1)", TICK_ADVISORY_LOCK_KEY
+        ) is False
+        assert await first.fetchval(
+            "select pg_advisory_unlock($1)", TICK_ADVISORY_LOCK_KEY
+        ) is True
+        assert await second.fetchval(
+            "select pg_try_advisory_lock($1)", TICK_ADVISORY_LOCK_KEY
+        ) is True
+        await second.fetchval(
+            "select pg_advisory_unlock($1)", TICK_ADVISORY_LOCK_KEY
+        )
+    finally:
+        await first.close()
+        await second.close()

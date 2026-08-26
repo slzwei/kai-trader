@@ -213,8 +213,34 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, 5c, 5d, **and 5e** shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, 5c, 5d, 5e, **and R1** shipped:
 
+- Phase R1 (2026-08-26) is a behaviour-preserving safety refactor that
+  prepares the repo for a future quant/AI decision layer. The cap
+  matrix (total deployment, options buying power, per-name notional,
+  contract ceiling, per-tick, per-day, cool-down, committed plus
+  in-flight collateral) moved verbatim from `strategy/candidates.py`
+  into the new `kai_trader/risk/gate.py`: a pure
+  `apply_gate(proposals, RiskContext) -> GateResult` that returns
+  `ApprovedIntent` values and machine-readable rejections. The worker's
+  new-entry submission path accepts ONLY gate-issued `ApprovedIntent`
+  (enforced by `mypy --strict` and a runtime guard), so any future
+  producer must pass the gate to reach the broker. `candidates.py` is
+  now screen+score only; `build_intents_with_diagnostics` keeps its
+  exact signature and output as a screen-then-gate composition (the
+  backtest, `/strategy_status`, and existing tests are unchanged; the
+  cap constants are re-exported for back-compat). Each submitted entry
+  now persists decision lineage in `orders.intent_payload`: a `reason`
+  sentence plus `scores` (composite, annualised yield, spread pct, IV,
+  trend, earnings, regime, bid/ask/mid, DTE). `StrategyWorker.tick` is
+  serialised by a non-blocking Postgres advisory lock (key
+  `KAI_TICK`), closing the H1 concurrency window between the scheduled
+  loop, `/trade_now`, and Render deploy crossover; a contended tick
+  skips safely and does not ping the liveness heartbeat. A golden
+  parity test (`tests/test_gate_golden_parity.py` plus
+  `tests/golden_gate_parity.json`, captured against the pre-refactor
+  build) pins that no trading decision, quantity, rejection, or
+  diagnostic changed.
 - Phase 5e fixes a real bug: the cap math in
   `build_intents_with_diagnostics` used `equity * pct` without
   subtracting cash already locked in open short put positions, so

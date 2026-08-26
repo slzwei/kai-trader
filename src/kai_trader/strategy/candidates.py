@@ -1,26 +1,94 @@
-"""Build dry-run trade intents for the strategy worker.
+"""Screen and score cash-secured-put candidates for the strategy worker.
 
-Phase 3.3 only constructs intents, never submits. The intent set drives
-both the periodic dry-run notification and the on-demand /strategy_status
-reply.
+Phase R1 split this module in two. Everything that decides WHAT is
+worth proposing stays here: whitelist walk, cool-down and earnings and
+trend pre-filters, chain fetch, delta-targeted strike selection, the
+premium floors, the IV gates, and the annualised-yield x spread-quality
+ranking. Everything that decides HOW MUCH may be deployed (the cap
+matrix: total, buying power, per-name, contract ceiling, per-tick,
+per-day) moved to :mod:`kai_trader.risk.gate`, where it now binds every
+producer of proposals, not just this one.
 
-Strike selection is intentionally minimal: pick the put whose absolute
-delta is closest to the regime-dependent target. No IV-rank filter, no
-earnings blackout, no spread quality check yet; those land as 3.5
-enhancements once paper data shows whether they matter.
+``build_intents_with_diagnostics`` keeps its historical signature and
+output for existing callers (worker rendering, /strategy_status, the
+backtest, tests): internally it screens, builds ranked ``TradeIntent``
+proposals carrying lineage (``reason`` + ``scores``), passes them
+through :func:`kai_trader.risk.gate.apply_gate`, and reassembles the
+same diagnostics counters the inline implementation produced. The
+strategy worker uses ``build_approved_intents_with_diagnostics`` so its
+submission path only ever holds gate-issued ``ApprovedIntent`` values.
+
+The cap constants are re-exported below for backwards compatibility;
+their source of truth is ``kai_trader.risk.gate``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
-from kai_trader.broker.options_data import OptionContract, parse_occ_symbol
+from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.logging import get_logger
+
+# Backwards-compatible re-exports. The cap math and its constants moved
+# to kai_trader.risk.gate in Phase R1; the aliases below keep every
+# historical import site (worker, chat tools, tick render, tests)
+# working unchanged. New code should import from kai_trader.risk.gate.
+from kai_trader.risk.gate import (
+    COOLDOWN_MINUTES as COOLDOWN_MINUTES,
+)
+from kai_trader.risk.gate import (
+    COOLDOWN_TICKS as COOLDOWN_TICKS,
+)
+from kai_trader.risk.gate import (
+    MAX_CONTRACTS_PER_SYMBOL as MAX_CONTRACTS_PER_SYMBOL,
+)
+from kai_trader.risk.gate import (
+    OPTIONS_BP_SAFETY_FACTOR as OPTIONS_BP_SAFETY_FACTOR,
+)
+from kai_trader.risk.gate import (
+    PER_DAY_NEW_DEPLOYMENT_PCT as PER_DAY_NEW_DEPLOYMENT_PCT,
+)
+from kai_trader.risk.gate import (
+    PER_NAME_NOTIONAL_CAP_PCT as PER_NAME_NOTIONAL_CAP_PCT,
+)
+from kai_trader.risk.gate import (
+    PER_TICK_DEPLOYMENT_CAP_PCT as PER_TICK_DEPLOYMENT_CAP_PCT,
+)
+from kai_trader.risk.gate import (
+    POST_PROFIT_TAKE_COOLDOWN_MINUTES as POST_PROFIT_TAKE_COOLDOWN_MINUTES,
+)
+from kai_trader.risk.gate import (
+    TICK_INTERVAL_MINUTES as TICK_INTERVAL_MINUTES,
+)
+from kai_trader.risk.gate import (
+    TOTAL_DEPLOYMENT_CAP_PCT as TOTAL_DEPLOYMENT_CAP_PCT,
+)
+from kai_trader.risk.gate import (
+    ApprovedIntent,
+    RiskContext,
+    SleeveGateCounters,
+    apply_gate,
+)
+from kai_trader.risk.gate import (
+    _committed_collateral as _committed_collateral,
+)
+from kai_trader.risk.gate import (
+    _existing_contract_counts as _existing_contract_counts,
+)
+from kai_trader.risk.gate import (
+    _max_qty_for as _max_qty_for,
+)
+from kai_trader.risk.gate import (
+    max_contracts_per_symbol as max_contracts_per_symbol,
+)
+from kai_trader.risk.gate import (
+    per_symbol_cap_pct as per_symbol_cap_pct,
+)
 from kai_trader.strategy.earnings import EARNINGS_BLACKOUT_DAYS, EarningsStatus
 from kai_trader.strategy.iv_rv import IV_RV_RATIO_MIN, passes_iv_rv_floor
 from kai_trader.strategy.regime import RegimeSnapshot
@@ -30,114 +98,6 @@ ChainFetcher = Callable[[str, date | None], Awaitable[list[OptionContract]]]
 
 _log = get_logger(__name__)
 
-
-# Variant A safety (2026-05-09): 4.00 → 1.00. Variant A is cash-
-# secured; even if Alpaca's account grants some options margin, the
-# strategy refuses to deploy beyond 1x equity in face collateral.
-# Caps blow-up risk: with $30k equity, max $30k of strikes at risk,
-# matching cash on hand.
-TOTAL_DEPLOYMENT_CAP_PCT = Decimal("1.00")
-
-# Variant A+ (P3): deploy at most this fraction of the broker's reported
-# options buying power. options_buying_power is a point-in-time figure;
-# between the account fetch and the order submit it can drift down (an
-# earlier tick's fill settling, a mark moving), which is what still
-# produced occasional "insufficient options buying power" rejections even
-# after the equity-cap clamp. A 5% cushion absorbs that drift so the
-# builder stops proposing puts the broker will reject a moment later.
-OPTIONS_BP_SAFETY_FACTOR = Decimal("0.95")
-
-# P7 (2026-05-09): MAX_CONTRACTS_PER_SYMBOL tiered by equity. The
-# original flat 10-contract ceiling was sized for $50k-$150k accounts;
-# at $200k+ it forces under-deployment on cheap names (e.g. SOFI $7
-# strike, $700/contract = $7k of the $30k per-name budget at 15%; the
-# 10-contract cap then leaves 60-70% of the per-name dollar budget
-# unused). Tiering lets larger books deploy fully without breaking the
-# small-account safety properties.
-_MAX_CONTRACTS_TIERS: tuple[tuple[Decimal, int], ...] = (
-    (Decimal("150000"), 10),
-    (Decimal("500000"), 25),
-)
-_MAX_CONTRACTS_LARGE_ACCOUNT = 50
-
-
-def max_contracts_per_symbol(equity: Decimal) -> int:
-    """Return the per-symbol contract ceiling for the given equity.
-
-    Below $150k: 10 contracts (preserves W-3 over-allocation safety
-    on small books, where 10 cheap-name contracts already saturate the
-    15% per-name dollar cap).
-
-    $150k-$500k: 25 contracts. Lifts the bottleneck on cheap-name
-    deployment at this scale; the 15% per-name dollar cap still binds
-    independently.
-
-    Above $500k: 50 contracts. Very large books only; the dollar cap
-    is the meaningful constraint and the contract ceiling exists only
-    to prevent fat-finger accidents at scale.
-    """
-    for threshold, ceiling in _MAX_CONTRACTS_TIERS:
-        if equity < threshold:
-            return ceiling
-    return _MAX_CONTRACTS_LARGE_ACCOUNT
-
-
-# Back-compat alias used by older test fixtures and by string
-# formatting in the diagnostic warning lines. The functional path
-# uses ``max_contracts_per_symbol(equity)`` directly. The constant
-# here is the floor (smallest tier) so any literal usage stays
-# conservative.
-MAX_CONTRACTS_PER_SYMBOL = 10
-
-# W-4: deployment velocity guard rails. The over-allocation incident on
-# 2026-05-01 took the book from 0% to 96% of the deployment cap in 20
-# minutes (4 ticks at 5-min cadence) by repeatedly stacking the same two
-# names. Three reinforcing controls:
-#
-#   * PER_TICK_DEPLOYMENT_CAP_PCT: total new collateral committed in any
-#     single tick is capped at this fraction of equity. Blocks
-#     single-tick blow-out. Current value below.
-#   * PER_DAY_NEW_DEPLOYMENT_PCT: cumulative new collateral since UTC
-#     midnight is capped at this fraction of equity. Blocks multi-hour
-#     blow-out across many ticks even when each individual tick is
-#     under the per-tick cap. Current value below.
-#   * COOLDOWN_TICKS: a symbol entered (filled or submitted) in the
-#     last N ticks is excluded from candidate selection. Forces the
-#     strategy to diversify across the pool rather than greedy-stacking
-#     the same top-scored names.
-# Current values are sized for live capital under Variant A safety;
-# the constants below are the source of truth. Read these directly
-# rather than trusting any narrative percentage in surrounding docs.
-# Phase 11: revert Phase 10's overly aggressive caps. Phase 10's
-# 50% per-tick + 1-tick cooldown caused cash-exhaustion broker
-# rejections that crashed monthly return to 0.37%. Phase 8's caps
-# (25% / 80% / 3-tick) were the sweet spot.
-PER_TICK_DEPLOYMENT_CAP_PCT = Decimal("0.25")
-PER_DAY_NEW_DEPLOYMENT_PCT = Decimal("0.80")
-COOLDOWN_TICKS = 3
-TICK_INTERVAL_MINUTES = 5
-COOLDOWN_MINUTES = COOLDOWN_TICKS * TICK_INTERVAL_MINUTES
-
-# Post-profit-take cooldown. After a profit_take_close fills on a
-# symbol, refuse to re-enter that same symbol for this many minutes
-# even if it ranks highly again. The base 30-min cooldown is for
-# rapid-stacking prevention (W-4); this longer one is to prevent
-# churn-after-profit-take, where the just-closed contract still ranks
-# top in the candidate scorer because its delta and yield haven't
-# moved enough yet. Observed 2026-05-06: bot closed F 11.5P x 8 at
-# $0.09 (profit-take), then re-opened the same strike x 2 at $0.09
-# 32 minutes later, just past the base cooldown. The new entry's
-# expected return barely covered fees and risk.
-#
-# Phase 5 retuning (2026-05-09): 240 → 60 minutes. Four-hour cooldown
-# was sized for a 30-name pool and starves the concentrated 8-12
-# name universe.
-# Phase 6 max-aggression: 60 → 0 (disabled). The base W-4 cooldown
-# (15 min via COOLDOWN_TICKS=3) is enough rapid-stacking protection;
-# the additional post-profit-take cooldown was over-restrictive for
-# the income target. With profit-take at 20%, cycles complete in
-# 1-2 days and the strategy needs to redeploy immediately.
-POST_PROFIT_TAKE_COOLDOWN_MINUTES = 0
 
 # P6 (2026-05-09): two-layer per-contract floor.
 #
@@ -151,7 +111,7 @@ POST_PROFIT_TAKE_COOLDOWN_MINUTES = 0
 # floor that was shipped today and audited as wrong-direction for
 # income generation). The income target is 6%/month on collateral.
 # With ~70% deployment and ~5-day cycles, that requires per-day
-# yield of ~0.43%/day on average. We set the floor at 0.10%/day —
+# yield of ~0.43%/day on average. We set the floor at 0.10%/day,
 # loose enough to pass any moderately-yielding trade (SPY-style
 # 0.30-delta 8DTE puts come in around 0.05-0.15%/day), tight enough
 # to reject the genuinely thin trades observed in production
@@ -175,51 +135,6 @@ MIN_BID_PREMIUM = Decimal("0.05")
 # higher delta, quietly drifting entries toward the money on low-vol
 # names. Skip, do not hunt.
 MIN_BID_YIELD_PER_DAY = Decimal("0.0010")
-
-# W-3: hard 15% per-name notional ceiling. The historical per-symbol cap
-# was tiered (60% at small accounts, 15% at large) because at $50k equity
-# a single SPY contract would exceed a 15% cap and the strategy would never
-# write anything. The over-allocation incident on 2026-05-01 showed that
-# 60% of equity in a single low-priced name is also catastrophic: MARA
-# reached 51% of equity, SNAP 40%, in 20 minutes. Live capital cannot
-# tolerate either failure mode. The fix: cap every account at 15%
-# regardless of equity tier and accept that small paper accounts will pass
-# on names whose strikes exceed 15% of equity. The previous tier table is
-# kept as the inner cap so a future regime might tighten further (e.g. for
-# very large books) but no tier is ever permitted to exceed 15%.
-# Phase 13 safety: 0.25 → 0.15. Phase 6's 25% allowed too much
-# single-name concentration; the 2024-04 backtest had cash going
-# to -$21k because multiple correlated names (MARA/RIOT/HOOD)
-# assigned simultaneously. 15% caps single-name losses to the
-# original W-3 ceiling.
-# Variant A+ (P6): 0.15 → 0.12. The live pool is all high-beta names
-# (MARA/RIOT/SNAP/RIVN) that gap down together in a risk-off spike;
-# the correlated-drawdown tail is the real threat to the return
-# target, so tighten single-name notional a further notch.
-PER_NAME_NOTIONAL_CAP_PCT = Decimal("0.12")
-
-_PER_SYMBOL_CAP_TIERS: tuple[tuple[Decimal, Decimal], ...] = (
-    (Decimal("50000"), Decimal("1.00")),
-    (Decimal("150000"), Decimal("0.60")),
-    (Decimal("500000"), Decimal("0.30")),
-)
-_PER_SYMBOL_CAP_FLOOR = Decimal("0.15")
-
-
-def per_symbol_cap_pct(equity: Decimal) -> Decimal:
-    """Return the per-symbol cap fraction for the given equity.
-
-    Always at most ``PER_NAME_NOTIONAL_CAP_PCT`` (12%). The internal tier
-    table is preserved for future tightening (e.g., 5% at very large
-    books) but the 15% ceiling is the live-capital guard rail and applies
-    regardless of equity tier. The over-allocation incident on
-    2026-05-01 showed that the historical 60% tier produced
-    catastrophic single-name concentration on low-priced underlyings.
-    """
-    for threshold, pct in _PER_SYMBOL_CAP_TIERS:
-        if equity < threshold:
-            return min(pct, PER_NAME_NOTIONAL_CAP_PCT)
-    return min(_PER_SYMBOL_CAP_FLOOR, PER_NAME_NOTIONAL_CAP_PCT)
 
 
 @dataclass(frozen=True)
@@ -478,7 +393,14 @@ class BuildDiagnostics:
 
 @dataclass(frozen=True)
 class TradeIntent:
-    """A would-be cash-secured put trade for one symbol/expiration."""
+    """A would-be cash-secured put trade for one symbol/expiration.
+
+    ``reason`` and ``scores`` are decision lineage (Phase R1): a human
+    sentence for why this candidate was proposed, and the raw signal
+    values available at decision time. Both are excluded from equality
+    so historical comparisons on the trading fields keep working, and
+    both are persisted into ``orders.intent_payload`` on submission.
+    """
 
     sleeve: str
     symbol: str
@@ -494,6 +416,8 @@ class TradeIntent:
     collateral: Decimal
     expected_premium: Decimal
     yield_pct: Decimal
+    reason: str = field(default="", compare=False)
+    scores: dict[str, str] = field(default_factory=dict, compare=False)
 
 
 def _is_sleeve_active(sleeve: SleeveConfig, regime: str) -> bool:
@@ -603,119 +527,36 @@ def _intent_from(
     )
 
 
-def _committed_collateral(
-    short_puts: list[PositionSnapshot],
-    sleeves: list[SleeveConfig],
-) -> tuple[dict[str, Decimal], dict[str, Decimal], Decimal]:
-    """Aggregate locked CSP collateral by sleeve and by underlying.
-
-    Cash-secured puts lock ``strike * 100 * abs(qty)`` per contract;
-    that capital cannot be reused for new entries until the position
-    closes. The strategy must subtract these amounts from sleeve and
-    total deployment caps so we do not re-attempt to open the same
-    contracts every tick (the broker would reject with insufficient
-    buying power).
-
-    Returns ``(per_sleeve, per_symbol, total)`` where per_sleeve is
-    keyed by sleeve name, per_symbol is keyed by underlying ticker,
-    and total is the sum across all positions. A position whose
-    underlying is not whitelisted by any sleeve is included in the
-    total and per_symbol map but not in any sleeve bucket (because
-    no sleeve owns it).
-    """
-    per_sleeve: dict[str, Decimal] = {s.sleeve: Decimal("0") for s in sleeves}
-    per_symbol: dict[str, Decimal] = {}
-    total = Decimal("0")
-
-    underlying_to_sleeve: dict[str, str] = {}
-    for sleeve in sleeves:
-        if not sleeve.enabled:
-            continue
-        for symbol in sleeve.symbol_whitelist:
-            underlying_to_sleeve.setdefault(symbol.upper(), sleeve.sleeve)
-
-    for position in short_puts:
-        try:
-            underlying, _exp, opt_type, strike = parse_occ_symbol(position.symbol)
-        except ValueError:
-            continue
-        if opt_type != "put":
-            continue
-        qty = abs(position.qty)
-        if qty <= 0:
-            continue
-        collateral = strike * Decimal("100") * qty
-        per_symbol[underlying] = per_symbol.get(underlying, Decimal("0")) + collateral
-        total += collateral
-        sleeve_name = underlying_to_sleeve.get(underlying)
-        if sleeve_name is not None:
-            per_sleeve[sleeve_name] = per_sleeve.get(sleeve_name, Decimal("0")) + collateral
-
-    return per_sleeve, per_symbol, total
-
-
-def _existing_contract_counts(
-    short_puts: list[PositionSnapshot],
-) -> dict[str, int]:
-    """Map each underlying ticker to its open short-put contract count.
-
-    Used by W-2 to enforce the per-symbol contract ceiling
-    cumulatively across ticks. Phase 5e already subtracts dollar
-    collateral; this complements that with a contract count so a
-    single name cannot accumulate beyond ``MAX_CONTRACTS_PER_SYMBOL``
-    no matter how many ticks fire.
-    """
-    counts: dict[str, int] = {}
-    for position in short_puts:
-        try:
-            underlying, _exp, opt_type, _strike = parse_occ_symbol(position.symbol)
-        except ValueError:
-            continue
-        if opt_type != "put":
-            continue
-        qty = abs(position.qty)
-        if qty <= 0:
-            continue
-        counts[underlying] = counts.get(underlying, 0) + int(qty)
-    return counts
-
-
-def _max_qty_for(
-    contract: OptionContract,
-    *,
-    sleeve_remaining: Decimal,
-    total_remaining: Decimal,
-    per_symbol_remaining: Decimal,
-    existing_qty: int = 0,
-    contract_ceiling: int = MAX_CONTRACTS_PER_SYMBOL,
-) -> int:
-    """Compute the largest qty respecting sleeve, total, per-symbol caps.
-
-    All three remaining dollar values are post-subtraction of any
-    collateral already committed to open positions. ``existing_qty`` is
-    the open short-put contract count for the candidate's underlying;
-    the function caps the returned qty at
-    ``max(0, contract_ceiling - existing_qty)`` so the per-name
-    contract ceiling is enforced cumulatively across ticks (W-2). The
-    historical behaviour (no existing positions) is preserved when
-    ``existing_qty`` is zero. ``contract_ceiling`` defaults to the
-    base 10-contract floor; callers with equity context should pass
-    ``max_contracts_per_symbol(equity)`` to honour the P7 tier.
-    """
-    per_contract_collateral = contract.strike * Decimal("100")
-    if per_contract_collateral <= 0:
-        return 0
-    contract_remaining = max(0, contract_ceiling - existing_qty)
-    if contract_remaining <= 0:
-        return 0
-    headroom = min(sleeve_remaining, total_remaining, per_symbol_remaining)
-    if headroom < per_contract_collateral:
-        return 0
-    qty = int(headroom // per_contract_collateral)
-    return min(qty, contract_remaining)
-
-
 SPREAD_QUALITY_CUTOFF_PCT = Decimal("0.30")
+
+
+def _score_breakdown(
+    contract: OptionContract, today: date
+) -> tuple[Decimal, Decimal, Decimal] | None:
+    """Return ``(annualised_yield, spread_quality, spread_pct)`` or None.
+
+    Shared by :func:`_score_candidate` (which multiplies the first two)
+    and the lineage builder (which persists all three), so the formulas
+    exist exactly once. Returns ``None`` on the same conditions the
+    scorer historically dropped a candidate: missing quotes, degenerate
+    mid or strike, negative spread, or spread at or beyond the 30
+    percent quality cutoff.
+    """
+    if contract.bid is None or contract.ask is None:
+        return None
+    mid = (contract.bid + contract.ask) / Decimal("2")
+    if mid <= 0 or contract.strike <= 0:
+        return None
+    spread = contract.ask - contract.bid
+    if spread < 0:
+        return None
+    spread_pct = spread / mid
+    if spread_pct >= SPREAD_QUALITY_CUTOFF_PCT:
+        return None
+    spread_quality = Decimal("1") - spread_pct / SPREAD_QUALITY_CUTOFF_PCT
+    dte = max((contract.expiration - today).days, 1)
+    annualised_yield = (mid / contract.strike) * (Decimal("365") / Decimal(dte))
+    return annualised_yield, spread_quality, spread_pct
 
 
 def _score_candidate(contract: OptionContract, today: date) -> Decimal | None:
@@ -757,20 +598,10 @@ def _score_candidate(contract: OptionContract, today: date) -> Decimal | None:
     (spread >= 30% of mid). The caller drops these so they never enter
     the greedy fill, regardless of how attractive the headline yield is.
     """
-    if contract.bid is None or contract.ask is None:
+    parts = _score_breakdown(contract, today)
+    if parts is None:
         return None
-    mid = (contract.bid + contract.ask) / Decimal("2")
-    if mid <= 0 or contract.strike <= 0:
-        return None
-    spread = contract.ask - contract.bid
-    if spread < 0:
-        return None
-    spread_pct = spread / mid
-    if spread_pct >= SPREAD_QUALITY_CUTOFF_PCT:
-        return None
-    spread_quality = Decimal("1") - spread_pct / SPREAD_QUALITY_CUTOFF_PCT
-    dte = max((contract.expiration - today).days, 1)
-    annualised_yield = (mid / contract.strike) * (Decimal("365") / Decimal(dte))
+    annualised_yield, spread_quality, _spread_pct = parts
     return annualised_yield * spread_quality
 
 
@@ -786,13 +617,39 @@ RV30Provider = Callable[[str], Awaitable["Decimal | None"]]
 # the symbol's trailing 252-day IV history. Returns None when
 # history is too thin to compute. Fail-open when None.
 IVPercentileProvider = Callable[[str, "Decimal"], Awaitable["Decimal | None"]]
-# Phase 6 max-aggression: 25 → 0 (disabled). The percentile gate is
+# Phase 6 max-aggression: 25 -> 0 (disabled). The percentile gate is
 # the cleanest VRP filter in theory but its rejections cost deployment.
 # At 6%/month target the strategy needs to take more trades; the
 # yield floor (0.02%/day, fee floor $0.05) provides the residual
 # vol-richness check. Setting to 0 means the gate fails-pass for any
 # candidate that has computable rank.
 IV_PERCENTILE_FLOOR_DEFAULT = Decimal("0")
+
+
+@dataclass
+class _SleeveScreen:
+    """Mutable screen-phase counters for one sleeve, merged after gating."""
+
+    sleeve: str
+    active: bool
+    chains_fetched: int = 0
+    chain_errors: int = 0
+    puts_seen: int = 0
+    puts_with_delta: int = 0
+    puts_in_dte_band: int = 0
+    puts_with_quotes: int = 0
+    symbols_skipped_for_earnings: int = 0
+    earnings_blackout_symbols: list[str] = field(default_factory=list)
+    symbols_skipped_for_earnings_unknown: int = 0
+    earnings_unknown_symbols: list[str] = field(default_factory=list)
+    symbols_skipped_for_iv_rv_floor: int = 0
+    iv_rv_floor_symbols: list[str] = field(default_factory=list)
+    symbols_skipped_for_min_yield: int = 0
+    min_yield_symbols: list[str] = field(default_factory=list)
+    symbols_skipped_for_trend: int = 0
+    trend_skip_symbols: list[str] = field(default_factory=list)
+    symbols_skipped_for_trend_unknown: int = 0
+    trend_unknown_symbols: list[str] = field(default_factory=list)
 
 
 async def build_intents(
@@ -852,138 +709,96 @@ async def build_intents_with_diagnostics(
 ) -> tuple[list[TradeIntent], BuildDiagnostics]:
     """Build intents and return the per-sleeve diagnostic counters alongside.
 
-    Multi-contract per symbol allowed within the per-symbol concentration
-    cap (15% of equity by default) and the total deployment cap (70% of
-    equity). The total cap covers the whole portfolio, not per sleeve.
+    Historical entry point, signature and output unchanged by the Phase
+    R1 gate extraction: display surfaces (/strategy_status), the
+    backtest, and the test suite consume plain ``TradeIntent`` values.
+    The strategy worker's submission path must NOT use this function;
+    it uses :func:`build_approved_intents_with_diagnostics` so it only
+    ever holds gate-issued ``ApprovedIntent`` values.
+    """
+    approved, diagnostics = await build_approved_intents_with_diagnostics(
+        regime=regime,
+        sleeves=sleeves,
+        account=account,
+        chain_fetcher=chain_fetcher,
+        today=today,
+        earnings_status=earnings_status,
+        trend_status=trend_status,
+        existing_short_puts=existing_short_puts,
+        today_already_deployed=today_already_deployed,
+        cooldown_symbols=cooldown_symbols,
+        rv30_provider=rv30_provider,
+        iv_percentile_provider=iv_percentile_provider,
+        iv_percentile_floor=iv_percentile_floor,
+    )
+    return [a.intent for a in approved], diagnostics
 
-    Within each sleeve, candidates are ranked by per-share yield
-    (mid / strike) descending and greedy-filled in that order. Diagnostic
-    counters are accumulated as the chain is walked so an empty result can
-    be explained without re-running the loop.
+
+async def build_approved_intents_with_diagnostics(
+    regime: RegimeSnapshot,
+    sleeves: list[SleeveConfig],
+    account: AccountSnapshot,
+    chain_fetcher: ChainFetcher,
+    *,
+    today: date | None = None,
+    earnings_status: EarningsStatusProvider | None = None,
+    trend_status: TrendStatusProvider | None = None,
+    existing_short_puts: list[PositionSnapshot] | None = None,
+    today_already_deployed: Decimal | None = None,
+    cooldown_symbols: set[str] | None = None,
+    rv30_provider: RV30Provider | None = None,
+    iv_percentile_provider: IVPercentileProvider | None = None,
+    iv_percentile_floor: Decimal = IV_PERCENTILE_FLOOR_DEFAULT,
+) -> tuple[list[ApprovedIntent], BuildDiagnostics]:
+    """Screen, score, and gate: the worker's submission-path entry point.
+
+    Phase 1 walks each active sleeve's whitelist through the pre-filters
+    (cool-down, earnings blackout, 50-DMA trend), fetches chains, picks
+    the target-delta strike, applies the premium floors and IV gates,
+    and scores survivors. Phase 2 ranks by score within each sleeve.
+    Phase 3 builds one-contract ``TradeIntent`` proposals carrying
+    lineage and hands them, in ranked order, to
+    :func:`kai_trader.risk.gate.apply_gate`, which owns every cap and
+    grants final quantities. Diagnostics merge the screen counters with
+    the gate counters into the exact shape the inline implementation
+    produced.
     """
     today = today or datetime.now(UTC).date()
     equity = Decimal(str(account.equity))
     short_puts = existing_short_puts or []
-    committed_per_sleeve, committed_per_symbol, committed_total = _committed_collateral(
-        short_puts, sleeves
-    )
-    existing_contracts = _existing_contract_counts(short_puts)
-    total_remaining = max(
-        equity * TOTAL_DEPLOYMENT_CAP_PCT - committed_total, Decimal("0")
-    )
-    # Clamp the equity-based headroom to the broker's real options buying
-    # power. The equity cap is a policy ceiling; it does not know how much
-    # collateral the broker will actually fund right now. Without this the
-    # builder emitted intents whose total collateral exceeded options
-    # buying power, and Alpaca rejected each one with "insufficient options
-    # buying power" every tick (previously caught only by per-contract
-    # prior-failure suppression). options_buying_power is already net of
-    # collateral locked by open positions, so it is the binding constraint;
-    # take the min. None means the caller did not supply it (legacy
-    # fixtures / pre-2026-06 callers), in which case the equity cap stands.
-    deployment_limited_by_buying_power = False
-    options_buying_power_usd = Decimal("0")
-    if account.options_buying_power is not None:
-        options_buying_power_usd = Decimal(str(account.options_buying_power))
-        # Deploy against a 5% haircut on reported options buying power so
-        # normal intra-tick drift (a settling fill, a moving mark) does not
-        # push the next submit past the broker's real limit. See
-        # OPTIONS_BP_SAFETY_FACTOR.
-        bp_cap = options_buying_power_usd * OPTIONS_BP_SAFETY_FACTOR
-        if bp_cap < total_remaining:
-            deployment_limited_by_buying_power = True
-            _log.info(
-                "strategy.deployment.buying_power_clamp",
-                equity_cap_remaining=str(total_remaining),
-                options_buying_power=str(options_buying_power_usd),
-                buying_power_cap=str(bp_cap),
-            )
-        total_remaining = min(total_remaining, bp_cap)
-    per_symbol_cap_dollars = equity * per_symbol_cap_pct(equity)
-    # P7: per-symbol contract ceiling tiered on equity. Smaller books
-    # see 10; $150k+ books see 25; $500k+ books see 50.
-    contract_ceiling = max_contracts_per_symbol(equity)
-    intents: list[TradeIntent] = []
-    sleeve_diags: list[SleeveDiagnostic] = []
-
-    # W-4 tick-level guard rails. These are global across sleeves so a
-    # multi-sleeve config still respects the per-tick and per-day caps.
     today_already = today_already_deployed or Decimal("0")
-    per_tick_remaining = equity * PER_TICK_DEPLOYMENT_CAP_PCT
-    per_day_remaining = max(
-        equity * PER_DAY_NEW_DEPLOYMENT_PCT - today_already, Decimal("0")
-    )
-    today_used_pct = (
-        today_already / equity if equity > 0 else Decimal("0")
-    )
     cooldown_set = cooldown_symbols or set()
-    intents_dropped_per_tick = 0
-    intents_dropped_per_day = 0
+
+    screens: list[_SleeveScreen] = []
+    proposals: list[TradeIntent] = []
     symbols_skipped_for_cooldown_count = 0
     cooldown_skipped_symbols: list[str] = []
 
     for sleeve in sleeves:
-        if not _is_sleeve_active(sleeve, regime.regime):
+        screen = _SleeveScreen(
+            sleeve=sleeve.sleeve,
+            active=_is_sleeve_active(sleeve, regime.regime),
+        )
+        screens.append(screen)
+        if not screen.active:
             _log.info(
                 "strategy.sleeve.skipped",
                 sleeve=sleeve.sleeve,
                 regime=regime.regime,
             )
-            sleeve_diags.append(
-                SleeveDiagnostic(
-                    sleeve=sleeve.sleeve,
-                    chains_fetched=0,
-                    chain_errors=0,
-                    puts_seen=0,
-                    puts_with_delta=0,
-                    puts_in_dte_band=0,
-                    puts_with_quotes=0,
-                    intents_built=0,
-                    candidates_cap_rejected=0,
-                    per_symbol_cap_dollars=per_symbol_cap_dollars,
-                )
-            )
             continue
 
         target_delta = _target_delta_for(sleeve, regime.regime)
-        sleeve_remaining = max(
-            equity * sleeve.target_pct - committed_per_sleeve.get(sleeve.sleeve, Decimal("0")),
-            Decimal("0"),
-        )
-
-        chains_fetched = 0
-        chain_errors = 0
-        puts_seen = 0
-        puts_with_delta = 0
-        puts_in_dte_band = 0
-        puts_with_quotes = 0
-        intents_built_for_sleeve = 0
-        candidates_cap_rejected = 0
-        symbols_skipped_for_earnings = 0
-        symbols_skipped_for_earnings_unknown = 0
-        symbols_skipped_for_contract_ceiling = 0
-        symbols_skipped_for_per_name_dollar_cap = 0
-        symbols_skipped_for_iv_rv_floor = 0
-        symbols_skipped_for_min_yield = 0
-        earnings_blackout_symbols: list[str] = []
-        earnings_unknown_symbols: list[str] = []
-        contract_ceiling_symbols: list[str] = []
-        per_name_dollar_cap_symbols: list[str] = []
-        iv_rv_floor_symbols: list[str] = []
-        min_yield_symbols: list[str] = []
-        symbols_skipped_for_trend = 0
-        symbols_skipped_for_trend_unknown = 0
-        trend_skip_symbols: list[str] = []
-        trend_unknown_symbols: list[str] = []
 
         # Phase 1: walk the whitelist, fetch each chain, pick a strike.
-        ranked: list[tuple[OptionContract, Decimal]] = []
+        ranked: list[tuple[OptionContract, Decimal, dict[str, str]]] = []
         for symbol in sleeve.symbol_whitelist:
             if symbol in cooldown_set:
                 # W-4: a symbol entered (filled or submitted) inside the
                 # cool-down window is excluded from candidate selection so
                 # the greedy ranker cannot keep stacking the same top-scored
-                # name tick after tick.
+                # name tick after tick. The gate re-checks this as a
+                # backstop for producers that bypass the screen.
                 symbols_skipped_for_cooldown_count += 1
                 if symbol not in cooldown_skipped_symbols:
                     cooldown_skipped_symbols.append(symbol)
@@ -993,6 +808,7 @@ async def build_intents_with_diagnostics(
                     symbol=symbol,
                 )
                 continue
+            earnings_checked = False
             if earnings_status is not None and sleeve.earnings_blackout_enabled:
                 status: EarningsStatus
                 try:
@@ -1013,11 +829,11 @@ async def build_intents_with_diagnostics(
                     )
                     status = "unknown"
                 if status != "outside_window":
-                    symbols_skipped_for_earnings += 1
-                    earnings_blackout_symbols.append(symbol)
+                    screen.symbols_skipped_for_earnings += 1
+                    screen.earnings_blackout_symbols.append(symbol)
                     if status == "unknown":
-                        symbols_skipped_for_earnings_unknown += 1
-                        earnings_unknown_symbols.append(symbol)
+                        screen.symbols_skipped_for_earnings_unknown += 1
+                        screen.earnings_unknown_symbols.append(symbol)
                     _log.info(
                         "strategy.earnings.skipped",
                         sleeve=sleeve.sleeve,
@@ -1025,12 +841,14 @@ async def build_intents_with_diagnostics(
                         status=status,
                     )
                     continue
+                earnings_checked = True
             # Variant A+ (P1): 50-DMA trend filter. Refuse to open a new
             # put on a symbol trading below its moving average, so an
             # assignment lands in a name that is at least not actively
             # falling. Fail-closed: an "unknown" status (data error or too
             # little history) is a skip, mirroring the earnings filter's
             # live-capital posture.
+            trend_checked = False
             if trend_status is not None:
                 t_status: TrendStatus
                 try:
@@ -1046,11 +864,11 @@ async def build_intents_with_diagnostics(
                     )
                     t_status = "unknown"
                 if t_status != "above":
-                    symbols_skipped_for_trend += 1
-                    trend_skip_symbols.append(symbol)
+                    screen.symbols_skipped_for_trend += 1
+                    screen.trend_skip_symbols.append(symbol)
                     if t_status == "unknown":
-                        symbols_skipped_for_trend_unknown += 1
-                        trend_unknown_symbols.append(symbol)
+                        screen.symbols_skipped_for_trend_unknown += 1
+                        screen.trend_unknown_symbols.append(symbol)
                     _log.info(
                         "strategy.trend.skipped",
                         sleeve=sleeve.sleeve,
@@ -1058,10 +876,11 @@ async def build_intents_with_diagnostics(
                         status=t_status,
                     )
                     continue
+                trend_checked = True
             try:
                 chain = await chain_fetcher(symbol, None)
             except Exception as exc:
-                chain_errors += 1
+                screen.chain_errors += 1
                 _log.warning(
                     "strategy.chain_fetch.failed",
                     sleeve=sleeve.sleeve,
@@ -1069,20 +888,20 @@ async def build_intents_with_diagnostics(
                     error=str(exc),
                 )
                 continue
-            chains_fetched += 1
+            screen.chains_fetched += 1
             for c in chain:
                 if c.option_type != "put":
                     continue
-                puts_seen += 1
+                screen.puts_seen += 1
                 if c.delta is None:
                     continue
-                puts_with_delta += 1
+                screen.puts_with_delta += 1
                 if not _within_dte_band(c.expiration, today, sleeve):
                     continue
-                puts_in_dte_band += 1
+                screen.puts_in_dte_band += 1
                 if c.bid is None or c.ask is None:
                     continue
-                puts_with_quotes += 1
+                screen.puts_with_quotes += 1
             contract = select_put_strike(chain, target_delta, sleeve, today)
             if contract is None or contract.bid is None or contract.ask is None:
                 continue
@@ -1097,9 +916,9 @@ async def build_intents_with_diagnostics(
                     contract.bid / contract.strike / Decimal(dte_days)
                 )
                 if bid_yield_per_day < MIN_BID_YIELD_PER_DAY:
-                    symbols_skipped_for_min_yield += 1
-                    if contract.underlying not in min_yield_symbols:
-                        min_yield_symbols.append(contract.underlying)
+                    screen.symbols_skipped_for_min_yield += 1
+                    if contract.underlying not in screen.min_yield_symbols:
+                        screen.min_yield_symbols.append(contract.underlying)
                     _log.info(
                         "strategy.min_yield.skipped",
                         sleeve=sleeve.sleeve,
@@ -1116,6 +935,7 @@ async def build_intents_with_diagnostics(
             # selling vol cheaper than the underlying has traded
             # recently, which is the opposite of edge. Fail-open when
             # either IV or RV is missing.
+            rv30: Decimal | None = None
             if rv30_provider is not None:
                 try:
                     rv30 = await rv30_provider(contract.underlying)
@@ -1128,9 +948,9 @@ async def build_intents_with_diagnostics(
                     )
                     rv30 = None
                 if not passes_iv_rv_floor(contract, rv30, IV_RV_RATIO_MIN):
-                    symbols_skipped_for_iv_rv_floor += 1
-                    if contract.underlying not in iv_rv_floor_symbols:
-                        iv_rv_floor_symbols.append(contract.underlying)
+                    screen.symbols_skipped_for_iv_rv_floor += 1
+                    if contract.underlying not in screen.iv_rv_floor_symbols:
+                        screen.iv_rv_floor_symbols.append(contract.underlying)
                     _log.info(
                         "strategy.iv_rv.skipped",
                         sleeve=sleeve.sleeve,
@@ -1147,6 +967,7 @@ async def build_intents_with_diagnostics(
             # signal. The percentile gate is the primary VRP filter
             # for the income recalibration; IV/RV stays as defense-
             # in-depth for the transition.
+            iv_rank: Decimal | None = None
             if (
                 iv_percentile_provider is not None
                 and contract.implied_volatility is not None
@@ -1164,9 +985,9 @@ async def build_intents_with_diagnostics(
                     )
                     iv_rank = None
                 if iv_rank is not None and iv_rank < iv_percentile_floor:
-                    symbols_skipped_for_iv_rv_floor += 1
-                    if contract.underlying not in iv_rv_floor_symbols:
-                        iv_rv_floor_symbols.append(contract.underlying)
+                    screen.symbols_skipped_for_iv_rv_floor += 1
+                    if contract.underlying not in screen.iv_rv_floor_symbols:
+                        screen.iv_rv_floor_symbols.append(contract.underlying)
                     _log.info(
                         "strategy.iv_percentile.skipped",
                         sleeve=sleeve.sleeve,
@@ -1176,175 +997,128 @@ async def build_intents_with_diagnostics(
                         floor=str(iv_percentile_floor),
                     )
                     continue
-            score = _score_candidate(contract, today)
-            if score is None:
+            parts = _score_breakdown(contract, today)
+            if parts is None:
                 continue
-            ranked.append((contract, score))
+            annualised_yield, spread_quality, spread_pct = parts
+            score = annualised_yield * spread_quality
+            scores: dict[str, str] = {
+                "composite": str(score),
+                "annualised_yield": str(annualised_yield),
+                "spread_quality": str(spread_quality),
+                "spread_pct": str(spread_pct),
+                "dte": str((contract.expiration - today).days),
+                "regime": regime.regime,
+            }
+            if contract.implied_volatility is not None:
+                scores["iv"] = str(contract.implied_volatility)
+            if earnings_checked:
+                scores["earnings"] = "outside_window"
+            if trend_checked:
+                scores["trend"] = "above"
+            if rv30 is not None:
+                scores["rv30"] = str(rv30)
+            if iv_rank is not None:
+                scores["iv_percentile_rank"] = str(iv_rank)
+            ranked.append((contract, score, scores))
 
         # Phase 2: sort highest score first. Score = annualised_yield *
         # spread_quality (see _score_candidate). Stable sort preserves
         # whitelist order on ties so behaviour stays deterministic.
-        ranked.sort(key=lambda pair: pair[1], reverse=True)
+        ranked.sort(key=lambda item: item[1], reverse=True)
 
-        # Phase 3: greedy-fill in score order. Stops early when the
-        # per-tick entry cap is hit so a large pool does not flood the
-        # book in one tick. The cap is per-sleeve so multi-sleeve
-        # configurations stay independent.
-        for contract, _y in ranked:
-            if sleeve_remaining <= 0 or total_remaining <= 0:
-                break
-            if intents_built_for_sleeve >= sleeve.max_new_entries_per_tick:
-                break
-            committed_for_underlying = committed_per_symbol.get(
-                contract.underlying, Decimal("0")
-            )
-            per_symbol_remaining = max(
-                per_symbol_cap_dollars - committed_for_underlying, Decimal("0")
-            )
-            existing_qty = existing_contracts.get(contract.underlying, 0)
-            if existing_qty >= contract_ceiling:
-                # W-2: per-symbol contract ceiling already met by held
-                # positions. Refusing here is the cumulative version of
-                # the historical per-build cap. Ceiling is tiered by
-                # equity (P7) so the same constraint scales with the
-                # account.
-                symbols_skipped_for_contract_ceiling += 1
-                if contract.underlying not in contract_ceiling_symbols:
-                    contract_ceiling_symbols.append(contract.underlying)
-                _log.info(
-                    "strategy.sleeve.contract_ceiling",
-                    sleeve=sleeve.sleeve,
-                    symbol=contract.underlying,
-                    existing_qty=existing_qty,
-                    ceiling=contract_ceiling,
-                )
+        # Phase 3: build one-contract proposals in ranked order. The gate
+        # owns sizing; a proposal's qty of 1 is a per-contract basis, not
+        # a request the gate must honour.
+        for rank, (contract, _score, scores) in enumerate(ranked, start=1):
+            proposal = _intent_from(sleeve, contract, target_delta, qty=1)
+            if proposal is None:
                 continue
-            qty = _max_qty_for(
-                contract,
-                sleeve_remaining=sleeve_remaining,
-                total_remaining=total_remaining,
-                per_symbol_remaining=per_symbol_remaining,
-                existing_qty=existing_qty,
-                contract_ceiling=contract_ceiling,
+            reason = (
+                f"delta {contract.delta} closest to target {target_delta} in "
+                f"{sleeve.target_dte_min}-{sleeve.target_dte_max} DTE band; "
+                f"ranked {rank}/{len(ranked)} in {sleeve.sleeve} by "
+                f"annualised-yield x spread-quality"
             )
-            if qty < 1:
-                candidates_cap_rejected += 1
-                # W-3: distinguish per-name dollar cap binding from
-                # sleeve/total binding so the operator can see which
-                # constraint is keeping the strategy idle.
-                per_contract_collateral = contract.strike * Decimal("100")
-                if per_symbol_remaining < per_contract_collateral:
-                    symbols_skipped_for_per_name_dollar_cap += 1
-                    if contract.underlying not in per_name_dollar_cap_symbols:
-                        per_name_dollar_cap_symbols.append(contract.underlying)
-                _log.info(
-                    "strategy.sleeve.no_fit",
-                    sleeve=sleeve.sleeve,
-                    symbol=contract.underlying,
-                    sleeve_remaining=str(sleeve_remaining),
-                    total_remaining=str(total_remaining),
-                    per_symbol_cap=str(per_symbol_cap_dollars),
-                    per_symbol_committed=str(committed_for_underlying),
-                    contract_collateral=str(per_contract_collateral),
-                )
-                continue
+            proposal = replace(
+                proposal,
+                reason=reason,
+                scores={
+                    **scores,
+                    "bid": str(proposal.bid),
+                    "ask": str(proposal.ask),
+                    "mid": str(proposal.mid),
+                },
+            )
+            proposals.append(proposal)
 
-            # W-4: enforce per-tick and per-day deployment caps. The
-            # per-name caps (W-2, W-3) above already reduced qty as
-            # needed; here we further reduce or drop the candidate when
-            # the global caps bind. Reduce-when-possible, drop-when-not so
-            # a partial intent gets through and the diagnostic counter
-            # captures the binding constraint.
-            per_contract_collateral = contract.strike * Decimal("100")
-            intent_collateral = per_contract_collateral * qty
-            if per_tick_remaining < per_contract_collateral:
-                intents_dropped_per_tick += 1
-                _log.info(
-                    "strategy.per_tick_cap.dropped",
-                    sleeve=sleeve.sleeve,
-                    symbol=contract.underlying,
-                    per_tick_remaining=str(per_tick_remaining),
-                )
-                continue
-            if intent_collateral > per_tick_remaining:
-                qty = int(per_tick_remaining // per_contract_collateral)
-                intent_collateral = per_contract_collateral * qty
-            if per_day_remaining < per_contract_collateral:
-                intents_dropped_per_day += 1
-                _log.info(
-                    "strategy.per_day_cap.dropped",
-                    sleeve=sleeve.sleeve,
-                    symbol=contract.underlying,
-                    per_day_remaining=str(per_day_remaining),
-                )
-                continue
-            if intent_collateral > per_day_remaining:
-                qty = int(per_day_remaining // per_contract_collateral)
-                intent_collateral = per_contract_collateral * qty
-            if qty < 1:
-                continue
+    ctx = RiskContext(
+        equity=equity,
+        options_buying_power=account.options_buying_power,
+        sleeves=tuple(sleeves),
+        existing_short_puts=tuple(short_puts),
+        today_already_deployed=today_already,
+        cooldown_symbols=frozenset(cooldown_set),
+    )
+    gate = apply_gate(proposals, ctx)
 
-            intent = _intent_from(sleeve, contract, target_delta, qty)
-            if intent is None:
-                continue
-            sleeve_remaining -= intent.collateral
-            total_remaining -= intent.collateral
-            per_tick_remaining -= intent.collateral
-            per_day_remaining -= intent.collateral
-            existing_contracts[contract.underlying] = existing_qty + intent.qty
-            intents.append(intent)
-            intents_built_for_sleeve += 1
-
-        sleeve_diags.append(
-            SleeveDiagnostic(
-                sleeve=sleeve.sleeve,
-                chains_fetched=chains_fetched,
-                chain_errors=chain_errors,
-                puts_seen=puts_seen,
-                puts_with_delta=puts_with_delta,
-                puts_in_dte_band=puts_in_dte_band,
-                puts_with_quotes=puts_with_quotes,
-                intents_built=intents_built_for_sleeve,
-                candidates_cap_rejected=candidates_cap_rejected,
-                per_symbol_cap_dollars=per_symbol_cap_dollars,
-                symbols_skipped_for_earnings=symbols_skipped_for_earnings,
-                earnings_blackout_symbols=tuple(earnings_blackout_symbols),
-                symbols_skipped_for_earnings_unknown=(
-                    symbols_skipped_for_earnings_unknown
-                ),
-                earnings_unknown_symbols=tuple(earnings_unknown_symbols),
-                symbols_skipped_for_contract_ceiling=(
-                    symbols_skipped_for_contract_ceiling
-                ),
-                contract_ceiling_symbols=tuple(contract_ceiling_symbols),
-                symbols_skipped_for_per_name_dollar_cap=(
-                    symbols_skipped_for_per_name_dollar_cap
-                ),
-                per_name_dollar_cap_symbols=tuple(per_name_dollar_cap_symbols),
-                symbols_skipped_for_iv_rv_floor=symbols_skipped_for_iv_rv_floor,
-                iv_rv_floor_symbols=tuple(iv_rv_floor_symbols),
-                symbols_skipped_for_min_yield=symbols_skipped_for_min_yield,
-                min_yield_symbols=tuple(min_yield_symbols),
-                symbols_skipped_for_trend=symbols_skipped_for_trend,
-                trend_skip_symbols=tuple(trend_skip_symbols),
-                symbols_skipped_for_trend_unknown=symbols_skipped_for_trend_unknown,
-                trend_unknown_symbols=tuple(trend_unknown_symbols),
-            )
+    empty_counters = SleeveGateCounters()
+    sleeve_diags = [
+        SleeveDiagnostic(
+            sleeve=screen.sleeve,
+            chains_fetched=screen.chains_fetched,
+            chain_errors=screen.chain_errors,
+            puts_seen=screen.puts_seen,
+            puts_with_delta=screen.puts_with_delta,
+            puts_in_dte_band=screen.puts_in_dte_band,
+            puts_with_quotes=screen.puts_with_quotes,
+            intents_built=counters.intents_built,
+            candidates_cap_rejected=counters.candidates_cap_rejected,
+            per_symbol_cap_dollars=gate.totals.per_symbol_cap_dollars,
+            symbols_skipped_for_earnings=screen.symbols_skipped_for_earnings,
+            earnings_blackout_symbols=tuple(screen.earnings_blackout_symbols),
+            symbols_skipped_for_earnings_unknown=(
+                screen.symbols_skipped_for_earnings_unknown
+            ),
+            earnings_unknown_symbols=tuple(screen.earnings_unknown_symbols),
+            symbols_skipped_for_contract_ceiling=(
+                counters.symbols_skipped_for_contract_ceiling
+            ),
+            contract_ceiling_symbols=counters.contract_ceiling_symbols,
+            symbols_skipped_for_per_name_dollar_cap=(
+                counters.symbols_skipped_for_per_name_dollar_cap
+            ),
+            per_name_dollar_cap_symbols=counters.per_name_dollar_cap_symbols,
+            symbols_skipped_for_iv_rv_floor=screen.symbols_skipped_for_iv_rv_floor,
+            iv_rv_floor_symbols=tuple(screen.iv_rv_floor_symbols),
+            symbols_skipped_for_min_yield=screen.symbols_skipped_for_min_yield,
+            min_yield_symbols=tuple(screen.min_yield_symbols),
+            symbols_skipped_for_trend=screen.symbols_skipped_for_trend,
+            trend_skip_symbols=tuple(screen.trend_skip_symbols),
+            symbols_skipped_for_trend_unknown=screen.symbols_skipped_for_trend_unknown,
+            trend_unknown_symbols=tuple(screen.trend_unknown_symbols),
         )
+        for screen, counters in (
+            (s, gate.sleeve_counters.get(s.sleeve, empty_counters)) for s in screens
+        )
+    ]
 
-    return intents, BuildDiagnostics(
+    diagnostics = BuildDiagnostics(
         sleeves=sleeve_diags,
-        intents_dropped_for_per_tick_cap=intents_dropped_per_tick,
-        intents_dropped_for_per_day_cap=intents_dropped_per_day,
+        intents_dropped_for_per_tick_cap=gate.totals.intents_dropped_for_per_tick_cap,
+        intents_dropped_for_per_day_cap=gate.totals.intents_dropped_for_per_day_cap,
         symbols_skipped_for_cooldown=symbols_skipped_for_cooldown_count,
         cooldown_symbols=tuple(cooldown_skipped_symbols),
-        today_deployment_used_pct=today_used_pct,
-        today_deployment_remaining_usd=per_day_remaining,
-        per_tick_cap_remaining_usd=per_tick_remaining,
-        contract_ceiling=contract_ceiling,
-        deployment_limited_by_buying_power=deployment_limited_by_buying_power,
-        options_buying_power_usd=options_buying_power_usd,
+        today_deployment_used_pct=gate.totals.today_deployment_used_pct,
+        today_deployment_remaining_usd=gate.totals.today_deployment_remaining_usd,
+        per_tick_cap_remaining_usd=gate.totals.per_tick_cap_remaining_usd,
+        contract_ceiling=gate.totals.contract_ceiling,
+        deployment_limited_by_buying_power=(
+            gate.totals.deployment_limited_by_buying_power
+        ),
+        options_buying_power_usd=gate.totals.options_buying_power_usd,
     )
+    return list(gate.approved), diagnostics
 
 
 def summarise_intents(intents: list[TradeIntent]) -> str:

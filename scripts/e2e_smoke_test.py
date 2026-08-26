@@ -23,6 +23,10 @@ from decimal import Decimal
 from kai_trader.broker.alpaca import AccountSnapshot, PositionSnapshot
 from kai_trader.broker.options_data import OptionContract
 from kai_trader.db.sleeve_config import SleeveConfig
+from kai_trader.risk.gate import (
+    PER_NAME_NOTIONAL_CAP_PCT,
+    PER_TICK_DEPLOYMENT_CAP_PCT,
+)
 from kai_trader.strategy.candidates import build_intents_with_diagnostics
 from kai_trader.strategy.regime import RegimeSnapshot
 
@@ -128,7 +132,8 @@ SLEEVE = SleeveConfig(
         "BAC",    # mid-cheap, no holdings; should produce an intent
         "T",      # cheap, no holdings; cool-down candidate (W-4)
         "PFE",    # earnings unknown (W-1 fail-closed)
-        "KO",     # IV/RV ratio < 1.10 (W-8 floor)
+        "KO",     # thin bid yield (Layer B floor catches it before W-8)
+        "XLE",    # IV/RV ratio < 1.10 (W-8 floor)
     ],
     enabled=True,
     max_new_entries_per_tick=2,
@@ -146,7 +151,8 @@ CHAINS: dict[str, list[OptionContract]] = {
     "BAC":  [_put(underlying="BAC",  strike=42, delta=-0.40, bid=0.55, ask=0.60, iv=0.30)],
     "T":    [_put(underlying="T",    strike=22, delta=-0.40, bid=0.25, ask=0.27, iv=0.30)],
     "PFE":  [_put(underlying="PFE",  strike=27, delta=-0.40, bid=0.30, ask=0.33, iv=0.30)],
-    "KO":   [_put(underlying="KO",   strike=70, delta=-0.40, bid=0.40, ask=0.45, iv=0.10)],  # iv low → W-8 reject
+    "KO":   [_put(underlying="KO",   strike=70, delta=-0.40, bid=0.40, ask=0.45, iv=0.10)],  # 0.07%/day -> min-yield reject
+    "XLE":  [_put(underlying="XLE",  strike=40, delta=-0.40, bid=0.45, ask=0.50, iv=0.10)],  # iv low -> W-8 reject
     # MARA/SNAP queried but skipped pre-fetch because contract ceiling
     # binds before chain fetch in the build pipeline. Provide them so a
     # bug fix that changes evaluation order does not silently fail.
@@ -176,7 +182,8 @@ RV30_BY_SYMBOL: dict[str, Decimal] = {
     "BAC":  Decimal("0.20"),
     "T":    Decimal("0.20"),
     "PFE":  Decimal("0.20"),
-    "KO":   Decimal("0.20"),  # combined with iv=0.10 → ratio 0.50 → W-8 reject
+    "KO":   Decimal("0.20"),
+    "XLE":  Decimal("0.20"),  # combined with iv=0.10 -> ratio 0.50 -> W-8 reject
 }
 
 
@@ -212,8 +219,9 @@ async def main() -> int:
     print()
     print(f"Cool-down set (W-4): {sorted(COOLDOWN_SYMBOLS)}")
     print(f"Today already deployed (W-4): ${TODAY_ALREADY_DEPLOYED}")
-    print(f"Earnings unknown symbols (W-1): ['PFE']")
-    print(f"IV/RV below floor symbols (W-8): ['KO']")
+    print("Earnings unknown symbols (W-1): ['PFE']")
+    print("Min-yield floor symbols (Layer B): ['KO']")
+    print("IV/RV below floor symbols (W-8): ['XLE']")
     print()
     print("-" * 70)
     print("Running build_intents_with_diagnostics...")
@@ -301,18 +309,31 @@ async def main() -> int:
          "MARA" in sleeve.contract_ceiling_symbols),
         ("W-2: SNAP skipped for contract ceiling",
          "SNAP" in sleeve.contract_ceiling_symbols),
-        ("W-3: per-name 15% cap referenced in diag",
-         sleeve.per_symbol_cap_dollars == ACCOUNT.equity * Decimal("0.15")),
+        (f"W-3: per-name {PER_NAME_NOTIONAL_CAP_PCT:.0%} cap referenced in diag",
+         sleeve.per_symbol_cap_dollars
+         == ACCOUNT.equity * PER_NAME_NOTIONAL_CAP_PCT),
         ("W-4: T skipped for cool-down",
          "T" in diag.cooldown_symbols),
-        ("W-4: per-tick cap = 10% of equity",
+        (f"W-4: per-tick cap = {PER_TICK_DEPLOYMENT_CAP_PCT:.0%} of equity",
          diag.per_tick_cap_remaining_usd
          + sum(i.collateral for i in intents)
-         == ACCOUNT.equity * Decimal("0.10")),
+         == ACCOUNT.equity * PER_TICK_DEPLOYMENT_CAP_PCT),
         ("W-4: today_deployment_used_pct = 0% (fresh UTC day)",
          diag.today_deployment_used_pct == 0),
-        ("W-8: KO skipped for IV/RV floor",
-         "KO" in sleeve.iv_rv_floor_symbols),
+        ("Layer B: KO skipped by min bid-yield floor",
+         "KO" in sleeve.min_yield_symbols),
+        ("W-8: XLE skipped for IV/RV floor",
+         "XLE" in sleeve.iv_rv_floor_symbols),
+        ("R1: every intent carries a lineage reason",
+         len(intents) > 0
+         and all("ranked" in i.reason for i in intents)),
+        ("R1: every intent carries lineage scores",
+         len(intents) > 0
+         and all(
+             {"composite", "annualised_yield", "spread_pct", "mid", "regime"}
+             <= set(i.scores)
+             for i in intents
+         )),
     ]
     for name, ok in checks:
         marker = "PASS" if ok else "FAIL"
