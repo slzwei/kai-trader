@@ -13,6 +13,7 @@ from kai_trader.broker.alpaca import (
     AccountSnapshot,
     AssignmentActivity,
     OrderStatusSnapshot,
+    PositionSnapshot,
     SubmitResult,
 )
 from kai_trader.broker.options_data import OptionContract
@@ -231,6 +232,10 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     # focused on other paths are unaffected.
     mark_stale_unsubmitted = AsyncMock(return_value=0)
 
+    record_position_snapshot = AsyncMock(return_value=0)
+    monkeypatch.setattr(
+        worker_module, "record_position_snapshot", record_position_snapshot
+    )
     monkeypatch.setattr(worker_module, "get_pool", get_pool)
     monkeypatch.setattr(worker_module, "enqueue", enqueue)
     monkeypatch.setattr(worker_module, "get_account", get_account)
@@ -2151,3 +2156,82 @@ async def test_tick_filter_mode_skipped_submission_disposition(
     assert engine.dispositions is not None
     ((_key, label),) = engine.dispositions.items()
     assert label == "skipped_by_flag_or_prior_failure"
+
+
+# ------------- Phase D1: per-tick position snapshot persistence -------------
+
+
+async def test_tick_persists_position_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    short = PositionSnapshot(
+        symbol="SPY260904P00050000", qty=Decimal("-2"), side="short",
+        avg_entry_price=Decimal("1.10"), current_price=Decimal("0.90"),
+        market_value=Decimal("-180"), unrealized_pl=Decimal("40"),
+        unrealized_intraday_pl=None,
+    )
+    shares = PositionSnapshot(
+        symbol="SOFI", qty=Decimal("200"), side="long",
+        avg_entry_price=Decimal("18.50"), current_price=Decimal("18.10"),
+        market_value=Decimal("3620"), unrealized_pl=Decimal("-80"),
+        unrealized_intraday_pl=None,
+    )
+    _patch_dependencies["list_short_option_positions"].return_value = [short]
+    _patch_dependencies["list_long_equity_positions"].return_value = [shares]
+
+    await worker_module.StrategyWorker().tick()
+
+    recorder = _patch_dependencies["record_position_snapshot"]
+    recorder.assert_awaited_once()
+    positions = recorder.await_args.args[0]
+    assert [p.symbol for p in positions] == ["SPY260904P00050000", "SOFI"]
+    assert recorder.await_args.kwargs["account_number"] is None
+
+
+async def test_tick_skips_snapshot_when_market_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=False)),
+    )
+    await worker_module.StrategyWorker().tick()
+    _patch_dependencies["record_position_snapshot"].assert_not_awaited()
+
+
+async def test_tick_skips_snapshot_when_book_fetch_partial(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """A partial book (long-equity fetch failed) is never written."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["list_long_equity_positions"].side_effect = RuntimeError(
+        "alpaca down"
+    )
+    await worker_module.StrategyWorker().tick()
+    _patch_dependencies["record_position_snapshot"].assert_not_awaited()
+
+
+async def test_tick_survives_snapshot_persist_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["record_position_snapshot"].side_effect = RuntimeError(
+        "db down"
+    )
+    summary = await worker_module.StrategyWorker().tick()
+    assert "Strategy Tick" in summary
+    _patch_dependencies["enqueue"].assert_awaited()

@@ -48,3 +48,23 @@ services:
         sync: false
       - key: DATABASE_URL_RO
         sync: false
+
+  # Phase D1: read-only web dashboard. Free tier (spins down when idle;
+  # first visit after a quiet spell takes a few seconds to wake). Same
+  # Docker image as the bot, different start command. Holds ONLY the
+  # read-only DSN and the page token: no broker keys, no Telegram
+  # token, no write-capable DB credentials.
+  - type: web
+    name: kai-trader-dashboard
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: uv run python -m kai_trader.dashboard.main
+    plan: free
+    region: singapore
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL_RO
+        sync: false
+      - key: DASHBOARD_TOKEN
+        generateValue: true

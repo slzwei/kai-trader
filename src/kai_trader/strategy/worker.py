@@ -66,6 +66,7 @@ from kai_trader.db.orders import (
     pending_orders,
     record_intent,
 )
+from kai_trader.db.position_snapshots import record_position_snapshot
 from kai_trader.db.sleeve_config import SleeveConfig, get_all_sleeves
 from kai_trader.db.system_flags import get_all_flags
 from kai_trader.logging import get_logger
@@ -624,11 +625,31 @@ class StrategyWorker:
         # B10: held equity is fetched once for the CC builder and the tick
         # render. Assignment detection no longer keys off it (see
         # _handle_assignments), so a wheeled name cannot be mis-flagged.
+        held_equity_fetch_failed = False
         try:
             held_equity = await list_long_equity_positions()
         except Exception as exc:
             _log.warning("strategy.held_equity.fetch_failed", error=str(exc))
             held_equity = []
+            held_equity_fetch_failed = True
+
+        # Phase D1: persist the position book this tick already fetched so
+        # the read-only web dashboard renders near-live positions from
+        # Postgres alone (no broker keys near the web service). Skipped
+        # when either fetch failed, so a partial book is never written as
+        # if it were the whole book. Best-effort: the dashboard is never
+        # worth a tick.
+        if not shorts_fetch_failed and not held_equity_fetch_failed:
+            try:
+                await record_position_snapshot(
+                    [*existing_shorts, *held_equity],
+                    account_number=account.account_number or None,
+                )
+            except Exception as exc:
+                _log.warning(
+                    "strategy.position_snapshot.persist_failed", error=str(exc)
+                )
+
         assignments_recorded = await self._handle_assignments()
         call_intents, call_diagnostics = await self._build_call_intents(
             held=held_equity,

@@ -23,6 +23,10 @@ dependencies = [
     "yfinance>=0.2.40,<1",
     "lxml>=5.0,<7",
     "anthropic>=0.39,<1",
+    # Phase D1: the read-only web dashboard service. Same image as the
+    # bot (one pyproject), different dockerCommand on Render.
+    "fastapi>=0.110,<1",
+    "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
