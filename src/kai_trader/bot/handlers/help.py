@@ -33,6 +33,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/close_confirm", "confirm a staged /close within 30 seconds"),
     ("/decisions", "applied changes from chat approvals, /decisions N for last N"),
     ("/dlq", "notifications stuck after retries, last 7 days"),
+    ("/ai_status", "AI decision layer mode, model, and today's TAKE/REJECT counters"),
 ]
 
 

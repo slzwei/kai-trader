@@ -26,6 +26,11 @@ import asyncio
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+from kai_trader.ai.decision import (
+    AIFilterOutcome,
+    build_decision_context,
+    get_default_engine,
+)
 from kai_trader.bot.formatting import format_sgt_timestamp
 from kai_trader.broker.alpaca import (
     OrderStatusSnapshot,
@@ -72,7 +77,11 @@ from kai_trader.risk.gate import (
     ApprovedIntent,
 )
 from kai_trader.strategy.assignment import detect_assignments, record_assignment
-from kai_trader.strategy.candidates import build_approved_intents_with_diagnostics
+from kai_trader.strategy.candidates import (
+    AIProposalFilter,
+    TradeIntent,
+    build_approved_intents_with_diagnostics,
+)
 from kai_trader.strategy.clock import get_clock_snapshot
 from kai_trader.strategy.covered_calls import (
     CallBuildDiagnostics,
@@ -136,6 +145,12 @@ ROLL_CLOSE_FILL_POLL_SECONDS = 3.0
 # id-less and non-terminal after this long is a zombie that
 # reconciliation can never resolve (it only polls rows with an id).
 STALE_UNSUBMITTED_MAX_AGE = timedelta(hours=1)
+
+# Phase A1: the AI decision engine is resolved through this module-level
+# name so tests can stub it and so the process-wide singleton (whose
+# decision cache spans ticks) is constructed lazily, only when FILTER
+# mode is actually on.
+get_ai_engine = get_default_engine
 
 # H1: strategy-tick mutex. Two code paths can otherwise run a tick
 # concurrently: the scheduled worker vs /trade_now (which constructs a
@@ -526,6 +541,36 @@ class StrategyWorker:
             if last_at >= post_pt_cutoff
         )
 
+        # Phase A1: AI selection between screener and gate. FILTER mode
+        # hands the engine to the builder as a closure; OFF mode passes
+        # None and the pipeline is byte-identical to Phase R1. Failures
+        # inside the engine fail closed per candidate; a failure of the
+        # closure itself is treated by the builder as reject-all for NEW
+        # entries. Rolls and profit-takes already ran above, and
+        # assignment detection plus covered calls below never route
+        # through the filter, so position management cannot be blocked
+        # by AI availability.
+        ai_outcome: AIFilterOutcome | None = None
+        ai_filter: AIProposalFilter | None = None
+        if settings.ai_decision_mode == "filter":
+            engine = get_ai_engine()
+            decision_ctx = build_decision_context(
+                regime=regime,
+                account=account,
+                existing_short_puts=shorts_for_caps,
+            )
+
+            async def _ai_filter(
+                proposals: list[TradeIntent],
+            ) -> list[TradeIntent]:
+                nonlocal ai_outcome
+                ai_outcome = await engine.evaluate_proposals(
+                    proposals, decision_ctx
+                )
+                return list(ai_outcome.taken)
+
+            ai_filter = _ai_filter
+
         if shorts_fetch_failed:
             approved: list[ApprovedIntent] = []
             diagnostic_warnings = [
@@ -544,6 +589,7 @@ class StrategyWorker:
                 existing_short_puts=shorts_for_caps,
                 today_already_deployed=today_already_deployed,
                 cooldown_symbols=cooldown_symbols,
+                ai_filter=ai_filter,
                 # Phase 5 retuning (2026-05-09): IV/RV gate disabled. The
                 # IV percentile filter is the primary VRP signal; running
                 # both gates double-rejected candidates in the 8-name
@@ -557,8 +603,10 @@ class StrategyWorker:
         submitted: list[str] = []
         skipped: list[str] = []
         failed: list[str] = []
+        entry_outcomes: dict[tuple[str, str], str] = {}
         for item in approved:
             outcome = await self._submit_intent(item, flags)
+            entry_outcomes[(item.intent.sleeve, item.intent.option_symbol)] = outcome
             label = f"{item.intent.symbol} P{item.intent.strike}"
             if outcome == "submitted":
                 submitted.append(label)
@@ -566,6 +614,9 @@ class StrategyWorker:
                 failed.append(label)
             else:
                 skipped.append(label)
+
+        if ai_outcome is not None:
+            await self._update_ai_dispositions(ai_outcome, entry_outcomes)
 
         # Covered-call leg. Assignment detection (OPASN-driven, idempotent)
         # records the audit row for any newly assigned put; the CC builder
@@ -621,6 +672,11 @@ class StrategyWorker:
                 diagnostic_warnings=diagnostic_warnings,
                 cc_diagnostic_warnings=call_diagnostics.warning_lines(),
                 today=today,
+                ai_lines=(
+                    tuple(ai_outcome.summary_lines())
+                    if ai_outcome is not None
+                    else ()
+                ),
             )
         )
         await enqueue(summary, "info", channel="telegram")
@@ -977,6 +1033,39 @@ class StrategyWorker:
 
         await mark_status(row_id, "failed", error_text=_format_error_text(result))
         return "failed"
+
+    async def _update_ai_dispositions(
+        self,
+        outcome: AIFilterOutcome,
+        entry_outcomes: dict[tuple[str, str], str],
+    ) -> None:
+        """Upgrade forwarded AI rows with the downstream result.
+
+        Best-effort audit bookkeeping: any failure logs and moves on,
+        never touching the tick outcome.
+        """
+        try:
+            labels = {
+                "submitted": "submitted",
+                "failed": "submit_failed",
+                "skipped": "skipped_by_flag_or_prior_failure",
+            }
+            dispositions: dict[tuple[str, str], str] = {}
+            for evaluation in outcome.evaluations:
+                if not evaluation.is_take:
+                    continue
+                submit_outcome = entry_outcomes.get(evaluation.key)
+                if submit_outcome is None:
+                    dispositions[evaluation.key] = "gate_rejected"
+                else:
+                    dispositions[evaluation.key] = labels.get(
+                        submit_outcome, submit_outcome
+                    )
+            await get_ai_engine().update_dispositions(outcome, dispositions)
+        except Exception as exc:
+            _log.warning(
+                "ai.decision.disposition_update_failed", error=str(exc)
+            )
 
     async def _handle_profit_takes(
         self,

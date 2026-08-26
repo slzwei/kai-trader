@@ -180,6 +180,12 @@ kai-trader/
 | WEEKLY_CHART_UTC_TIME | no       | `HH:MM` UTC for the weekly chart post. Default `00:00`. |
 | WEEKLY_CHART_ENABLED  | no       | `true` (default) or `false` to suppress the weekly chart entirely. |
 | EODHD_API_KEY         | strongly recommended | EODHD Calendar API key. Primary earnings source for the live bot (`src/kai_trader/strategy/earnings.py`) with yfinance as fallback, and required by the backtest harness. Without it the live bot falls through to yfinance only; coverage gaps trigger fail-closed unknown-skips across the universe. |
+| AI_DECISION_MODE      | no       | `off` (default) or `filter`. `filter` lets the AI decision layer TAKE/REJECT screened CSP candidates before the risk gate; failures fail closed for new entries. Position management never depends on it. |
+| AI_DECISION_MODEL     | no       | Claude model id for the decision layer. Default `claude-sonnet-4-6`. Persisted with every decision. |
+| AI_DECISION_TIMEOUT_SECONDS | no | Per-candidate request ceiling. Default 30. |
+| AI_DECISION_TICK_BUDGET_SECONDS | no | Whole-tick AI ceiling; unevaluated candidates are rejected fail-closed. Default 120. |
+| AI_DECISION_MAX_CONCURRENCY | no | Concurrent decision requests. Default 3. |
+| AI_DECISION_CACHE_TTL_MINUTES | no | Decision reuse window per contract/regime/earnings/trend/premium bucket. Default 30. |
 
 ## Conventions
 
@@ -213,8 +219,40 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, 5c, 5d, 5e, **and R1** shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, 5c, 5d, 5e, R1, **and A1** shipped:
 
+- Phase A1 (2026-08-26) is the first operational AI decision layer,
+  governing NEW CSP entries only. New package `kai_trader/ai/`
+  (models, prompts, context, providers, client, decision): the
+  deterministic screener's ranked proposals pass through
+  `AIDecisionEngine.evaluate_proposals`, which asks a Claude model
+  (default `claude-sonnet-4-6`, configurable via AI_DECISION_MODEL,
+  prompt version persisted) for a strictly validated TAKE/REJECT with
+  confidence, wheel_suitability, event risk, fundamental view, risk
+  flags, and thesis. Only TAKE candidates proceed, reordered by
+  `final_score = quant_composite * wheel_suitability`, into the
+  UNCHANGED deterministic risk gate and `ApprovedIntent` submission
+  path. The hook is `ai_filter` on
+  `build_approved_intents_with_diagnostics`; it can only shrink and
+  reorder the screener's own proposals (foreign, duplicated, or
+  mutated candidates are discarded). Modes via AI_DECISION_MODE:
+  `off` (default; behaviour byte-identical to R1, pinned by parity
+  tests) and `filter`. Every failure (timeout, malformed output,
+  invalid enum, provider error, missing key, tick budget) fails
+  CLOSED for new entries and never touches rolls, profit-takes,
+  assignments, covered calls, or reconciliation. Every evaluation,
+  TAKE and REJECT alike, is persisted to the new `ai_decisions` table
+  (migration 035) with the full candidate packet, model/prompt
+  lineage, tokens, latency, cost estimate, source freshness, and
+  final pipeline disposition. Event context comes from yfinance
+  headlines plus the existing earnings module, freshness-stamped,
+  with EODHD degradation surfaced honestly. Telegram: the tick
+  summary gains an "AI decisions" section and `/ai_status` shows
+  mode, model, and today's counters. The AI package holds no broker
+  imports and cannot construct `ApprovedIntent` (AST hygiene tests
+  enforce this). Also ships the M4 security fix: Kai's chat
+  `read_file`/`list_dir` refuse `.env*` (except `.env.example`), key
+  and certificate files, and `.ssh`/`.aws`/`.gnupg` paths.
 - Phase R1 (2026-08-26) is a behaviour-preserving safety refactor that
   prepares the repo for a future quant/AI decision layer. The cap
   matrix (total deployment, options buying power, per-name notional,

@@ -233,3 +233,51 @@ async def test_tick_advisory_lock_mutual_exclusion(
     finally:
         await first.close()
         await second.close()
+
+
+@pytest.mark.skipif(not _enabled(), reason="KAI_SCHEMA_INTEGRATION_TEST != 1")
+async def test_ai_decisions_round_trip(
+    _apply_migrations_once: None,
+) -> None:
+    """Migration 035: an AI decision row inserts and aggregates cleanly."""
+    from decimal import Decimal
+
+    from kai_trader.db.ai_decisions import (
+        decisions_summary,
+        mark_disposition,
+        record_decision,
+    )
+
+    row_id = await record_decision(
+        sleeve="index_core",
+        symbol="SPY",
+        option_symbol="SPY261218P00050000",
+        decision="TAKE",
+        pipeline_disposition="forwarded_to_gate",
+        candidate_packet={"underlying": {"ticker": "SPY"}},
+        provider="anthropic",
+        model="claude-test-1",
+        prompt_version="1.0.0",
+        confidence=Decimal("0.850"),
+        ai_score=Decimal("0.900"),
+        quant_score=Decimal("0.745"),
+        final_score=Decimal("0.6705"),
+        event_risk="LOW",
+        fundamental_view="NEUTRAL",
+        risk_flags=[],
+        positive_factors=["stable"],
+        thesis="Round-trip test thesis.",
+        response_json={"decision": "TAKE"},
+        input_tokens=1000,
+        output_tokens=150,
+        latency_ms=2100,
+        cost_usd=Decimal("0.005250"),
+        cache_hit=False,
+        error=None,
+        source_freshness={"news_status": "ok"},
+    )
+    assert row_id
+    await mark_disposition(row_id, "submitted")
+    summary = await decisions_summary()
+    assert summary.total >= 1
+    assert summary.takes >= 1

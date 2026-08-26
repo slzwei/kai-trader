@@ -22,6 +22,7 @@ from telegram.ext import (
 
 from kai_trader.bot.handlers import (
     account,
+    ai_status,
     approval,
     chain,
     chat,
@@ -142,6 +143,7 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CommandHandler("close_confirm", close.handle_confirm))
     app.add_handler(CommandHandler("decisions", decisions.handle))
     app.add_handler(CommandHandler("dlq", dlq.handle))
+    app.add_handler(CommandHandler("ai_status", ai_status.handle))
 
     # Free-form text from the owner is routed to the conversational
     # chat handler. Slash commands are matched by the CommandHandlers

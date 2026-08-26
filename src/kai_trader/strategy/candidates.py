@@ -420,6 +420,16 @@ class TradeIntent:
     scores: dict[str, str] = field(default_factory=dict, compare=False)
 
 
+# Phase A1: optional AI selection hook. Given the screener's ranked
+# proposals, returns the subset that should proceed to the risk gate
+# (possibly reordered). The composed pipeline enforces that the return
+# value can only SELECT from the exact proposals given: unknown or
+# duplicated entries are discarded and the screener's original objects
+# are forwarded, so a filter can never inject or mutate a candidate.
+# A raised exception fails closed to zero new entries for the tick.
+AIProposalFilter = Callable[[list["TradeIntent"]], Awaitable[list["TradeIntent"]]]
+
+
 def _is_sleeve_active(sleeve: SleeveConfig, regime: str) -> bool:
     """Sleeve activity rule.
 
@@ -749,6 +759,7 @@ async def build_approved_intents_with_diagnostics(
     rv30_provider: RV30Provider | None = None,
     iv_percentile_provider: IVPercentileProvider | None = None,
     iv_percentile_floor: Decimal = IV_PERCENTILE_FLOOR_DEFAULT,
+    ai_filter: AIProposalFilter | None = None,
 ) -> tuple[list[ApprovedIntent], BuildDiagnostics]:
     """Screen, score, and gate: the worker's submission-path entry point.
 
@@ -1012,6 +1023,12 @@ async def build_approved_intents_with_diagnostics(
             }
             if contract.implied_volatility is not None:
                 scores["iv"] = str(contract.implied_volatility)
+            if contract.gamma is not None:
+                scores["gamma"] = str(contract.gamma)
+            if contract.theta is not None:
+                scores["theta"] = str(contract.theta)
+            if contract.vega is not None:
+                scores["vega"] = str(contract.vega)
             if earnings_checked:
                 scores["earnings"] = "outside_window"
             if trend_checked:
@@ -1051,6 +1068,41 @@ async def build_approved_intents_with_diagnostics(
                 },
             )
             proposals.append(proposal)
+
+    # Phase A1: optional AI selection between screen and gate. The
+    # filter may only SHRINK and REORDER the screened proposals: its
+    # return value is matched back to the screener's own objects by
+    # (sleeve, option_symbol), so an injected, duplicated, or mutated
+    # candidate is discarded rather than traded. A filter exception
+    # fails closed to zero new entries this tick; management flows
+    # (rolls, profit-takes, assignments, covered calls) never pass
+    # through here and are unaffected.
+    if ai_filter is not None and proposals:
+        proposed_by_key = {(p.sleeve, p.option_symbol): p for p in proposals}
+        try:
+            selected = await ai_filter(list(proposals))
+        except Exception as exc:
+            _log.error(
+                "ai.decision.filter_failed_fail_closed",
+                error=f"{type(exc).__name__}: {exc}",
+                candidates=len(proposals),
+            )
+            selected = []
+        filtered: list[TradeIntent] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in selected:
+            key = (candidate.sleeve, candidate.option_symbol)
+            original = proposed_by_key.get(key)
+            if original is None or key in seen:
+                _log.warning(
+                    "ai.decision.filter_returned_unknown_candidate",
+                    sleeve=candidate.sleeve,
+                    option_symbol=candidate.option_symbol,
+                )
+                continue
+            seen.add(key)
+            filtered.append(original)
+        proposals = filtered
 
     ctx = RiskContext(
         equity=equity,

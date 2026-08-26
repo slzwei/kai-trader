@@ -58,13 +58,38 @@ _GREP_OUTPUT_CAP = 8000  # bytes
 _READ_FILE_CAP = 200_000  # bytes
 
 
+# Secret-bearing files Kai must never read, even inside the repo root.
+# Local runs keep a real .env at the repo root; without this denylist
+# the read_file tool could pull live credentials into chat history and
+# the Anthropic API. ``.env.example`` stays readable: it is committed,
+# placeholder-only reference material.
+_SECRET_BASENAMES = frozenset(
+    {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials"}
+)
+_SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".der")
+_SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg"})
+
+
+def _is_secret_path(candidate: Path) -> bool:
+    name = candidate.name.lower()
+    if name == ".env" or (name.startswith(".env.") and name != ".env.example"):
+        return True
+    if name in _SECRET_BASENAMES:
+        return True
+    if any(name.endswith(suffix) for suffix in _SECRET_SUFFIXES):
+        return True
+    return any(part.lower() in _SECRET_DIRS for part in candidate.parts)
+
+
 def _safe_path(rel: str) -> Path:
-    """Resolve ``rel`` against the repo root and reject escapes."""
+    """Resolve ``rel`` against the repo root; reject escapes and secrets."""
     if not rel:
         raise ValueError("path must not be empty")
     candidate = (_repo_root() / rel).resolve()
     if not str(candidate).startswith(str(_repo_root())):
         raise ValueError("path resolves outside the repository")
+    if _is_secret_path(candidate):
+        raise ValueError("path is a secret-bearing file and cannot be accessed")
     return candidate
 
 

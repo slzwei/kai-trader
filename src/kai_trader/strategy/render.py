@@ -81,6 +81,10 @@ class TickRenderInputs:
     diagnostic_warnings: list[str] = field(default_factory=list)
     cc_diagnostic_warnings: list[str] = field(default_factory=list)
     today: date | None = None
+    # Phase A1: pre-rendered AI decision lines from the tick's
+    # AIFilterOutcome. Empty when the AI decision mode is off, which
+    # also keeps the rendered message byte-identical to Phase R1.
+    ai_lines: tuple[str, ...] = ()
 
 
 def _committed_collateral(short_options: list[PositionSnapshot]) -> Decimal:
@@ -323,6 +327,10 @@ def render_tick(inputs: TickRenderInputs) -> str:
     this_tick = _this_tick_section(inputs)
     if this_tick:
         sections.append(bold("This tick") + "\n" + pre(this_tick))
+    if inputs.ai_lines:
+        sections.append(
+            bold("AI decisions") + "\n" + pre("\n".join(inputs.ai_lines))
+        )
     open_block, count = _open_positions_section(inputs)
     if count > 0:
         sections.append(bold(f"Open positions ({count})") + "\n" + pre(open_block))

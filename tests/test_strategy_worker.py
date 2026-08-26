@@ -1932,3 +1932,222 @@ async def test_submit_intent_rejects_raw_trade_intent(
         await worker._submit_intent(raw, {})  # type: ignore[arg-type]
     _patch_dependencies["record_intent"].assert_not_awaited()
     _patch_dependencies["submit_short_put"].assert_not_awaited()
+
+
+# ------------- Phase A1: AI decision layer wiring -------------
+
+
+def _ai_decision(symbol: str, verdict: str, suitability: float = 0.9) -> Any:
+    from kai_trader.ai.models import AIDecision
+
+    return AIDecision(
+        symbol=symbol,
+        decision=verdict,  # type: ignore[arg-type]
+        confidence=0.85,
+        score=0.8,
+        event_risk="LOW",
+        fundamental_view="NEUTRAL",
+        wheel_suitability=suitability,
+        risk_flags=[] if verdict == "TAKE" else ["binary event in window"],
+        positive_factors=["stable"] if verdict == "TAKE" else [],
+        thesis="Deterministic fixture thesis for the tick test.",
+    )
+
+
+class FakeAIEngine:
+    """Engine stand-in: scripted verdicts, records disposition updates."""
+
+    def __init__(
+        self,
+        verdict: str = "TAKE",
+        raise_error: bool = False,
+        gate_drops: bool = False,
+    ) -> None:
+        self._verdict = verdict
+        self._raise = raise_error
+        self._gate_drops = gate_drops
+        self.evaluated: list[str] = []
+        self.dispositions: dict[tuple[str, str], str] | None = None
+
+    async def evaluate_proposals(self, proposals: Any, ctx: Any) -> Any:
+        from decimal import Decimal as D
+
+        from kai_trader.ai.decision import AIFilterOutcome, Evaluation
+
+        if self._raise:
+            raise RuntimeError("ai engine exploded")
+        evaluations = []
+        for i, p in enumerate(proposals):
+            self.evaluated.append(p.symbol)
+            decision = _ai_decision(p.symbol, self._verdict)
+            evaluations.append(
+                Evaluation(
+                    proposal=p,
+                    decision=decision,
+                    error=None,
+                    cache_hit=False,
+                    latency_ms=1500,
+                    input_tokens=1000,
+                    output_tokens=150,
+                    cost_usd=0.005,
+                    final_score=D("0.5"),
+                    row_id=f"row-{i}",
+                    model="claude-test-1",
+                    prompt_version="1.0.0",
+                )
+            )
+        taken = [] if self._gate_drops else [
+            e.proposal for e in evaluations if e.is_take
+        ]
+        return AIFilterOutcome(taken=taken, evaluations=evaluations)
+
+    async def update_dispositions(
+        self, outcome: Any, dispositions: dict[tuple[str, str], str]
+    ) -> None:
+        self.dispositions = dispositions
+
+
+def _enable_filter_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    import kai_trader.config as config_module
+
+    monkeypatch.setenv("AI_DECISION_MODE", "filter")
+    config_module.reset_settings_cache()
+
+
+def _green_entry_world(
+    monkeypatch: pytest.MonkeyPatch,
+    deps: dict[str, AsyncMock],
+) -> None:
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    deps["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": False,
+    }
+    deps["get_sleeves"].return_value = [_sleeve()]
+    deps["get_chain"].return_value = [_put_contract()]
+    deps["submit_short_put"].return_value = SubmitResult(
+        submitted=True, alpaca_order_id="alpaca-1", order_status="accepted",
+        reason=None, flags={"trading_enabled": True, "kill_switch": False},
+    )
+
+
+async def test_tick_ai_off_by_default_never_touches_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Default mode is off: the engine is not even constructed."""
+
+    def _explode() -> Any:
+        raise AssertionError("engine must not be constructed in off mode")
+
+    monkeypatch.setattr(worker_module, "get_ai_engine", _explode)
+    _green_entry_world(monkeypatch, _patch_dependencies)
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "SPY P50" in summary
+    assert "AI decisions" not in summary
+    _patch_dependencies["submit_short_put"].assert_awaited_once()
+
+
+async def test_tick_filter_mode_take_submits_and_marks_disposition(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    _enable_filter_mode(monkeypatch)
+    engine = FakeAIEngine(verdict="TAKE")
+    monkeypatch.setattr(worker_module, "get_ai_engine", lambda: engine)
+    _green_entry_world(monkeypatch, _patch_dependencies)
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert engine.evaluated == ["SPY"]
+    _patch_dependencies["submit_short_put"].assert_awaited_once()
+    assert "AI decisions" in summary
+    assert "TAKE" in summary
+    assert engine.dispositions is not None
+    ((key, label),) = engine.dispositions.items()
+    assert key[0] == "index_core" and key[1].startswith("SPY")
+    assert label == "submitted"
+
+
+async def test_tick_filter_mode_reject_blocks_submission_only(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """AI REJECT blocks the new entry; every management flow still runs."""
+    _enable_filter_mode(monkeypatch)
+    engine = FakeAIEngine(verdict="REJECT")
+    monkeypatch.setattr(worker_module, "get_ai_engine", lambda: engine)
+    _green_entry_world(monkeypatch, _patch_dependencies)
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert engine.evaluated == ["SPY"]
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    _patch_dependencies["record_intent"].assert_not_awaited()
+    assert "REJECT" in summary
+    # Management flows are untouched by the AI verdict.
+    _patch_dependencies["evaluate_rolls"].assert_awaited_once()
+    _patch_dependencies["list_short_option_positions"].assert_awaited()
+    _patch_dependencies["list_long_equity_positions"].assert_awaited_once()
+    _patch_dependencies["get_assignment_activities"].assert_awaited_once()
+
+
+async def test_tick_filter_mode_engine_crash_fails_closed_tick_survives(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """An AI outage rejects new entries and leaves the tick healthy."""
+    _enable_filter_mode(monkeypatch)
+    engine = FakeAIEngine(raise_error=True)
+    monkeypatch.setattr(worker_module, "get_ai_engine", lambda: engine)
+    _green_entry_world(monkeypatch, _patch_dependencies)
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    # Tick completed: summary rendered and enqueued, management flows ran.
+    assert "Strategy Tick" in summary
+    _patch_dependencies["enqueue"].assert_awaited()
+    _patch_dependencies["evaluate_rolls"].assert_awaited_once()
+    _patch_dependencies["list_long_equity_positions"].assert_awaited_once()
+    _patch_dependencies["get_assignment_activities"].assert_awaited_once()
+
+
+async def test_tick_filter_mode_gate_rejection_recorded_as_disposition(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """A TAKE the gate then drops is marked gate_rejected, not submitted."""
+    _enable_filter_mode(monkeypatch)
+    engine = FakeAIEngine(verdict="TAKE", gate_drops=True)
+    monkeypatch.setattr(worker_module, "get_ai_engine", lambda: engine)
+    _green_entry_world(monkeypatch, _patch_dependencies)
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    assert engine.dispositions is not None
+    ((_key, label),) = engine.dispositions.items()
+    assert label == "gate_rejected"
+
+
+async def test_tick_filter_mode_skipped_submission_disposition(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    _enable_filter_mode(monkeypatch)
+    engine = FakeAIEngine(verdict="TAKE")
+    monkeypatch.setattr(worker_module, "get_ai_engine", lambda: engine)
+    _green_entry_world(monkeypatch, _patch_dependencies)
+    _patch_dependencies["has_failed_since"].return_value = True
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    assert engine.dispositions is not None
+    ((_key, label),) = engine.dispositions.items()
+    assert label == "skipped_by_flag_or_prior_failure"

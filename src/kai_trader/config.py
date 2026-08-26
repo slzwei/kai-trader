@@ -18,6 +18,7 @@ Environment = Literal["dev", "staging", "prod"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 StockFeed = Literal["iex", "sip"]
 OptionsFeedName = Literal["indicative", "opra"]
+AIDecisionMode = Literal["off", "filter"]
 
 
 class Settings(BaseSettings):
@@ -161,6 +162,62 @@ class Settings(BaseSettings):
             "Sign up at https://eodhd.com/."
         ),
     )
+
+    ai_decision_mode: AIDecisionMode = Field(
+        default="off",
+        alias="AI_DECISION_MODE",
+        description=(
+            "'off' (default): the strategy behaves exactly as before, no "
+            "AI is consulted. 'filter': the AI decision layer evaluates "
+            "screened CSP candidates and only TAKE candidates proceed to "
+            "the deterministic risk gate. Any AI failure fails closed for "
+            "new entries; position management never depends on this."
+        ),
+    )
+    ai_decision_model: str = Field(
+        default="claude-sonnet-4-6",
+        alias="AI_DECISION_MODEL",
+        description=(
+            "Claude model id for the decision layer. Configurable so the "
+            "business logic is never wired to one exact model name; the "
+            "model used is persisted with every decision."
+        ),
+    )
+    ai_decision_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        alias="AI_DECISION_TIMEOUT_SECONDS",
+        description="Per-request ceiling for one candidate evaluation.",
+    )
+    ai_decision_tick_budget_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        alias="AI_DECISION_TICK_BUDGET_SECONDS",
+        description=(
+            "Overall AI ceiling per strategy tick. Candidates still "
+            "unevaluated at the deadline are rejected fail-closed."
+        ),
+    )
+    ai_decision_max_concurrency: int = Field(
+        default=3,
+        ge=1,
+        alias="AI_DECISION_MAX_CONCURRENCY",
+        description="Concurrent decision requests per tick.",
+    )
+    ai_decision_cache_ttl_minutes: int = Field(
+        default=30,
+        ge=1,
+        alias="AI_DECISION_CACHE_TTL_MINUTES",
+        description=(
+            "How long a decision stays reusable for the same contract, "
+            "regime, earnings/trend status, and premium bucket."
+        ),
+    )
+
+    @property
+    def ai_decision_enabled(self) -> bool:
+        """True when any AI decision mode other than 'off' is active."""
+        return self.ai_decision_mode != "off"
 
     env: Environment = Field(default="dev", alias="ENV")
     log_level: LogLevel = Field(default="INFO", alias="LOG_LEVEL")

@@ -537,3 +537,50 @@ def test_format_age_buckets() -> None:
     assert tools._format_age(72_000) == "20.0h ago"
     assert tools._format_age(200_000) == "2.3d ago"
     assert tools._format_age(-5) == "in the future"
+
+
+# ------------- Phase A1: secret-bearing paths are unreadable -------------
+
+
+async def test_read_file_refuses_dot_env(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / ".env").write_text("TELEGRAM_BOT_TOKEN=real-secret")
+    monkeypatch.setattr(tools, "_REPO_ROOT", tmp_path)
+    result = json.loads(await tools.dispatch("read_file", {"path": ".env"}, proposed_by=1))
+    assert "secret-bearing" in result["error"]
+    assert "real-secret" not in json.dumps(result)
+
+
+async def test_read_file_refuses_env_variants_and_keys(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tools, "_REPO_ROOT", tmp_path)
+    for name in (".env.local", ".env.prod", "server.pem", "deploy.key", "id_rsa", "credentials"):
+        (tmp_path / name).write_text("secret material")
+        result = json.loads(
+            await tools.dispatch("read_file", {"path": name}, proposed_by=1)
+        )
+        assert "secret-bearing" in result.get("error", ""), name
+
+
+async def test_read_file_still_allows_env_example(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".env.example").write_text("TELEGRAM_BOT_TOKEN=placeholder")
+    monkeypatch.setattr(tools, "_REPO_ROOT", tmp_path)
+    result = json.loads(
+        await tools.dispatch("read_file", {"path": ".env.example"}, proposed_by=1)
+    )
+    assert result.get("content") == "TELEGRAM_BOT_TOKEN=placeholder"
+
+
+async def test_read_file_refuses_ssh_dir(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "known_hosts").write_text("host data")
+    monkeypatch.setattr(tools, "_REPO_ROOT", tmp_path)
+    result = json.loads(
+        await tools.dispatch("read_file", {"path": ".ssh/known_hosts"}, proposed_by=1)
+    )
+    assert "secret-bearing" in result["error"]
