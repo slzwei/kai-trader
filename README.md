@@ -1,244 +1,160 @@
 # Kai Trader
 
-Automated options wheel trading on Alpaca, controlled through a private
-Telegram bot, with all state in Supabase Postgres. Single-owner system
-designed for paper-first, then live with explicit flag flips.
+Automated options wheel trading on Alpaca with an AI decision layer,
+controlled through a private Telegram bot and a read-only web
+dashboard, with all state in Supabase Postgres. Single-owner system:
+paper burn-in first, live only after explicit flag flips.
 
 ## What this is
 
 A defensive, premium-capture wheel: sell cash-secured puts at a target
-delta, take profits early, roll when challenged for net credit, accept
-assignment when the math says so, then sell covered calls against held
-shares until called away. Repeat. The system is built around the
-single-sleeve, small-account configuration shipped by migration 018,
-optimised for accounts in the $25k-$100k range.
+delta, take profits early, roll challenged positions for net credit
+only, accept assignment when it comes, then sell covered calls against
+the shares until called away. Repeat.
 
-## How the strategy works
-
-### The universe
-
-One active sleeve (`index_core`) with a 30-name pool of cheap-liquid
-optionable underlyings. Each name has weekly options on Alpaca's OPRA
-feed and a low enough strike that one CSP fits inside a small account.
-
-| Bucket | Tickers |
-|---|---|
-| Defensive large-caps | F, T, BAC, PFE, KO, KVUE, VZ, INTC, CSCO, GE, KMI, KHC, MO, WBA |
-| Mid-cap growth / cyclical | HOOD, SOFI, PLTR, MU, MARA, RIOT, SNAP, RIVN |
-| Quality | WFC, GM, C |
-| Non-correlated ETFs | GDX, SLV, XLF, XLE, EEM |
-
-The two other sleeves (`stable_largecap`, `opportunistic`) are
-disabled. Re-enable them in `sleeve_config` if you want the original
-three-bucket allocation back.
-
-### Tick cadence
-
-The strategy worker runs every **5 minutes** during US market hours.
-Order reconciliation runs on every tick regardless of market state, so
-overnight fills are reflected at the next open. A separate
-`TradingStream` WebSocket subscribes to Alpaca `trade_updates` for
-real-time fill notifications; the 5-minute reconciliation is
-belt-and-suspenders.
-
-Each tick performs, in order:
-
-1. Reconcile any pending Alpaca orders.
-2. Skip if market is closed.
-3. Run the drawdown circuit breaker (auto-trips kill switch on breach).
-4. Skip if `kill_switch` is engaged (heartbeat only).
-5. Compute the regime, write a row only on transition.
-6. Evaluate rolls on existing short puts.
-7. Evaluate profit-takes on existing short puts.
-8. Build new CSP intents from the pool, submit the top-ranked picks.
-9. Detect put assignments, build and submit covered calls.
-10. Post a tick summary to Telegram.
-
-### Strike selection
-
-For each whitelisted underlying:
-
-1. Skip if next earnings falls inside the DTE window
-   (`earnings_blackout_enabled=true`, yfinance lookup, fail-open on
-   error).
-2. Fetch the option chain.
-3. Pick the put whose absolute delta is closest to the target for the
-   current regime, with expiration inside the sleeve's 7-10 DTE band.
-
-| Regime | Target put delta | Target call delta |
-|---|---|---|
-| `risk_on` | -0.40 | +0.30 |
-| `neutral` | -0.30 | +0.30 |
-| `risk_off` | no new entries | no new entries |
-
-### Ranking the candidates
-
-Once a strike is picked per symbol, candidates are scored and the
-greedy fill takes the best:
+Since Phase A1 the pipeline has four layers, and the ordering is the
+whole point:
 
 ```
-score = annualised_yield_pct × spread_quality
-
-annualised_yield_pct = (mid / strike) × (365 / DTE) × 100
-spread_quality       = 1 - (ask - bid) / mid / 0.30   (0 .. 1)
+market/options data (Alpaca chains, quotes, bars; VIX via yfinance)
+        |
+deterministic screener        picks strikes, applies filters, ranks
+        |
+AI decision layer             TAKE / REJECT per candidate (Claude)
+        |
+deterministic risk gate       sizes and caps; the final word on money
+        |
+flag-gated execution          re-reads kill_switch before every order
+        |
+Alpaca (paper by default)
 ```
 
-A spread of 30% or more of mid hard-rejects the candidate (the OPRA
-feed often has stale quotes on thin names; a wide-spread headline
-yield is fiction because you cannot fill at the bid). Annualisation
-makes a 7-day and a 10-day candidate directly comparable.
+The AI can only shrink and reorder what the screener produced. It
+cannot call the broker, cannot construct an `ApprovedIntent`, cannot
+bypass the gate, and cannot touch flags or risk limits; AST hygiene
+tests in `tests/test_ai_pipeline.py` enforce all of that. Every AI
+failure (timeout, malformed output, missing key, budget overrun) fails
+CLOSED for new entries, and position management never routes through
+the AI at all.
 
-The greedy fill iterates score-descending and stops as soon as any
-cap binds. Stable sort means whitelist order breaks ties.
+## The tick, every 5 minutes during US market hours
 
-### Capital deployment caps
+1. Reconcile pending Alpaca orders (runs even when the market is
+   closed, so overnight fills land at the next open).
+2. Drawdown circuit breaker: equity down 7% from the 7-day high-water
+   mark auto-engages `kill_switch`.
+3. Skip if the market is closed or the kill switch is on.
+4. Compute the regime (VIX + SPY moving averages); log transitions.
+5. Evaluate rolls on challenged short puts (net-credit-only; the close
+   leg must FILL before the reopen goes out).
+6. Evaluate profit-takes (default: close at 50% of credit captured).
+7. Screen new CSP candidates, pass the cap-viable ones through the AI
+   underwriter, gate the TAKEs, submit the survivors at chain mid.
+8. Detect assignments from Alpaca's OPASN feed; sell covered calls
+   against held shares (cost-basis floor, minimum credit).
+9. Persist the position book for the dashboard, post a tick summary to
+   Telegram.
 
-Three caps clamp how much of the account is at risk in cash-secured
-puts. All three are enforced *after* subtracting collateral already
-locked in open short puts, so the strategy will not re-attempt to
-open contracts you already hold.
+Ticks are serialised by a Postgres advisory lock, so `/trade_now`, the
+scheduled loop, and a deploy crossover can never run two ticks at once.
 
-| Cap | Value | Source |
-|---|---|---|
-| Total deployment | 70% of equity | `TOTAL_DEPLOYMENT_CAP_PCT` in `candidates.py` |
-| Sleeve | 100% of equity (`index_core` is the only active sleeve) | `sleeve_config.target_pct` |
-| Per-symbol | tiered by equity (see below) | `_PER_SYMBOL_CAP_TIERS` in `candidates.py` |
-| Hard contract ceiling | 10 contracts per symbol | `MAX_CONTRACTS_PER_SYMBOL` |
+## The screener (deterministic)
 
-The per-symbol cap loosens for smaller accounts so a single normal
-CSP can clear:
-
-| Equity | Per-symbol cap |
-|---|---|
-| under $50k | 100% |
-| $50k to $150k | 60% |
-| $150k to $500k | 30% |
-| $500k or more | 15% |
-
-### Per-tick entry cap
-
-A single tick will submit at most **2 new CSPs per sleeve**
-(`sleeve_config.max_new_entries_per_tick`, default 2). With a
-30-name pool, this prevents one volatile day from flooding the book.
-Additional candidates wait for the next tick.
-
-### Profit-take
-
-For each open short put: read the original credit from the filled CSP
-order, look up the current ask, and submit a buy-to-close at the ask
-when
+Per whitelisted symbol, in order: cool-down check, earnings blackout,
+50-DMA trend filter, chain fetch, strike selection (put closest to the
+regime's target delta inside the sleeve's DTE band), premium floors,
+then scoring:
 
 ```
-current_ask <= original_credit × (1 - profit_take_pct)
+score = annualised_yield x spread_quality
+annualised_yield = (mid / strike) x (365 / DTE)
+spread_quality   = 1 - (spread / mid) / 0.30      (>=30% spread rejects)
 ```
 
-Default `profit_take_pct = 0.50`, so the system closes at 50% of max
-credit captured. Capital released by a profit-take is available on
-the same tick for new entries.
+**Earnings blackout is fail-closed** and reads the union of three
+independent calendars (EODHD, Finnhub, yfinance): the soonest upcoming
+date any source reports wins, and no confirmed date at all means skip.
+The trend filter is fail-closed the same way. Both exist because the
+strategy's worst realized losses came from assignment into
+deteriorating names.
 
-### Rolling
+## The AI decision layer (Phase A1)
 
-A short put becomes a roll candidate when its live delta crosses
-`roll_trigger_delta` (default `0.50`). The roll candidate must be:
+Mode is set by `AI_DECISION_MODE`: `off` (byte-identical to the pure
+deterministic strategy, pinned by golden parity tests) or `filter`
+(live since 2026-08-26). In filter mode each screened candidate gets a
+structured packet (price, greeks, economics, breakeven and cushion,
+volatility context, quant scores, portfolio context, recent headlines
+with freshness stamps, and an explicit list of what data is missing)
+and a Claude model answers one underwriting question: assuming
+assignment is realistic, do we want to own this at the breakeven? The
+answer is a strictly validated TAKE or REJECT with confidence,
+wheel-suitability, event risk, fundamental view, risk flags, and a
+thesis. There is no maybe.
 
-- Same underlying.
-- Strike strictly **lower** (further OTM).
-- Expiration **on or after** the current expiration, inside the DTE
-  band.
-- Closest to the regime's target delta among qualifying contracts.
+TAKEs re-rank by `final_score = quant_composite x wheel_suitability`
+and proceed to the gate. Candidates with provably zero per-name
+headroom skip the AI entirely (the gate would reject them regardless,
+so no tokens are spent on foregone conclusions). Decisions are cached
+per contract, prompt version, regime, earnings/trend status, and
+premium bucket. Every evaluation, TAKE and REJECT alike, is persisted
+to `ai_decisions` with the full packet, model and prompt lineage,
+tokens, latency, cost, and the final pipeline disposition. `/ai_status`
+shows today's counters.
 
-Rolls only execute for **net credit**. If `new_bid - current_ask <= 0`,
-the position holds and the operator sees a `no_net_credit_candidate`
-line in the tick summary. Better to accept assignment risk than lock
-in a debit.
+## The risk gate (Phase R1)
 
-`risk_off` does **not** block rolls (rolling reduces risk on a
-challenged position).
+`kai_trader/risk/gate.py` owns every cap, and the worker's submission
+path only accepts gate-issued `ApprovedIntent` values (enforced under
+`mypy --strict` plus a runtime guard). Caps, all applied net of
+collateral already locked by open positions and working unfilled
+orders: total deployment vs equity, a haircut against the broker's
+live options buying power, a per-name notional cap, a per-symbol
+contract ceiling, per-tick and per-day deployment velocity caps, and
+entry cool-downs. Constants live in `gate.py`; per-sleeve parameters
+(deltas, DTE band, profit-take, roll trigger, whitelists) live in the
+`sleeve_config` table and are visible live via `/sleeves`.
 
-### Covered calls
+## The weekly universe review (Phase U1)
 
-After CSP processing each tick, the worker:
+Which names the wheel may be assigned is the real risk surface, so it
+is machine-proposed and human-ratified. Weekly (and on demand via
+`/universe_review`), a curated candidate pool plus the current
+whitelists are screened deterministically, then an AI curator judges
+each survivor: ADD or SKIP for pool names, KEEP or RETIRE for
+incumbents. Guardrails cap every run at 2 adds and 2 retires with
+sleeve sizes bounded 4-10, and the output is only ever a
+`pending_changes` proposal with the thesis attached. Nothing applies
+until the owner taps Approve, on Telegram or on the dashboard. Retired
+names keep being managed to close; only new entries stop.
 
-1. Detects assignments by matching held long equity against
-   recently-filled CSPs. Records an idempotent audit row in `orders`.
-2. For each held block (100 shares per contract), finds the sleeve
-   that whitelists the underlying and picks the call closest to
-   `target_delta_call` (default 0.30) inside the DTE band.
-3. Submits the CC at bid. Quantity = `floor(shares / 100)`.
+## Surfaces
 
-No capital math here. The shares are the collateral.
-
-### Regime classifier
-
-Pure function over VIX and SPY indicators (yfinance ^VIX + Alpaca
-daily SPY bars):
-
-```
-risk_off  if  VIX > 25
-          OR  SPY price < SPY 50DMA
-          OR  VIX 5-day change > +30%
-
-risk_on   if  VIX < 17
-          AND SPY price > SPY 20DMA
-          AND SPY realized vol (10d) < 15%
-
-neutral   otherwise
-```
-
-A row is written to `regime_history` only on transition.
-
-### Defensive layers
-
-- **Three flags**, all enforced inside the broker submit calls as the
-  last gate before HTTP:
-  - `kill_switch=true` blocks every new order. Closes still allowed.
-  - `trading_enabled=false` blocks new entries (puts and calls).
-    Rolls still allowed.
-  - `new_entries_enabled=false` blocks new puts. Rolls and closes
-    proceed.
-- **Drawdown circuit breaker**: if equity drops 7% or more from the
-  7-day high-water mark, `kill_switch` is auto-engaged and a
-  critical-priority Telegram notification fires. Idempotent; will
-  not re-notify on subsequent ticks while still tripped.
-- **Earnings blackout**: per-sleeve flag skips any underlying whose
-  next earnings announcement falls inside the sleeve's DTE window.
-  yfinance lookup with 24-hour per-symbol cache; fail-open on lookup
-  errors.
-- **Retry-storm suppressor**: an option contract that already has a
-  failed `open_short_put` row from earlier today is skipped without
-  another DB write or HTTP call. Stops the 5-minute tick from spamming
-  Alpaca with the same failing strike.
-- **Spread-quality reject**: any candidate with a bid-ask spread of
-  30% or more of mid never enters the ranker.
-
-### Authority and overrides
-
-The strategy never writes to its own config. Free-form Telegram text
-from the owner routes to Kai (the conversational handler), which can
-read state and **propose** changes via inline Approve / Reject /
-Modify buttons. The applier in `kai_trader.approvals.applier` is the
-only writer for config mutations and writes a `decision_log` row for
-every applied change. Direct `/flag`, `/kill`, `/close`,
-`/close_confirm`, and `/trade_now` slash commands stay authoritative
-for time-sensitive operator actions.
-
-### Where the numbers live
-
-| Setting | Location |
-|---|---|
-| Sleeve config (whitelist, deltas, DTE band, profit-take, roll trigger, per-tick cap, earnings flag) | `sleeve_config` table; latest values in migrations `006`, `009`, `017`, `018` |
-| Total deployment cap, per-symbol tiers, hard contract ceiling, spread cutoff | `src/kai_trader/strategy/candidates.py` |
-| Drawdown threshold and lookback | `src/kai_trader/strategy/drawdown.py` |
-| Regime thresholds | `src/kai_trader/strategy/regime.py` |
-| Tick cadence | `StrategyWorker.poll_interval` in `src/kai_trader/strategy/worker.py` |
+- **Telegram bot**: the control plane. Slash commands for reads and
+  explicit operator actions (`/flag`, `/kill`, `/close`, `/trade_now`,
+  `/ai_status`, `/universe_review`, `/help` for the full list).
+  Free-form text routes to Kai, a conversational layer with read-only
+  tools that can propose (never apply) config changes. Strangers get
+  silent-ignored; every inbound command is audited.
+- **Web dashboard** (`kai-trader-dashboard`, Render free tier): account
+  stats, 7-day equity curve, live position book, recent orders, the
+  last 20 AI decisions with theses, and Pending approvals with
+  Approve/Reject buttons. It authenticates to Postgres as the
+  read-only `kai_chat_ro` role and holds no broker keys or Telegram
+  token; its approval buttons only file requests into `web_actions`,
+  which the bot validates and executes with its own credentials.
+  Access is gated by `DASHBOARD_TOKEN` (one `?token=` visit sets a
+  30-day cookie).
 
 ## Prerequisites
 
 - Python 3.11 or newer
 - [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
-- A Supabase project (you need the project URL and the Postgres password)
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Your own Telegram user ID (get it from [@userinfobot](https://t.me/userinfobot))
+- A Supabase project (project URL plus the Postgres password)
+- A Telegram bot token from [@BotFather](https://t.me/BotFather) and
+  your own Telegram user ID
+- An Anthropic API key (chat layer and AI decision layer)
+- Optional but recommended: a free Finnhub API key (earnings calendar)
 
 ## Setup
 
@@ -247,33 +163,22 @@ for time-sensitive operator actions.
 git clone https://github.com/slzwei/kai-trader.git
 cd kai-trader
 
-# 2. Create your local .env
+# 2. Create your local .env and fill in the values. The full variable
+#    reference with notes lives in CLAUDE.md.
 cp .env.example .env
-# then edit .env and fill in the required values:
-#   TELEGRAM_BOT_TOKEN, TELEGRAM_OWNER_ID,
-#   SUPABASE_URL, SUPABASE_DB_PASSWORD, SUPABASE_KEY,
-#   ALPACA_API_KEY, ALPACA_SECRET_KEY,
-#   ANTHROPIC_API_KEY (for the chat handler),
-#   KAI_CHAT_RO_PASSWORD (for the read-only DB role).
 
 # 3. Install dependencies
 uv sync --extra dev
 
-# 4. Apply database migrations
+# 4. Apply database migrations (idempotent; re-run whenever new .sql
+#    files land under src/kai_trader/db/migrations/)
 uv run python scripts/apply_migrations.py
 
-# 5. (One-time) Bootstrap the read-only Postgres role used by the chat
-#    layer. The script reads KAI_CHAT_RO_PASSWORD from the env. Re-run
-#    whenever you rotate the password.
+# 5. One-time: bootstrap the read-only Postgres role used by the chat
+#    layer and the dashboard, then set DATABASE_URL_RO accordingly.
 KAI_CHAT_RO_PASSWORD="$(grep KAI_CHAT_RO_PASSWORD .env | cut -d= -f2-)" \
   uv run python scripts/create_chat_ro_role.py
-
-# 6. Set DATABASE_URL_RO in your .env to the same Supabase pooler URL
-#    you use for DATABASE_URL, but with kai_chat_ro / KAI_CHAT_RO_PASSWORD.
 ```
-
-The migration script is idempotent. Run it again whenever new `.sql` files
-land under `src/kai_trader/db/migrations/`.
 
 ## Run the bot
 
@@ -281,48 +186,57 @@ land under `src/kai_trader/db/migrations/`.
 bash scripts/run_bot.sh
 ```
 
-Then message `/start` to your bot from your whitelisted Telegram account.
-Non-whitelisted users are silently ignored; they get no reply at all, by
-design.
-
-Slash commands cover read paths (account, positions, regime, sleeves,
-chain, history, etc.) and explicit operator actions (`/flag`, `/kill`,
-`/close`, `/trade_now`). Free-form text from the owner is routed to
-Kai, the conversational layer, which can read repo files, query the
-read-only DB, hit Alpaca read endpoints, and **propose** changes via
-inline Approve / Reject / Modify buttons. Kai never writes trades or
-params directly.
-
-Run `/help` from your bot for the live command list.
+Message `/start` to your bot from the whitelisted account. The
+dashboard runs separately: `uv run python -m kai_trader.dashboard.main`
+(it reads only `DATABASE_URL_RO`, `DASHBOARD_TOKEN`, and `PORT`).
 
 ## Run the tests
 
 ```bash
 uv run pytest
-uv run ruff check
+uv run ruff check src/ tests/
 uv run mypy --strict src/
+uv run python scripts/e2e_smoke_test.py
 ```
 
-The suite targets 80%+ coverage and currently sits around 92%. One
-integration test hits the live Supabase; it is skipped unless you set
-`SUPABASE_INTEGRATION_TEST=1` in your environment.
+Around 1,140 tests: golden parity fixtures pin that the gate
+extraction and the AI layer's off mode changed no trading decision;
+AST hygiene tests pin that the AI package cannot reach the broker.
+Integration tests against live services are env-gated
+(`SUPABASE_INTEGRATION_TEST`, `ALPACA_INTEGRATION_TEST`,
+`KAI_SCHEMA_INTEGRATION_TEST`).
 
-## Render deployment
+## Deployment
 
-`render.yaml` declares a single Background Worker (no inbound HTTP because
-the bot uses Telegram long-polling). The Background Worker stays up across
-idle periods, which matters for the chat handler and event dispatcher.
-Secrets (every `sync: false` key) are pasted into the Render dashboard and
-never committed.
+`render.yaml` declares two services from the same Docker image:
 
-## MCP integration
+- `kai-trader`: a Background Worker running the bot and every worker
+  loop (no inbound HTTP; Telegram long-polling).
+- `kai-trader-dashboard`: a free-tier Web Service running the
+  dashboard (spins down when idle; first visit after a quiet spell
+  takes a few seconds).
 
-`.mcp.json` wires the Supabase MCP server at project scope. From a Claude
-Code session in this repo, run `/mcp` to authenticate, then the assistant
-can query schemas and logs directly.
+Render watches the `claude/kai-trader-phase-1-sHFJk` branch, not
+`main`; both branches are kept in lockstep. Secrets (`sync: false`
+keys) are pasted into the Render dashboard and never committed. Any
+deploy that touches strategy code resets the paper burn-in clock.
+
+## Safety invariants
+
+- The kill switch, `trading_enabled`, and `new_entries_enabled` are
+  re-read from Postgres inside the broker module as the last step
+  before every order. No code path skips them.
+- The AI cannot call Alpaca, produce an `ApprovedIntent`, bypass the
+  gate, change risk parameters, or block position management by being
+  unavailable.
+- Watchlist changes require a human Approve, whichever surface files
+  them.
+- Every command, order intent, fill, assignment, AI decision, applied
+  change, and approval request is persisted. State never changes in
+  the dark.
 
 ## Where to look next
 
-- [CLAUDE.md](./CLAUDE.md) for the architecture, conventions, and the list of
-  things that are intentionally not built yet.
+- [CLAUDE.md](./CLAUDE.md) for the architecture, the full environment
+  variable table, conventions, and the phase-by-phase current state.
 - [TRACKER.md](./TRACKER.md) for the daily work log.
