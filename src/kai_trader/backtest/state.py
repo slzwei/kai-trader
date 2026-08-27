@@ -104,6 +104,12 @@ class BacktestState:
     # for ~3.3x leverage). The cash invariant stays tight in absolute
     # cash terms; only the per-position collateral consumption scales.
     margin_factor: Decimal = REG_T_MARGIN_FACTOR_CASH_SECURED
+    # Research-only fidelity switch. False (default) keeps the historical
+    # cost-basis equity in ``account_snapshot``; True marks held shares
+    # at the per-symbol prices in ``long_equity_marks``, matching what
+    # production reads from Alpaca. See ``_long_equity_value``.
+    mark_long_equity_at_market: bool = False
+    long_equity_marks: dict[str, Decimal] = field(default_factory=dict)
     # Recorded HWM at the moment kill_switch was tripped. Used by
     # drawdown_sim.check_and_trip in auto_reset mode to decide when
     # equity has recovered enough to clear the flag.
@@ -162,6 +168,26 @@ class BacktestState:
             last_equity=equity,
             cash=self.cash,
             buying_power=buying_power,
+            # Production parity: live ``get_account`` always populates
+            # options_buying_power, and the risk gate clamps its
+            # equity-based deployment cap to 95% of it so it never
+            # proposes collateral the broker will not fund. Leaving this
+            # None made the clamp inert in the harness, so the gate sized
+            # purely off the equity cap; once equity contained assigned
+            # stock (not spendable cash) it over-proposed and the broker
+            # rejected the order outright. Measured on the 2024-03 to
+            # 2026-08 window: 29% of CSP submits failed at $30k capital
+            # and 53% at $75k/$100k, because the bigger books carry more
+            # inventory. Production would have SIZED THOSE DOWN instead.
+            # Same class of defect as the harness omitting the 50-DMA
+            # trend filter: the harness must not fail-open a gate
+            # production enforces.
+            #
+            # For a cash-secured book the free-cash figure above IS the
+            # options buying power: the additional strike collateral the
+            # account can fund right now, net of what open positions
+            # already lock. That matches Alpaca's own definition.
+            options_buying_power=buying_power,
             portfolio_value=equity,
             day_pl=Decimal("0"),
             status="ACTIVE",
@@ -230,15 +256,28 @@ class BacktestState:
         return total
 
     def _long_equity_value(self) -> Decimal:
-        """Marked equity: avg_entry_price * qty (no MtM at this layer).
+        """Carrying value of held shares for ``account_snapshot``.
 
-        The reporting layer does end-of-day MtM separately when it has the
-        underlying close in hand. This conservative carrying value avoids
-        rosy intra-tick paper gains.
+        Default is cost basis (``avg_entry_price * qty``), preserving
+        every historical run. That is a known fidelity gap rather than a
+        conservative choice: production reads Alpaca's market equity, so
+        while shares are under water the harness reports a LARGER equity
+        than production and every equity-scaled cap (per-name notional,
+        the S2 economic cap, sleeve and total headroom) runs looser than
+        live exactly during a drawdown.
+
+        Setting ``mark_long_equity_at_market`` and populating
+        ``long_equity_marks`` (the runner does this per tick from the
+        asof-bounded bar cache) closes that gap for a research run.
+        Marks are per-symbol prices; a symbol with no mark falls back to
+        cost.
         """
         total = Decimal("0")
         for p in self.long_equity_positions:
-            total += p.avg_entry_price * p.qty
+            price = p.avg_entry_price
+            if self.mark_long_equity_at_market:
+                price = self.long_equity_marks.get(p.symbol, price)
+            total += price * p.qty
         return total
 
     # Order log helpers used by the broker.
