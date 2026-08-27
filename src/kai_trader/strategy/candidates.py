@@ -73,6 +73,7 @@ from kai_trader.risk.gate import (
     RiskContext,
     SleeveGateCounters,
     apply_gate,
+    partition_symbol_headroom,
 )
 from kai_trader.risk.gate import (
     _committed_collateral as _committed_collateral,
@@ -1069,41 +1070,6 @@ async def build_approved_intents_with_diagnostics(
             )
             proposals.append(proposal)
 
-    # Phase A1: optional AI selection between screen and gate. The
-    # filter may only SHRINK and REORDER the screened proposals: its
-    # return value is matched back to the screener's own objects by
-    # (sleeve, option_symbol), so an injected, duplicated, or mutated
-    # candidate is discarded rather than traded. A filter exception
-    # fails closed to zero new entries this tick; management flows
-    # (rolls, profit-takes, assignments, covered calls) never pass
-    # through here and are unaffected.
-    if ai_filter is not None and proposals:
-        proposed_by_key = {(p.sleeve, p.option_symbol): p for p in proposals}
-        try:
-            selected = await ai_filter(list(proposals))
-        except Exception as exc:
-            _log.error(
-                "ai.decision.filter_failed_fail_closed",
-                error=f"{type(exc).__name__}: {exc}",
-                candidates=len(proposals),
-            )
-            selected = []
-        filtered: list[TradeIntent] = []
-        seen: set[tuple[str, str]] = set()
-        for candidate in selected:
-            key = (candidate.sleeve, candidate.option_symbol)
-            original = proposed_by_key.get(key)
-            if original is None or key in seen:
-                _log.warning(
-                    "ai.decision.filter_returned_unknown_candidate",
-                    sleeve=candidate.sleeve,
-                    option_symbol=candidate.option_symbol,
-                )
-                continue
-            seen.add(key)
-            filtered.append(original)
-        proposals = filtered
-
     ctx = RiskContext(
         equity=equity,
         options_buying_power=account.options_buying_power,
@@ -1112,6 +1078,63 @@ async def build_approved_intents_with_diagnostics(
         today_already_deployed=today_already,
         cooldown_symbols=frozenset(cooldown_set),
     )
+
+    # Phase A1: optional AI selection between screen and gate. The
+    # filter may only SHRINK and REORDER the screened proposals: its
+    # return value is matched back to the screener's own objects by
+    # (sleeve, option_symbol), so an injected, duplicated, or mutated
+    # candidate is discarded rather than traded. A filter exception
+    # fails closed to zero new entries this tick; management flows
+    # (rolls, profit-takes, assignments, covered calls) never pass
+    # through here and are unaffected.
+    #
+    # Phase A2: candidates with provably zero per-name headroom skip
+    # the AI entirely. The gate is guaranteed to reject them (per-name
+    # dollar cap or contract ceiling, both order-independent), so an
+    # evaluation would spend tokens on a foregone conclusion and fill
+    # the decision dataset with noise. They still pass through
+    # apply_gate below, so the rejection lands in the counters and
+    # tick warnings exactly as always, and the moment headroom returns
+    # (a position closes) the symbol is evaluated again with no
+    # cool-down to wait out.
+    if ai_filter is not None and proposals:
+        viable, capped = partition_symbol_headroom(proposals, ctx)
+        if capped:
+            _log.info(
+                "ai.decision.precheck_skipped_capped",
+                count=len(capped),
+                symbols=sorted({p.symbol for p in capped}),
+            )
+        filtered: list[TradeIntent] = []
+        if viable:
+            proposed_by_key = {(p.sleeve, p.option_symbol): p for p in viable}
+            try:
+                selected = await ai_filter(list(viable))
+            except Exception as exc:
+                _log.error(
+                    "ai.decision.filter_failed_fail_closed",
+                    error=f"{type(exc).__name__}: {exc}",
+                    candidates=len(viable),
+                )
+                selected = []
+            seen: set[tuple[str, str]] = set()
+            for candidate in selected:
+                key = (candidate.sleeve, candidate.option_symbol)
+                original = proposed_by_key.get(key)
+                if original is None or key in seen:
+                    _log.warning(
+                        "ai.decision.filter_returned_unknown_candidate",
+                        sleeve=candidate.sleeve,
+                        option_symbol=candidate.option_symbol,
+                    )
+                    continue
+                seen.add(key)
+                filtered.append(original)
+        # Capped proposals are appended for the gate's on-record
+        # rejection; they consume no gate budget, so their position in
+        # the order cannot change any approval.
+        proposals = filtered + capped
+
     gate = apply_gate(proposals, ctx)
 
     empty_counters = SleeveGateCounters()

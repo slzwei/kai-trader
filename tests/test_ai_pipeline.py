@@ -379,3 +379,119 @@ async def test_ai_status_survives_db_failure(
     )
     reply = await ai_status_module._build(None, None)  # type: ignore[arg-type]
     assert "Today's counters unavailable" in reply
+
+
+# ------------- Phase A2: capped candidates never spend an AI call -------------
+
+
+async def test_capped_symbol_skips_ai_but_still_gate_rejected() -> None:
+    """AAA at its contract ceiling: the filter never sees it, the gate
+    still rejects it on the record, and the viable candidate proceeds."""
+    from kai_trader.broker.alpaca import PositionSnapshot
+
+    ceiling_positions = [
+        PositionSnapshot(
+            symbol=f"AAA{EXPIRY.strftime('%y%m%d')}P00005000",
+            qty=Decimal("-10"),
+            side="short",
+            avg_entry_price=Decimal("0.20"),
+            current_price=None,
+            market_value=None,
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        )
+    ]
+    seen_by_ai: list[str] = []
+
+    async def take_all(proposals: list[TradeIntent]) -> list[TradeIntent]:
+        seen_by_ai.extend(p.symbol for p in proposals)
+        return proposals
+
+    approved, diag = await build_approved_intents_with_diagnostics(
+        regime=_regime(),
+        sleeves=[_sleeve(["AAA", "BBB"])],
+        account=_account(),
+        chain_fetcher=_chain_fetcher,
+        today=TODAY,
+        existing_short_puts=ceiling_positions,
+        ai_filter=take_all,
+    )
+
+    assert seen_by_ai == ["BBB"]
+    assert [a.intent.symbol for a in approved] == ["BBB"]
+    assert diag.sleeves[0].symbols_skipped_for_contract_ceiling == 1
+    assert diag.sleeves[0].contract_ceiling_symbols == ("AAA",)
+
+
+async def test_all_capped_never_invokes_ai_filter() -> None:
+    from kai_trader.broker.alpaca import PositionSnapshot
+
+    positions = [
+        PositionSnapshot(
+            symbol=f"{sym}{EXPIRY.strftime('%y%m%d')}P00005000",
+            qty=Decimal("-10"),
+            side="short",
+            avg_entry_price=Decimal("0.20"),
+            current_price=None,
+            market_value=None,
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        )
+        for sym in ("AAA", "BBB")
+    ]
+    calls = {"n": 0}
+
+    async def counting_filter(proposals: list[TradeIntent]) -> list[TradeIntent]:
+        calls["n"] += 1
+        return proposals
+
+    approved, diag = await build_approved_intents_with_diagnostics(
+        regime=_regime(),
+        sleeves=[_sleeve(["AAA", "BBB"])],
+        account=_account(),
+        chain_fetcher=_chain_fetcher,
+        today=TODAY,
+        existing_short_puts=positions,
+        ai_filter=counting_filter,
+    )
+
+    assert calls["n"] == 0
+    assert approved == []
+    assert diag.sleeves[0].symbols_skipped_for_contract_ceiling == 2
+
+
+async def test_precheck_preserves_outcomes_vs_no_ai() -> None:
+    """With a take-all filter, approvals match the no-AI pipeline even
+    when some candidates are capped."""
+    from kai_trader.broker.alpaca import PositionSnapshot
+
+    positions = [
+        PositionSnapshot(
+            symbol=f"AAA{EXPIRY.strftime('%y%m%d')}P00005000",
+            qty=Decimal("-10"),
+            side="short",
+            avg_entry_price=Decimal("0.20"),
+            current_price=None,
+            market_value=None,
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        )
+    ]
+
+    async def take_all(proposals: list[TradeIntent]) -> list[TradeIntent]:
+        return proposals
+
+    kwargs: dict[str, Any] = dict(
+        regime=_regime(),
+        sleeves=[_sleeve(["AAA", "BBB"])],
+        account=_account(),
+        chain_fetcher=_chain_fetcher,
+        today=TODAY,
+        existing_short_puts=positions,
+    )
+    with_ai, _ = await build_approved_intents_with_diagnostics(
+        **kwargs, ai_filter=take_all
+    )
+    without_ai, _ = await build_approved_intents_with_diagnostics(**kwargs)
+
+    assert [a.intent for a in with_ai] == [a.intent for a in without_ai]

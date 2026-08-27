@@ -447,3 +447,59 @@ def test_empty_proposals_still_reports_totals() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ------------- Phase A2: per-name headroom precheck -------------
+
+
+def test_partition_flags_ceiling_met_as_capped() -> None:
+    from kai_trader.risk.gate import partition_symbol_headroom
+
+    ctx = _ctx(existing=[_short_put("SPY", "10", 10)])
+    viable, capped = partition_symbol_headroom(
+        [_proposal("SPY", "10"), _proposal("AAA", "50")], ctx
+    )
+    assert [p.symbol for p in capped] == ["SPY"]
+    assert [p.symbol for p in viable] == ["AAA"]
+
+
+def test_partition_flags_dollar_cap_consumed_as_capped() -> None:
+    from kai_trader.risk.gate import partition_symbol_headroom
+
+    # 10k of the 12k per-name budget committed; a 5k-contract cannot fit.
+    ctx = _ctx(existing=[_short_put("SPY", "50", 2)])
+    viable, capped = partition_symbol_headroom([_proposal("SPY", "50")], ctx)
+    assert viable == []
+    assert [p.symbol for p in capped] == ["SPY"]
+
+
+def test_partition_leaves_free_symbols_viable() -> None:
+    from kai_trader.risk.gate import partition_symbol_headroom
+
+    viable, capped = partition_symbol_headroom(
+        [_proposal("SPY", "50"), _proposal("AAA", "40")], _ctx()
+    )
+    assert capped == []
+    assert len(viable) == 2
+
+
+def test_partition_agrees_with_apply_gate_verdicts() -> None:
+    """Every capped proposal must be per-name rejected by the gate."""
+    from kai_trader.risk.gate import partition_symbol_headroom
+
+    ctx = _ctx(
+        existing=[_short_put("SPY", "50", 2), _short_put("BBB", "10", 10)]
+    )
+    proposals = [
+        _proposal("SPY", "50"),  # dollar budget consumed
+        _proposal("BBB", "10"),  # ceiling met
+        _proposal("AAA", "40"),  # free
+    ]
+    viable, capped = partition_symbol_headroom(proposals, ctx)
+    assert {p.symbol for p in capped} == {"SPY", "BBB"}
+
+    result = apply_gate(proposals, ctx)
+    rejected_reasons = {r.intent.symbol: r.reason for r in result.rejected}
+    assert rejected_reasons["SPY"] == "per_name_cap"
+    assert rejected_reasons["BBB"] == "contract_ceiling"
+    assert [a.intent.symbol for a in result.approved] == ["AAA"]

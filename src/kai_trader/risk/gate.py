@@ -481,6 +481,49 @@ def _scaled(proposal: TradeIntent, qty: int) -> TradeIntent:
     )
 
 
+def partition_symbol_headroom(
+    proposals: Sequence[TradeIntent],
+    ctx: RiskContext,
+) -> tuple[list[TradeIntent], list[TradeIntent]]:
+    """Split proposals into (has per-name headroom, provably capped).
+
+    A proposal is provably capped when the per-name checks
+    :func:`apply_gate` runs later cannot admit even one contract,
+    independent of anything else in the batch: the per-symbol contract
+    ceiling is already met by held positions, or committed collateral
+    leaves less than one contract of the per-name dollar budget.
+
+    Phase A2 uses this so the AI decision layer stops spending an
+    evaluation on a candidate the gate is guaranteed to reject. Capped
+    proposals must STILL be passed to ``apply_gate`` so the rejection
+    lands in the counters and diagnostics as always; this function
+    only decides who is worth an AI call, never who trades. It lives
+    in this module, built on the same helpers as ``apply_gate``, so
+    the two can never drift.
+    """
+    equity = ctx.equity
+    _per_sleeve, committed_per_symbol, _total = _committed_collateral(
+        ctx.existing_short_puts, ctx.sleeves
+    )
+    existing_contracts = _existing_contract_counts(ctx.existing_short_puts)
+    per_symbol_cap_dollars = equity * per_symbol_cap_pct(equity)
+    contract_ceiling = max_contracts_per_symbol(equity)
+    viable: list[TradeIntent] = []
+    capped: list[TradeIntent] = []
+    for proposal in proposals:
+        existing_qty = existing_contracts.get(proposal.symbol, 0)
+        committed = committed_per_symbol.get(proposal.symbol, Decimal("0"))
+        per_symbol_remaining = max(
+            per_symbol_cap_dollars - committed, Decimal("0")
+        )
+        per_contract = proposal.strike * Decimal("100")
+        if existing_qty >= contract_ceiling or per_symbol_remaining < per_contract:
+            capped.append(proposal)
+        else:
+            viable.append(proposal)
+    return viable, capped
+
+
 def apply_gate(
     proposals: Sequence[TradeIntent],
     ctx: RiskContext,
