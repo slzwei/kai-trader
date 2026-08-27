@@ -17,6 +17,14 @@ Two modes are supported:
   default for "is this strategy profitable" questions because it
   separates "the wheel logic" from "what happens when an operator goes
   on vacation."
+* ``s1_freeze`` -- mirrors the Safety S1 production breaker
+  (2026-08-27): a breach flips ``new_entries_enabled`` off and leaves
+  ``kill_switch`` alone, so closes, profit-takes, and expiries keep
+  working while new CSPs, covered calls, and roll reopens stop. The
+  live sweep re-freezes on every still-breached tick and recovery is
+  an operator action; the backtest has no operator, so this mode
+  re-enables entries on the first tick the 7-day drawdown is back
+  under threshold (the operator-in-the-loop assumption).
 
 The threshold (7%) and lookback (7 days) match production exactly. Only
 the recovery rule differs.
@@ -29,6 +37,10 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Final, Literal
 
+from kai_trader.backtest.experiments.breaker_rules import (
+    BreakerRule,
+    slow_drawdown_pct,
+)
 from kai_trader.backtest.state import BacktestState
 from kai_trader.logging import get_logger
 
@@ -36,7 +48,7 @@ DRAWDOWN_THRESHOLD_PCT: Final[Decimal] = Decimal("7")
 LOOKBACK_DAYS: Final[int] = 7
 RECOVERY_DAYS: Final[int] = 3
 
-KillSwitchMode = Literal["permanent", "auto_reset"]
+KillSwitchMode = Literal["permanent", "auto_reset", "s1_freeze"]
 
 _log = get_logger(__name__)
 
@@ -56,6 +68,7 @@ def check_and_trip(
     asof: date,
     *,
     mode: KillSwitchMode = "permanent",
+    breaker_rule: BreakerRule | None = None,
 ) -> DrawdownCheckResult:
     """Walk equity curve, trip on breach, optionally reset on recovery.
 
@@ -64,6 +77,11 @@ def check_and_trip(
     the flag after equity has been at or above the trip-time high-water
     mark for ``RECOVERY_DAYS`` consecutive days; that mirrors what an
     operator would do once the drawdown event has passed.
+
+    ``breaker_rule`` opts one run into a research slow anchor layered
+    over the production 7-day rule (see
+    ``backtest.experiments.breaker_rules``). ``None`` keeps the
+    production breaker byte-identical.
     """
     if not state.equity_curve:
         return DrawdownCheckResult(
@@ -90,6 +108,52 @@ def check_and_trip(
         )
     dd = (high - current) / high * Decimal("100")
     breached = dd >= DRAWDOWN_THRESHOLD_PCT
+
+    # Research-only slow anchor (recommendation 3 of the drawdown
+    # forensics). The union can only trip earlier or hold longer than
+    # production; with no rule, or a rule carrying no anchor, every
+    # number below is the production one unchanged.
+    slow_dd = Decimal("0")
+    if breaker_rule is not None and breaker_rule.slow is not None:
+        slow_dd = slow_drawdown_pct(state.equity_curve, asof, breaker_rule.slow)
+        if slow_dd >= breaker_rule.slow.threshold_pct:
+            breached = True
+    # Report whichever anchor is deeper so the tick ledger shows what
+    # drove the decision. Identical to the fast value when no anchor is
+    # active, since slow_dd is then zero.
+    dd = max(dd, slow_dd)
+
+    if mode == "s1_freeze":
+        entries_on = state.flags.get("new_entries_enabled", True)
+        s1_tripped = False
+        s1_reset = False
+        if breached and entries_on:
+            state.flags["new_entries_enabled"] = False
+            state.flags_meta_trip_hwm = float(high)
+            s1_tripped = True
+            _log.warning(
+                "backtest.drawdown.s1_freeze_engaged",
+                asof=asof.isoformat(),
+                drawdown_pct=str(dd),
+                high_water_mark=str(high),
+                current_equity=str(current),
+            )
+        elif not breached and not entries_on:
+            state.flags["new_entries_enabled"] = True
+            s1_reset = True
+            _log.info(
+                "backtest.drawdown.s1_freeze_lifted",
+                asof=asof.isoformat(),
+                drawdown_pct=str(dd),
+            )
+        return DrawdownCheckResult(
+            high_water_mark=high,
+            current_equity=current,
+            drawdown_pct=dd,
+            breached=breached,
+            kill_switch_tripped=s1_tripped,
+            kill_switch_reset=s1_reset,
+        )
 
     kill_switch_was_on = state.flags.get("kill_switch", False)
     tripped = False

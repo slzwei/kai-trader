@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -29,8 +29,19 @@ from kai_trader.backtest import assignment_sim, drawdown_sim
 from kai_trader.backtest.broker import BacktestBroker
 from kai_trader.backtest.data import bars, earnings
 from kai_trader.backtest.data.chains import HistoricalChainFetcher
+from kai_trader.backtest.experiments.breaker_rules import BreakerRule
+from kai_trader.backtest.experiments.risk_controls import (
+    RiskControls,
+    apply_entry_controls,
+    make_trend_provider,
+)
+from kai_trader.backtest.experiments.time_aware_pt import (
+    TimeAwarePTRule,
+    evaluate_time_aware_profit_takes,
+)
 from kai_trader.backtest.fills import Quote
 from kai_trader.backtest.state import BacktestState
+from kai_trader.broker.alpaca import PositionSnapshot
 from kai_trader.broker.options_data import parse_occ_symbol
 from kai_trader.logging import get_logger
 from kai_trader.strategy import candidates as strat_candidates
@@ -176,13 +187,25 @@ async def _run_profit_takes(
     broker: BacktestBroker,
     fetcher: HistoricalChainFetcher,
     asof: date,
+    *,
+    pt_rule: TimeAwarePTRule | None = None,
+    trading_day_index: dict[date, int] | None = None,
 ) -> int:
-    intents = await strat_pt.evaluate_profit_takes(
-        short_option_positions=state.list_short_option_positions(),
-        orders=state.orders,
-        sleeves=state.get_all_sleeves(),
-        chain_fetcher=fetcher,
-    )
+    if pt_rule is not None and trading_day_index is not None:
+        intents = await evaluate_time_aware_profit_takes(
+            state,
+            fetcher,
+            pt_rule,
+            trading_day_index,
+            asof,
+        )
+    else:
+        intents = await strat_pt.evaluate_profit_takes(
+            short_option_positions=state.list_short_option_positions(),
+            orders=state.orders,
+            sleeves=state.get_all_sleeves(),
+            chain_fetcher=fetcher,
+        )
     executed = 0
     for intent in intents:
         chain = await fetcher(intent.underlying, None)
@@ -218,6 +241,18 @@ async def _run_rolls(
         chain_fetcher=fetcher,
         today=asof,
     )
+    # Rolls are entries-gated in production (the reopen leg is a new
+    # entry; Safety S1 keeps the challenged put riding to assignment
+    # under a freeze). Submitting only the close leg while entries are
+    # blocked would strand a half-roll the live system cannot produce,
+    # so hold everything when any entry flag blocks.
+    flags = state.get_all_flags()
+    if (
+        flags.get("kill_switch")
+        or not flags.get("trading_enabled")
+        or not flags.get("new_entries_enabled")
+    ):
+        return 0, len(intents)
     executed = 0
     held = 0
     for intent in intents:
@@ -318,15 +353,53 @@ def _make_iv_percentile_provider(
     return _provider
 
 
+def _marked_long_equity(
+    state: BacktestState, asof: date
+) -> list[PositionSnapshot]:
+    """Long-equity snapshots priced at the asof close for the risk gate.
+
+    The state's snapshots carry only cost basis; the S2 economic cap
+    must see market value (cost would loosen exactly when shares are
+    under water). Mirrors the production path, where Alpaca populates
+    ``market_value`` on every position fetch. Falls back to cost when
+    the bar cache has no close at or before ``asof``.
+    """
+    marked: list[PositionSnapshot] = []
+    for p in state.list_long_equity_positions():
+        close = bars.get_close_on_or_before(p.symbol, asof)
+        mark = close[1] if close is not None else p.avg_entry_price
+        marked.append(
+            replace(p, current_price=mark, market_value=mark * p.qty)
+        )
+    return marked
+
+
 async def _run_csp_entries(
     state: BacktestState,
     broker: BacktestBroker,
     fetcher: HistoricalChainFetcher,
     regime: RegimeSnapshot,
     asof: date,
+    *,
+    entry_controls: RiskControls | None = None,
+    econ_cap_pct: Decimal | None = None,
 ) -> tuple[int, int]:
-    """Build and submit CSP intents. Returns (built, filled)."""
+    """Build and submit CSP intents. Returns (built, filled).
+
+    ``entry_controls`` (research only, default None = byte-identical
+    production path) optionally wires the production 50-DMA trend
+    filter through the builder's existing ``trend_status`` hook and
+    applies assignment-aware exposure caps to the gate's output.
+    ``econ_cap_pct`` is the S2 gate-native assignment-aware economic
+    cap, threaded straight into the production builder exactly as the
+    live worker passes it; ``None`` disables (pre-S2 parity).
+    """
     account = state.account_snapshot()
+    trend_provider = (
+        make_trend_provider(asof)
+        if entry_controls is not None and entry_controls.trend_filter
+        else None
+    )
     intents, _diagnostics = await strat_candidates.build_intents_with_diagnostics(
         regime=regime,
         sleeves=state.get_all_sleeves(),
@@ -334,9 +407,12 @@ async def _run_csp_entries(
         chain_fetcher=fetcher,
         today=asof,
         earnings_status=earnings.earnings_status,
+        trend_status=trend_provider,
         existing_short_puts=state.list_short_option_positions(),
         today_already_deployed=state.today_deployed,
         cooldown_symbols={s for s in state.cooldown_symbols},
+        long_equity_positions=_marked_long_equity(state, asof),
+        per_name_economic_cap_pct=econ_cap_pct,
         # Phase 5 retuning (2026-05-09): IV/RV gate disabled in favour
         # of IV percentile alone. Running both was double-gating the
         # candidate stream into 80% rejection. The percentile rank is
@@ -345,6 +421,10 @@ async def _run_csp_entries(
         # rv30_provider=_make_rv30_provider(asof),
         iv_percentile_provider=_make_iv_percentile_provider(asof),
     )
+    if entry_controls is not None:
+        intents, _decision = apply_entry_controls(
+            intents, state, asof, entry_controls
+        )
     filled = 0
     for intent in intents:
         chain = await fetcher(intent.symbol, None)
@@ -438,6 +518,11 @@ async def run_tick(
     *,
     last_asof: date | None,
     kill_switch_mode: str = "permanent",
+    pt_rule: TimeAwarePTRule | None = None,
+    trading_day_index: dict[date, int] | None = None,
+    entry_controls: RiskControls | None = None,
+    econ_cap_pct: Decimal | None = None,
+    breaker_rule: BreakerRule | None = None,
 ) -> TickReport:
     """Execute one backtest tick at ``asof``.
 
@@ -477,14 +562,28 @@ async def run_tick(
         )
 
     fetcher = HistoricalChainFetcher(asof=asof)
-    profit_takes = await _run_profit_takes(state, broker, fetcher, asof)
+    profit_takes = await _run_profit_takes(
+        state,
+        broker,
+        fetcher,
+        asof,
+        pt_rule=pt_rule,
+        trading_day_index=trading_day_index,
+    )
     rolls_done, rolls_held = await _run_rolls(state, broker, fetcher, regime, asof)
-    csp_built, csp_filled = await _run_csp_entries(state, broker, fetcher, regime, asof)
+    csp_built, csp_filled = await _run_csp_entries(
+        state, broker, fetcher, regime, asof,
+        entry_controls=entry_controls,
+        econ_cap_pct=econ_cap_pct,
+    )
     cc_built, cc_filled = await _run_cc_entries(state, broker, fetcher, regime, asof)
 
     positions_value = _mark_to_market(state, asof)
     state.append_equity(asof, positions_value)
-    dd = drawdown_sim.check_and_trip(state, asof, mode=kill_switch_mode)  # type: ignore[arg-type]
+    dd = drawdown_sim.check_and_trip(
+        state, asof, mode=kill_switch_mode,  # type: ignore[arg-type]
+        breaker_rule=breaker_rule,
+    )
 
     return TickReport(
         asof=asof,
@@ -515,15 +614,34 @@ async def run_backtest(
     trading_days: list[date],
     *,
     kill_switch_mode: str = "permanent",
+    pt_rule: TimeAwarePTRule | None = None,
+    entry_controls: RiskControls | None = None,
+    econ_cap_pct: Decimal | None = None,
+    breaker_rule: BreakerRule | None = None,
 ) -> RunOutcome:
-    """Walk every trading day; collect TickReport per day."""
+    """Walk every trading day; collect TickReport per day.
+
+    ``pt_rule`` opts one run into the experimental time-aware
+    profit-take evaluator. ``entry_controls`` opts one run into the
+    research entry risk controls. ``econ_cap_pct`` enables the S2
+    gate-native economic cap (production default 0.20; ``None``
+    reproduces the pre-S2 gate). ``breaker_rule`` opts one run into a
+    research slow drawdown anchor. ``None`` for all four keeps the
+    pre-S2 path byte-identical.
+    """
     reports: list[TickReport] = []
+    trading_day_index = {d: i for i, d in enumerate(trading_days)}
     last_asof: date | None = None
     for d in trading_days:
         try:
             report = await run_tick(
                 state, broker, d, last_asof=last_asof,
                 kill_switch_mode=kill_switch_mode,
+                pt_rule=pt_rule,
+                trading_day_index=trading_day_index,
+                entry_controls=entry_controls,
+                econ_cap_pct=econ_cap_pct,
+                breaker_rule=breaker_rule,
             )
         except Exception as exc:
             _log.error(

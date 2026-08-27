@@ -34,6 +34,9 @@ from kai_trader.backtest import clock, runner
 from kai_trader.backtest.broker import BacktestBroker
 from kai_trader.backtest.costs import DEFAULT_COST_MODEL
 from kai_trader.backtest.data import bars, chains, earnings, rates, universe
+from kai_trader.backtest.experiments.breaker_rules import RULES as BREAKER_RULES
+from kai_trader.backtest.experiments.risk_controls import CONTROLS as ENTRY_CONTROLS
+from kai_trader.backtest.experiments.time_aware_pt import VARIANTS as PT_VARIANTS
 from kai_trader.backtest.fills import FillModel
 from kai_trader.backtest.reporting import detailed as reporting_detailed
 from kai_trader.backtest.reporting import summary as reporting_summary
@@ -282,10 +285,40 @@ async def _do_run(args: argparse.Namespace) -> int:
     sleeve_path = Path(args.sleeve_config) if args.sleeve_config else None
     sleeves, snapshot_path = _load_sleeve_config(sleeve_path)
 
-    # Save sleeve config snapshot to the run directory.
+    # Save the sleeve config actually used to the run directory. The
+    # previous version always wrote _DEFAULT_SLEEVE_CONFIG here, which
+    # mis-recorded provenance whenever --sleeve-config was passed.
     snapshot_dest = output_dir / "sleeve_config_snapshot.json"
-    snapshot_dest.write_text(
-        json.dumps(_DEFAULT_SLEEVE_CONFIG, indent=2, sort_keys=True),
+    if sleeve_path is not None and sleeve_path.exists():
+        snapshot_dest.write_text(
+            sleeve_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    else:
+        snapshot_dest.write_text(
+            json.dumps(_DEFAULT_SLEEVE_CONFIG, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    pt_rule = PT_VARIANTS.get(args.pt_variant) if args.pt_variant != "baseline" else None
+    run_config_dest = output_dir / "run_config.json"
+    run_config_dest.write_text(
+        json.dumps(
+            {
+                "start": args.start,
+                "end": args.end,
+                "capital": args.capital,
+                "fill_model": args.fill_model,
+                "margin_factor": args.margin_factor,
+                "kill_switch_mode": args.kill_switch_mode,
+                "pt_variant": args.pt_variant,
+                "entry_controls": args.entry_controls,
+                "econ_cap_pct": args.econ_cap_pct,
+                "breaker": args.breaker,
+                "sleeve_config": snapshot_path,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
 
@@ -330,8 +363,18 @@ async def _do_run(args: argparse.Namespace) -> int:
         count=len(days),
     )
 
+    entry_controls = (
+        ENTRY_CONTROLS[args.entry_controls]
+        if args.entry_controls != "none"
+        else None
+    )
+    econ_cap = Decimal(args.econ_cap_pct)
     outcome = await runner.run_backtest(
         state, broker, days, kill_switch_mode=args.kill_switch_mode,
+        pt_rule=pt_rule,
+        entry_controls=entry_controls,
+        econ_cap_pct=econ_cap if econ_cap > 0 else None,
+        breaker_rule=BREAKER_RULES[args.breaker],
     )
     metrics = reporting_summary.write_all_artefacts(
         outcome,
@@ -399,12 +442,61 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--kill-switch-mode",
         default="permanent",
-        choices=["permanent", "auto_reset"],
+        choices=["permanent", "auto_reset", "s1_freeze"],
         help=(
             "permanent (default): once tripped, stays on for the whole run "
-            "(production-equivalent). auto_reset: clears the flag when "
-            "equity recovers above the trip-time HWM (mimics operator "
-            "intervention; better for evaluating the strategy itself)."
+            "(pre-S1 production equivalent). auto_reset: clears the flag "
+            "when equity recovers above the trip-time HWM (mimics operator "
+            "intervention). s1_freeze: mirrors the Safety S1 breaker — a "
+            "breach freezes new entries only (closes and profit-takes keep "
+            "working) and entries re-enable once the drawdown is back "
+            "under threshold."
+        ),
+    )
+    parser.add_argument(
+        "--entry-controls",
+        default="none",
+        choices=["none", *sorted(ENTRY_CONTROLS.keys())],
+        help=(
+            "Research-only entry risk controls. none (default) runs the "
+            "production entry path untouched. Named bundles wire the "
+            "50-DMA trend filter and/or assignment-aware exposure caps "
+            "(see backtest.experiments.risk_controls)."
+        ),
+    )
+    parser.add_argument(
+        "--econ-cap-pct",
+        default="0.20",
+        help=(
+            "S2 assignment-aware per-name economic cap as a fraction of "
+            "equity, threaded into the production risk gate exactly as "
+            "the live worker passes it (default 0.20, the production "
+            "default). Pass 0 to disable and reproduce pre-S2 baselines. "
+            "Distinct from the research --entry-controls econ bundles, "
+            "which post-filter the gate's output."
+        ),
+    )
+    parser.add_argument(
+        "--breaker",
+        default="baseline",
+        choices=sorted(BREAKER_RULES.keys()),
+        help=(
+            "Research-only drawdown-breaker rule. baseline (default) is "
+            "the production 7-day/7% breaker alone. The other rules add "
+            "a slow anchor (all-time peak or a 30-day window) whose "
+            "breach also freezes new entries (see "
+            "backtest.experiments.breaker_rules)."
+        ),
+    )
+    parser.add_argument(
+        "--pt-variant",
+        default="baseline",
+        choices=["baseline", *sorted(PT_VARIANTS.keys())],
+        help=(
+            "Research-only profit-take rule. baseline (default) runs the "
+            "production rule untouched. A/B/D layer time-aware fast-winner "
+            "stages over the production threshold (see "
+            "backtest.experiments.time_aware_pt)."
         ),
     )
     return parser.parse_args(argv)
