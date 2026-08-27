@@ -346,18 +346,31 @@ def render_kill_switch(
     reconciled: int,
     drawdown_pct: Decimal | None,
     high_water_mark: Decimal | None,
+    assignments_recorded: int = 0,
 ) -> str:
-    """Tick output when the kill switch is engaged at tick start."""
+    """Tick output when the kill switch is engaged at tick start.
+
+    The kill switch freezes execution, not awareness: reconciliation,
+    assignment detection, and position snapshots still run each tick so
+    the operator's view of the account stays live while every outbound
+    order (including closes and cancels) is refused.
+    """
     title = bold("Strategy Tick - Kill switch engaged")
-    sub = italic(timestamp_label + " . trading suspended")
+    sub = italic(timestamp_label + " . execution suspended, observation live")
     body_lines = [
         f"Checked {reconciled} pending order(s) against the broker.",
-        "No new candidates evaluated.",
+        "No orders placed, closed, rolled, or cancelled.",
+        "Still watching: fills, assignments, positions.",
     ]
+    if assignments_recorded > 0:
+        body_lines.append(
+            f"Recorded {assignments_recorded} new assignment(s) while killed."
+        )
     if drawdown_pct is not None and high_water_mark is not None:
         body_lines.append(
             f"Drawdown {drawdown_pct:.2f}% from high-water mark "
-            f"{format_money(high_water_mark)} tripped the breaker."
+            f"{format_money(high_water_mark)} is at or past the breaker "
+            "threshold."
         )
     body_lines.append(
         "Flip with /flag kill_switch off when you have decided what to do."

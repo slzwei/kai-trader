@@ -3,8 +3,9 @@
 The companion script proves the drawdown breaker against real Postgres. This
 test exercises the same orchestration in-process with the DB layer stubbed
 out, so CI catches regressions without needing live credentials. Together
-they form belt-and-braces evidence that ``check_and_trip`` actually trips
-the kill switch and emits a critical notification on a 7% drawdown.
+they form belt-and-braces evidence that ``check_and_trip`` actually engages
+the entry freeze (new_entries_enabled off, kill_switch untouched) and emits
+a critical notification on a 7% drawdown.
 """
 
 from __future__ import annotations
@@ -102,7 +103,12 @@ class _FakePool:
 
 
 def _stored_snapshot(equity: Decimal, days_ago: int = 0) -> StoredSnapshot:
-    when = datetime(2026, 5, 6, 14, tzinfo=UTC) - timedelta(days=days_ago)
+    # Anchor to ``now`` so the snapshot always falls inside the 7-day
+    # drawdown lookback regardless of when the suite runs. The original
+    # hard-coded 2026-05-06 date aged out of the window (the breaker
+    # anchors its cutoff to now, not to the latest snapshot), which made
+    # this suite fail from 2026-05-13 onward.
+    when = datetime.now(UTC) - timedelta(days=days_ago)
     return StoredSnapshot(
         id=f"snap-{days_ago}",
         captured_at=when,
@@ -128,7 +134,7 @@ def script_with_mocks(monkeypatch: pytest.MonkeyPatch) -> tuple[
 
     # Pool with the synthetic snapshot already "inserted" so check_and_trip
     # can compute a 7% breach against the script's HWM_EQUITY.
-    now_ts = datetime(2026, 5, 6, 14, tzinfo=UTC)
+    now_ts = datetime.now(UTC)
     fake_conn = _FakeConn(
         now_value=now_ts,
         critical_rows=[
@@ -136,7 +142,7 @@ def script_with_mocks(monkeypatch: pytest.MonkeyPatch) -> tuple[
                 "id": "00000000-0000-0000-0000-000000000abc",
                 "message": (
                     "*DRAWDOWN CIRCUIT BREAKER*\n7.00% drop from 10000000 "
-                    "to 9300000.\nKill switch engaged automatically."
+                    "to 9300000.\nEntry freeze engaged automatically."
                 ),
                 "created_at": now_ts,
             }
@@ -233,10 +239,12 @@ async def test_main_passes_when_breaker_trips_and_restores_state(
     assert priority == "critical"
     assert module.NOTIFICATION_MARKER in body
 
-    # The breaker flipped kill_switch to True via the drawdown set_flag.
+    # The breaker flipped new_entries_enabled to False via the drawdown
+    # set_flag, and never touched kill_switch.
     mocks["drawdown_set_flag"].assert_called_once_with(
-        "kill_switch", True, actor=-1
+        "new_entries_enabled", False, actor=-1
     )
+    assert mocks["flags_state"]["kill_switch"] is False
 
     # The script issued the expected SQL: an UPDATE that suppresses the
     # synthetic critical notification before the live worker can deliver
@@ -251,8 +259,8 @@ async def test_main_passes_when_breaker_trips_and_restores_state(
     assert any("delete from notifications" in q and "message like" in q
                for q, _ in executed)
 
-    # State was restored: kill_switch ends back at the initial False.
-    assert mocks["flags_state"]["kill_switch"] is False
+    # State was restored: new_entries_enabled ends back at the initial False.
+    assert mocks["flags_state"]["new_entries_enabled"] is False
 
     # Pool was closed at the end of main().
     mocks["close_pool"].assert_awaited_once()
@@ -310,7 +318,7 @@ async def test_main_restores_state_even_when_breaker_does_not_breach(
     assert rc == 1  # at least one assertion failed
     mocks["enqueue"].assert_not_awaited()
     # State still gets restored.
-    assert mocks["flags_state"]["kill_switch"] is False
+    assert mocks["flags_state"]["new_entries_enabled"] is False
     mocks["close_pool"].assert_awaited_once()
     executed = mocks["fake_conn"].executed
     assert any("delete from account_snapshots" in q for q, _ in executed)

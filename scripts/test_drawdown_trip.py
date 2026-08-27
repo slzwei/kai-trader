@@ -1,11 +1,13 @@
 """Dry-run verification for the drawdown circuit breaker.
 
 The breaker at ``kai_trader.strategy.drawdown.check_and_trip`` is the only
-emergency brake on the bot. It has never fired against this account, so
-before we point real capital at it we want positive evidence that:
+automatic brake on the bot. Before we point real capital at it we want
+positive evidence that:
 
 1. A 7% drop from the rolling high-water mark is detected.
-2. ``system_flags.kill_switch`` is flipped to ``true``.
+2. ``system_flags.new_entries_enabled`` is flipped to ``false`` (the entry
+   freeze). The breaker deliberately does NOT touch ``kill_switch``; that
+   stays a manual, stricter brake.
 3. A ``critical``-priority notification is enqueued.
 
 This script proves all three by inserting a synthetic ``account_snapshots``
@@ -61,8 +63,10 @@ def _print_header() -> None:
     print("Drawdown circuit breaker dry-run")
     print("=" * 70)
     print()
-    print("Goal: verify check_and_trip flips kill_switch and enqueues a")
-    print("critical notification when equity drops 7% from the HWM.")
+    print("Goal: verify check_and_trip engages the entry freeze")
+    print("(new_entries_enabled -> false, kill_switch untouched) and")
+    print("enqueues a critical notification when equity drops 7% from")
+    print("the HWM.")
     print()
 
 
@@ -144,7 +148,7 @@ async def _cleanup(
     *,
     synthetic_snapshot_id: str | None,
     test_window_start: datetime | None,
-    initial_kill_switch: bool,
+    initial_new_entries_enabled: bool,
 ) -> None:
     """Restore database state to whatever it was before the script ran."""
     pool = await get_pool()
@@ -175,9 +179,11 @@ async def _cleanup(
                 f"%{NOTIFICATION_MARKER}%",
             )
 
-    # Always restore kill_switch to its prior value, regardless of how far
-    # through the test we got.
-    await set_flag("kill_switch", initial_kill_switch, actor=DRY_RUN_ACTOR_ID)
+    # Always restore new_entries_enabled to its prior value, regardless of
+    # how far through the test we got.
+    await set_flag(
+        "new_entries_enabled", initial_new_entries_enabled, actor=DRY_RUN_ACTOR_ID
+    )
 
 
 async def main() -> int:
@@ -191,10 +197,10 @@ async def main() -> int:
 
     await get_pool()  # ensure pool is up before we start mutating
     initial_flags = await get_all_flags()
-    initial_kill_switch = initial_flags["kill_switch"]
-    print(f"Initial kill_switch:         {initial_kill_switch}")
+    initial_new_entries = initial_flags["new_entries_enabled"]
+    print(f"Initial kill_switch:         {initial_flags['kill_switch']}")
     print(f"Initial trading_enabled:     {initial_flags['trading_enabled']}")
-    print(f"Initial new_entries_enabled: {initial_flags['new_entries_enabled']}")
+    print(f"Initial new_entries_enabled: {initial_new_entries}")
     print()
 
     synthetic_snapshot_id: str | None = None
@@ -202,9 +208,11 @@ async def main() -> int:
     results: list[tuple[str, bool, str]] = []
 
     try:
-        # Make sure kill_switch is OFF so we exercise the "fresh breach"
-        # branch rather than the "already killed, idempotent" branch.
-        await set_flag("kill_switch", False, actor=DRY_RUN_ACTOR_ID)
+        # Make sure new_entries_enabled is ON so we exercise the "fresh
+        # breach" branch rather than the "already frozen, idempotent"
+        # branch.
+        await set_flag("new_entries_enabled", True, actor=DRY_RUN_ACTOR_ID)
+        kill_switch_before = (await get_all_flags())["kill_switch"]
 
         synthetic_snapshot_id = await _insert_synthetic_hwm()
         print(f"Inserted synthetic HWM snapshot: id={synthetic_snapshot_id} "
@@ -218,7 +226,7 @@ async def main() -> int:
               f"(HWM was ${HWM_EQUITY}).")
         check = await check_and_trip(
             current_equity=DOWN_EQUITY,
-            kill_switch_already_on=False,
+            entries_enabled=True,
         )
         # Race-shrink: mark any breaker notification as sent immediately so
         # the live notifications worker (5s poll) cannot deliver our
@@ -232,6 +240,7 @@ async def main() -> int:
         print()
 
         post_flags = await get_all_flags()
+        new_entries_now = post_flags["new_entries_enabled"]
         kill_switch_now = post_flags["kill_switch"]
         criticals = await _critical_notifications_after(test_window_start)
         breaker_notifs = [
@@ -240,6 +249,7 @@ async def main() -> int:
             and NOTIFICATION_MARKER in str(r["message"])
         ]
 
+        print(f"Post-trip new_entries_enabled:   {new_entries_now}")
         print(f"Post-trip kill_switch:           {kill_switch_now}")
         print(f"Critical notifications since:    {len(criticals)} total, "
               f"{len(breaker_notifs)} match the breaker marker")
@@ -258,9 +268,12 @@ async def main() -> int:
             ("HWM resolved to the synthetic value",
              check.high_water_mark >= HWM_EQUITY,
              f"high_water_mark={check.high_water_mark}"),
-            ("system_flags.kill_switch flipped to true",
-             kill_switch_now is True,
-             f"kill_switch={kill_switch_now}"),
+            ("system_flags.new_entries_enabled flipped to false",
+             new_entries_now is False,
+             f"new_entries_enabled={new_entries_now}"),
+            ("kill_switch untouched by the breaker",
+             kill_switch_now is kill_switch_before,
+             f"kill_switch={kill_switch_now} (was {kill_switch_before})"),
             ("critical notification with breaker marker enqueued",
              len(breaker_notifs) >= 1,
              f"matched={len(breaker_notifs)}"),
@@ -268,15 +281,16 @@ async def main() -> int:
     finally:
         print("-" * 70)
         print("Cleaning up: removing synthetic snapshot + critical notification, "
-              "restoring kill_switch.")
+              "restoring new_entries_enabled.")
         await _cleanup(
             synthetic_snapshot_id=synthetic_snapshot_id,
             test_window_start=test_window_start,
-            initial_kill_switch=initial_kill_switch,
+            initial_new_entries_enabled=initial_new_entries,
         )
         restored = await get_all_flags()
-        print(f"Restored kill_switch to:         {restored['kill_switch']} "
-              f"(was {initial_kill_switch} before the run)")
+        print(f"Restored new_entries_enabled to: "
+              f"{restored['new_entries_enabled']} "
+              f"(was {initial_new_entries} before the run)")
         await close_pool()
 
     print()

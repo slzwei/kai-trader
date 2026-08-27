@@ -89,7 +89,7 @@ async def test_check_and_trip_no_breach_does_nothing(
 
     check = await drawdown.check_and_trip(
         current_equity=Decimal("99000"),
-        kill_switch_already_on=False,
+        entries_enabled=True,
     )
 
     assert check.breached is False
@@ -97,33 +97,44 @@ async def test_check_and_trip_no_breach_does_nothing(
     enqueue.assert_not_awaited()
 
 
-async def test_check_and_trip_fresh_breach_engages_kill_switch(
+async def test_check_and_trip_fresh_breach_engages_entry_freeze(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A fresh breach flips new_entries_enabled off and notifies. It must
+    never touch kill_switch: the freeze stops risk-taking, not the system."""
     monkeypatch.setattr(
         drawdown, "recent_snapshots",
         AsyncMock(return_value=[_snap(Decimal("100000"))]),
     )
-    set_flag = AsyncMock()
+    set_flag = AsyncMock(return_value=True)  # prior value: entries were on
     enqueue = AsyncMock()
     monkeypatch.setattr(drawdown, "set_flag", set_flag)
     monkeypatch.setattr(drawdown, "enqueue", enqueue)
 
     check = await drawdown.check_and_trip(
         current_equity=Decimal("90000"),
-        kill_switch_already_on=False,
+        entries_enabled=True,
     )
 
     assert check.breached is True
-    set_flag.assert_awaited_once_with("kill_switch", True, actor=drawdown.WORKER_ACTOR_ID)
+    set_flag.assert_awaited_once_with(
+        "new_entries_enabled", False, actor=drawdown.WORKER_ACTOR_ID
+    )
     enqueue.assert_awaited_once()
     args = enqueue.await_args
     assert args.args[1] == "critical"
+    body = args.args[0]
+    assert "DRAWDOWN CIRCUIT BREAKER" in body
+    assert "new_entries_enabled" in body
+    assert "kill_switch" not in body
 
 
-async def test_check_and_trip_idempotent_when_already_killed(
+async def test_check_and_trip_idempotent_when_already_frozen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Entries already off (prior trip or operator preference): the breach
+    is logged but nothing is re-set and nothing is re-notified, so a
+    multi-day breach cannot flood Telegram or churn the flag audit row."""
     monkeypatch.setattr(
         drawdown, "recent_snapshots",
         AsyncMock(return_value=[_snap(Decimal("100000"))]),
@@ -135,9 +146,34 @@ async def test_check_and_trip_idempotent_when_already_killed(
 
     check = await drawdown.check_and_trip(
         current_equity=Decimal("90000"),
-        kill_switch_already_on=True,
+        entries_enabled=False,
     )
 
     assert check.breached is True
     set_flag.assert_not_awaited()
+    enqueue.assert_not_awaited()
+
+
+async def test_check_and_trip_skips_notify_when_freeze_race_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deploy-crossover race: a twin process froze the flag between our
+    flags read and our write. set_flag reports prior=False, so this
+    process must not send a duplicate critical notification."""
+    monkeypatch.setattr(
+        drawdown, "recent_snapshots",
+        AsyncMock(return_value=[_snap(Decimal("100000"))]),
+    )
+    set_flag = AsyncMock(return_value=False)  # someone else already froze it
+    enqueue = AsyncMock()
+    monkeypatch.setattr(drawdown, "set_flag", set_flag)
+    monkeypatch.setattr(drawdown, "enqueue", enqueue)
+
+    check = await drawdown.check_and_trip(
+        current_equity=Decimal("90000"),
+        entries_enabled=True,
+    )
+
+    assert check.breached is True
+    set_flag.assert_awaited_once()
     enqueue.assert_not_awaited()

@@ -1,9 +1,12 @@
-"""Read-only Alpaca broker access.
+"""Alpaca broker access.
 
-Phase 2 deliberately exposes only fetch operations: account snapshot, open
-positions, and a liveness ping. No order placement, no cancellations, no
-state mutation. The wheel strategy and order routing arrive in later phases
-and will be gated behind the trading_enabled system flag.
+Phase 2 started read-only (account snapshot, positions, liveness ping);
+later phases added the gated mutation surface: short put / short call
+submission (kill_switch + trading_enabled + new_entries_enabled), buy to
+close and position close (kill_switch only, closing reduces exposure),
+and order cancellation (kill_switch only, same rationale). Every mutating
+call reads system_flags immediately before touching Alpaca, so the flag
+check is always the last gate before the wire.
 
 The official ``alpaca-py`` SDK is sync. We push each call into a worker
 thread via ``asyncio.to_thread`` so the bot's event loop stays responsive.
@@ -693,6 +696,96 @@ async def submit_buy_to_close(
         reason=None,
         flags=flags,
     )
+
+
+@dataclass(frozen=True)
+class CancelResult:
+    """Outcome of an order-cancellation request.
+
+    ``requested`` means the cancel was accepted by Alpaca; the order is
+    not necessarily cancelled yet (broker cancels are asynchronous and
+    the order may still partially fill first), so callers must NOT mark
+    local state cancelled on the strength of this result. Reconciliation
+    stays the single writer of terminal order statuses.
+    """
+
+    requested: bool
+    reason: str | None
+    flags: dict[str, bool]
+    error: str | None = None
+
+
+def _is_not_cancelable(error_str: str) -> bool:
+    """Detect the benign 'already terminal' family of cancel rejections.
+
+    Alpaca refuses to cancel an order that is already filled, cancelled,
+    expired, or rejected. That is not a failure of the cancel sweep: the
+    broker state is already terminal and reconciliation will record the
+    truth on its next pass.
+    """
+    lowered = error_str.lower()
+    return (
+        "not cancelable" in lowered
+        or "cannot be canceled" in lowered
+        or "unable to be canceled" in lowered
+        or "order not found" in lowered
+        or "42210000" in error_str
+        or "40410000" in error_str
+    )
+
+
+async def cancel_order(alpaca_order_id: str) -> CancelResult:
+    """Request cancellation of a working order. Gated by kill_switch only.
+
+    Cancelling a working order only ever reduces prospective exposure, so
+    like ``close_position`` it stays available when ``trading_enabled``
+    and ``new_entries_enabled`` are off (the drawdown entry freeze uses
+    exactly that window to pull risk-increasing orders). The kill switch
+    still blocks it: a system kill means we do not trust our own view of
+    broker state, so the bot mutates nothing, cancels included.
+
+    Safe to retry: a repeat cancel of an already-terminal order comes
+    back as the benign ``not_cancelable`` reason.
+    """
+    flags = await get_all_flags()
+    if flags.get("kill_switch", False):
+        _log.warning(
+            "alpaca.cancel.refused_kill_switch",
+            alpaca_order_id=alpaca_order_id,
+        )
+        return CancelResult(
+            requested=False,
+            reason="kill_switch_engaged",
+            flags=flags,
+        )
+    try:
+        await _call_alpaca_with_retry("cancel_order_by_id", alpaca_order_id)
+    except Exception as exc:
+        if _is_not_cancelable(str(exc)):
+            _log.info(
+                "alpaca.cancel.not_cancelable",
+                alpaca_order_id=alpaca_order_id,
+                error=str(exc),
+            )
+            return CancelResult(
+                requested=False,
+                reason="not_cancelable",
+                flags=flags,
+                error=str(exc),
+            )
+        _log.error(
+            "alpaca.cancel.failed",
+            alpaca_order_id=alpaca_order_id,
+            error=str(exc),
+        )
+        return CancelResult(
+            requested=False,
+            reason="cancel_exception",
+            flags=flags,
+            error=str(exc),
+        )
+    _log.info("alpaca.cancel.requested", alpaca_order_id=alpaca_order_id)
+    return CancelResult(requested=True, reason=None, flags=flags)
 
 
 async def get_order_status(alpaca_order_id: str) -> OrderStatusSnapshot:

@@ -224,6 +224,32 @@ kai-trader/
 
 Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, 5c, 5d, 5e, R1, A1, D1, **and U1** shipped:
 
+- Safety S1 (2026-08-27) splits the market-risk freeze from the system
+  kill. The drawdown breaker (7% off the 7-day high) no longer engages
+  `kill_switch`; it flips `new_entries_enabled` off (actor -1) and
+  fires one critical notification. Under the freeze: no new CSPs, no
+  covered calls, no roll reopens (rolls were already entries-gated;
+  the challenged put rides to assignment by design), while
+  reconciliation, assignment detection, position snapshots,
+  profit-takes, and `/close` all keep working. Each breached tick also
+  requests broker cancellation of working risk-increasing orders
+  (`open_short_put`, `open_covered_call`, `roll` reopen legs) via the
+  new `broker.alpaca.cancel_order` (kill-gated, request-only:
+  reconciliation stays the sole writer of terminal statuses, so a
+  cancel race with a partial fill is recorded truthfully); close-side
+  working orders are never touched. The sweep re-runs while the breach
+  holds, so failures retry and restarts are safe; a still-breached
+  account re-freezes on the next tick even if the operator re-enables
+  entries. `kill_switch` is now manual-only (`/kill`) and stricter:
+  no orders, closes, or cancels, but the killed tick still reconciles
+  fills, records OPASN assignments, and persists position snapshots,
+  so being killed never means being blind (killed-tick summaries also
+  dropped from alert to info priority). Recovery: `/flag
+  new_entries_enabled on` when ready; with entries off and kill off,
+  management (profit-takes, rolls held by design, manual closes) runs
+  without new entries. No auto-liquidation anywhere: the breaker
+  freezes and escalates, the human decides (paper anomalies like the
+  2026-07-07 assigned-stock wipe can fake a crater).
 - Phase U1 (2026-08-27) adds the weekly universe review and web
   approvals. New `kai_trader/universe/` package: a curated candidate
   pool (`pool.py`, changed only by PR), a deterministic eligibility
@@ -492,9 +518,10 @@ Earlier phases unchanged:
   - **Drawdown circuit breaker** at `src/kai_trader/strategy/drawdown.py`.
     Each tick reads recent `account_snapshots`, computes the high-water
     mark over a 7-day window, and if equity is down 7% or more from
-    that high it auto-engages `kill_switch` and fires a `critical`
-    notification. Idempotent: re-tripping on the same already-killed
-    state does not re-notify.
+    that high it engages the entry freeze (`new_entries_enabled` off,
+    see Safety S1 above; it never touches `kill_switch`) and fires a
+    `critical` notification. Idempotent: a breach while already frozen
+    logs but does not re-set or re-notify.
   - **Roll logic** at `src/kai_trader/strategy/rolls.py`. Worker
     fetches Alpaca positions, identifies short puts whose live delta
     has crossed the sleeve's `roll_trigger_delta` (default 0.45), and

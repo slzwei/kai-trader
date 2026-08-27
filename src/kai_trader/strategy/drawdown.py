@@ -3,12 +3,25 @@
 Reads recent ``account_snapshots`` rows, computes the high-water mark over
 ``lookback_days``, and decides whether the drawdown from that high exceeds
 the configured threshold. The strategy worker calls ``check_and_trip``
-each tick so a sudden equity drop auto-engages the kill switch and fires
+each tick so a sudden equity drop auto-engages the entry freeze and fires
 a critical-priority notification.
 
 Threshold and lookback come from PHASE3.md: 7% drop from the prior week's
 high. The hard 10% drawdown ceiling sits one tick above the breaker so an
 operator has time to investigate before manual stop-out.
+
+A breach is a MARKET emergency, not a software emergency, so the breaker
+freezes risk-taking without blinding the system or blocking risk
+reduction. It flips ``new_entries_enabled`` off (the freeze), which stops
+new CSPs, new covered calls, and roll reopens, while reconciliation,
+assignment detection, profit-takes, and manual closes keep running. The
+worker separately cancels any working risk-increasing orders while the
+breach holds. ``kill_switch`` is reserved for the stricter case where the
+operator does not trust the software or broker state; the breaker never
+touches it. While equity stays 7% or more below the 7-day high, the
+freeze re-engages on the next tick even if the operator flips the flag
+back on, so recovery is deliberate: wait for the breach to clear or
+accept the re-trip.
 """
 
 from __future__ import annotations
@@ -69,14 +82,26 @@ def compute_drawdown(
 async def check_and_trip(
     *,
     current_equity: Decimal,
-    kill_switch_already_on: bool,
+    entries_enabled: bool,
     current_account_number: str | None = None,
 ) -> DrawdownCheck:
-    """Read recent snapshots, evaluate drawdown, trip the kill switch if needed.
+    """Read recent snapshots, evaluate drawdown, engage the entry freeze if needed.
 
     Returns the check result so the worker can include the numbers in its
-    tick summary. When the breach is fresh (kill switch was off), this also
-    fires a critical-priority notification.
+    tick summary and drive the working-order cancel sweep. When the breach
+    is fresh (``new_entries_enabled`` was on), this flips the flag off and
+    fires a critical-priority notification. The freeze deliberately does
+    NOT touch ``kill_switch``: position management, profit-takes, manual
+    closes, reconciliation, and assignment detection all keep running so a
+    drawdown never blinds the system or blocks risk reduction.
+
+    ``entries_enabled`` is the caller's current read of the flag. When it
+    is already off (operator preference or a prior trip), the breach is
+    logged but nothing is re-set and nothing is re-notified, so a multi-day
+    breach does not churn ``system_flags.updated_by`` or flood Telegram.
+    ``set_flag`` returns the prior value, which closes the deploy-crossover
+    race: if a twin process froze the flag between our read and our write,
+    the prior comes back False and the duplicate notification is skipped.
 
     ``current_account_number`` scopes the snapshot lookup to the Alpaca
     account currently in use. Without it, swapping Alpaca accounts (e.g.
@@ -102,22 +127,38 @@ async def check_and_trip(
     check = compute_drawdown(snapshots, current_equity)
     if not check.breached:
         return check
-    if kill_switch_already_on:
+    if not entries_enabled:
         _log.info(
-            "drawdown.breached_already_killed",
+            "drawdown.breached_already_frozen",
             drawdown_pct=str(check.drawdown_pct),
             high_water_mark=str(check.high_water_mark),
             current_equity=str(check.current_equity),
         )
         return check
 
-    await set_flag("kill_switch", True, actor=WORKER_ACTOR_ID)
+    prior = await set_flag("new_entries_enabled", False, actor=WORKER_ACTOR_ID)
+    if not prior:
+        # A concurrent process (deploy crossover twin) froze the flag
+        # between our flags read and this write. The freeze is already
+        # in force and already announced; do not notify twice.
+        _log.info(
+            "drawdown.freeze_lost_race",
+            drawdown_pct=str(check.drawdown_pct),
+        )
+        return check
+
     body = (
         f"{bold('DRAWDOWN CIRCUIT BREAKER')}\n"
         f"{check.drawdown_pct:.2f}% drop from {check.high_water_mark} "
         f"to {check.current_equity}.\n"
-        "Kill switch engaged automatically. Investigate before clearing "
-        "with /flag kill_switch off."
+        "Entry freeze engaged automatically (new_entries_enabled off): no "
+        "new CSPs, covered calls, or roll reopens, and working entry "
+        "orders are being cancelled. Reconciliation, assignment "
+        "detection, profit-takes, and /close all keep working.\n"
+        "Investigate, then re-enable with /flag new_entries_enabled on. "
+        "While the drawdown stays at or above 7% of the 7-day high, the "
+        "freeze re-engages on the next tick. For a full stop (no orders "
+        "of any kind), use /kill instead."
     )
     await enqueue(body, "critical", channel="telegram")
     _log.error(

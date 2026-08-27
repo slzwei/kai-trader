@@ -4,8 +4,12 @@ Phase 3.4 wires the worker into actual order submission. Each tick:
 
 1. Reconciles status of any pending/submitted orders against Alpaca,
    writing back fill info.
-2. Skips early if the market is closed or kill_switch is engaged
-   (still emits a heartbeat in the latter case).
+2. Skips early if the market is closed. If kill_switch is engaged the
+   tick stops after the observation work (reconciliation, assignment
+   detection, position snapshot): execution is frozen, awareness is not.
+   A drawdown breach engages the entry freeze (new_entries_enabled off)
+   and cancels working risk-increasing orders, but the tick continues so
+   position management keeps running.
 3. Computes regime, refreshes account, reads sleeve config, builds
    candidate intents.
 4. For each intent: records the intent row (status pending), then
@@ -25,6 +29,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Literal
 
 from kai_trader.ai.decision import (
     AIFilterOutcome,
@@ -36,6 +41,7 @@ from kai_trader.broker.alpaca import (
     OrderStatusSnapshot,
     PositionSnapshot,
     SubmitResult,
+    cancel_order,
     close_position,
     get_account,
     get_assignment_activities,
@@ -114,6 +120,16 @@ from kai_trader.strategy.trend import get_trend_status
 _log = get_logger(__name__)
 
 _TERMINAL_ALPACA_STATUSES = {"filled", "canceled", "expired", "rejected"}
+
+# Order actions that ADD exposure when they fill: a new short put (entry or
+# the reopen leg of a roll, action='roll') or a new covered call. While the
+# drawdown breach holds, the tick cancels working orders with these actions
+# so a limit order submitted seconds before the trip cannot quietly fill
+# into a falling market. Close-side actions ('close', 'profit_take_close',
+# 'close_covered_call') only ever reduce exposure and are never cancelled.
+RISK_INCREASING_ACTIONS = frozenset(
+    {"open_short_put", "open_covered_call", "roll"}
+)
 
 # W-9: post-fill delta verification. We compare the contract's live delta
 # at fill time to the target delta the strategy intended. A drift larger
@@ -404,21 +420,63 @@ class StrategyWorker:
         flags = await get_all_flags()
 
         # Drawdown circuit breaker runs before strategy logic so a fresh
-        # breach trips the kill switch and short-circuits this tick. The
+        # breach engages the entry freeze (new_entries_enabled off) for
+        # the remainder of this tick. The freeze stops risk-taking only:
+        # reconciliation, assignment detection, profit-takes, and manual
+        # closes keep running, and kill_switch is never touched. The
         # account_number scopes the snapshot lookup so a previous Alpaca
         # account's equity history cannot poison the high-water mark.
         account = await get_account()
         dd_check = await check_drawdown(
             current_equity=account.equity,
-            kill_switch_already_on=flags.get("kill_switch", False),
+            entries_enabled=flags.get("new_entries_enabled", False),
             current_account_number=account.account_number or None,
         )
-        if dd_check.breached and not flags.get("kill_switch", False):
-            # We just tripped the breaker. Re-read flags so the rest of
-            # the tick sees kill_switch=true.
+        if dd_check.breached:
+            # The breaker may have just flipped the entries flag. Re-read
+            # so the rest of the tick (roll gating, submit audit rows)
+            # sees the freeze. The broker layer re-reads flags anyway as
+            # the last gate, so this is display and audit accuracy.
             flags = await get_all_flags()
 
         if flags.get("kill_switch", False):
+            # System kill: the operator does not trust the software or
+            # broker state, so the bot mutates NOTHING at the broker
+            # (no orders, no closes, no cancels). Awareness continues:
+            # reconciliation already ran above, and assignment
+            # detection plus the dashboard position snapshot run here
+            # so being killed never means being blind. Every fetch is
+            # best-effort; a killed tick must not start failing.
+            killed_shorts: list[PositionSnapshot] | None
+            killed_equity: list[PositionSnapshot] | None
+            try:
+                killed_shorts = await list_short_option_positions()
+            except Exception as exc:
+                _log.warning(
+                    "strategy.killed.shorts_fetch_failed", error=str(exc)
+                )
+                killed_shorts = None
+            try:
+                killed_equity = await list_long_equity_positions()
+            except Exception as exc:
+                _log.warning(
+                    "strategy.killed.equity_fetch_failed", error=str(exc)
+                )
+                killed_equity = None
+            if killed_shorts is not None and killed_equity is not None:
+                # Same partial-book rule as the live path: never persist
+                # half a book as if it were the whole book.
+                try:
+                    await record_position_snapshot(
+                        [*killed_shorts, *killed_equity],
+                        account_number=account.account_number or None,
+                    )
+                except Exception as exc:
+                    _log.warning(
+                        "strategy.killed.position_snapshot_failed",
+                        error=str(exc),
+                    )
+            assignments_recorded = await self._handle_assignments()
             summary = render_kill_switch(
                 timestamp_label=format_sgt_timestamp(settings.timezone),
                 reconciled=reconciled,
@@ -428,10 +486,29 @@ class StrategyWorker:
                 high_water_mark=(
                     dd_check.high_water_mark if dd_check.breached else None
                 ),
+                assignments_recorded=assignments_recorded,
             )
-            await enqueue(summary, "alert", channel="telegram")
-            _log.info("strategy.tick.kill_switch_engaged", reconciled=reconciled)
+            # Routine per-tick summary, same cadence as a normal tick's
+            # info summary. The alarm already fired when the switch was
+            # engaged; repeating it at alert priority every 5 minutes
+            # buried real alerts.
+            await enqueue(summary, "info", channel="telegram")
+            _log.info(
+                "strategy.tick.kill_switch_engaged",
+                reconciled=reconciled,
+                assignments_recorded=assignments_recorded,
+            )
             return summary
+
+        if dd_check.breached:
+            # Entry freeze in force and execution is trusted (no kill):
+            # pull any working risk-increasing orders so nothing submitted
+            # before the trip can still fill into the drawdown. Runs every
+            # breached tick, so a cancel that fails (or a restart mid-
+            # breach) is retried for as long as the breach holds; once the
+            # broker confirms, reconciliation records the terminal state
+            # and the order drops out of the working set on its own.
+            await self._cancel_risk_increasing_orders(working_orders)
 
         regime, transitioned = await compute_and_record(notes="strategy tick")
         sleeves = await get_all_sleeves()
@@ -600,6 +677,20 @@ class StrategyWorker:
                 iv_percentile_provider=compute_iv_percentile_rank,
             )
             diagnostic_warnings = diagnostics.warning_lines()
+
+        if dd_check.breached:
+            # Surface the freeze in every tick summary while the breach
+            # holds, so the operator sees WHY entries are skipping without
+            # digging through flags or the original trip notification.
+            diagnostic_warnings = [
+                (
+                    f"Drawdown breaker: {dd_check.drawdown_pct:.2f}% below "
+                    f"7-day high {dd_check.high_water_mark}. Entry freeze "
+                    "active: no new CSPs, covered calls, or rolls. "
+                    "Profit-takes, closes, and monitoring continue."
+                ),
+                *diagnostic_warnings,
+            ]
 
         submitted: list[str] = []
         skipped: list[str] = []
@@ -1335,6 +1426,108 @@ class StrategyWorker:
 
         await mark_status(row_id, "failed", error_text=_format_error_text(result))
         return "failed"
+
+    async def _cancel_risk_increasing_orders(
+        self, working_orders: list[OrderRow]
+    ) -> tuple[list[str], list[str]]:
+        """Request broker cancellation of working orders that would add risk.
+
+        Runs while the drawdown breach holds (and kill_switch is off).
+        Only actions in ``RISK_INCREASING_ACTIONS`` are touched; working
+        close-side orders are left to finish reducing exposure.
+
+        This REQUESTS cancellation only. Local order rows are never
+        marked cancelled here: Alpaca cancels asynchronously and the
+        order may still partially fill first, so reconciliation stays
+        the single writer of terminal statuses (including its
+        partial-fill-on-cancel handling). An order the broker reports as
+        already terminal (``not_cancelable``) is treated as a no-op for
+        the same reason. A genuine broker failure is surfaced at
+        critical priority and retried on the next breached tick because
+        the order stays in the working set.
+
+        Returns ``(cancelled_labels, failed_labels)`` for logging/tests.
+        """
+        to_cancel = [
+            row
+            for row in working_orders
+            if row.action in RISK_INCREASING_ACTIONS
+            and row.alpaca_order_id is not None
+        ]
+        if not to_cancel:
+            return [], []
+
+        cancelled: list[str] = []
+        failed: list[str] = []
+        for row in to_cancel:
+            label = f"{row.symbol} {row.action} {row.option_symbol}"
+            assert row.alpaca_order_id is not None  # narrowed above
+            try:
+                result = await cancel_order(row.alpaca_order_id)
+            except Exception as exc:
+                failed.append(f"{label}: {exc}")
+                _log.error(
+                    "strategy.freeze_cancel.exception",
+                    row_id=row.id,
+                    alpaca_order_id=row.alpaca_order_id,
+                    error=str(exc),
+                )
+                continue
+            if result.requested:
+                cancelled.append(label)
+                _log.info(
+                    "strategy.freeze_cancel.requested",
+                    row_id=row.id,
+                    alpaca_order_id=row.alpaca_order_id,
+                    action=row.action,
+                    option_symbol=row.option_symbol,
+                )
+            elif result.reason == "not_cancelable":
+                # Already terminal at the broker; reconciliation will
+                # record the real outcome. Nothing to report.
+                _log.info(
+                    "strategy.freeze_cancel.already_terminal",
+                    row_id=row.id,
+                    alpaca_order_id=row.alpaca_order_id,
+                )
+            else:
+                failed.append(
+                    f"{label}: {result.reason or 'unknown'}"
+                    + (f" ({result.error})" if result.error else "")
+                )
+                _log.error(
+                    "strategy.freeze_cancel.refused",
+                    row_id=row.id,
+                    alpaca_order_id=row.alpaca_order_id,
+                    reason=result.reason,
+                    error=result.error,
+                )
+
+        if cancelled or failed:
+            lines = ["DRAWDOWN FREEZE: working-order sweep."]
+            if cancelled:
+                lines.append(
+                    f"Cancel requested for {len(cancelled)} risk-increasing "
+                    "working order(s):"
+                )
+                lines.extend(f"- {label}" for label in cancelled)
+            if failed:
+                lines.append(
+                    f"Cancel FAILED for {len(failed)} order(s); they are "
+                    "still working at the broker and will be retried next "
+                    "tick while the breach holds:"
+                )
+                lines.extend(f"- {label}" for label in failed)
+            priority: Literal["alert", "critical"] = (
+                "critical" if failed else "alert"
+            )
+            try:
+                await enqueue("\n".join(lines), priority, channel="telegram")
+            except Exception as exc:
+                _log.error(
+                    "strategy.freeze_cancel.notify_failed", error=str(exc)
+                )
+        return cancelled, failed
 
     async def _reconcile_pending(self) -> tuple[int, list[OrderRow]]:
         """Check Alpaca for status updates on any non-terminal orders.

@@ -12,6 +12,7 @@ import pytest
 from kai_trader.broker.alpaca import (
     AccountSnapshot,
     AssignmentActivity,
+    CancelResult,
     OrderStatusSnapshot,
     PositionSnapshot,
     SubmitResult,
@@ -197,6 +198,9 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
         submitted=True, alpaca_order_id="close-uuid", order_status="accepted",
         reason=None, flags={},
     ))
+    cancel_order = AsyncMock(return_value=CancelResult(
+        requested=True, reason=None, flags={},
+    ))
     check_drawdown = AsyncMock(return_value=DrawdownCheck(
         high_water_mark=Decimal("100000"),
         current_equity=Decimal("100000"),
@@ -258,6 +262,7 @@ def _patch_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]
     )
     monkeypatch.setattr(worker_module, "submit_buy_to_close", submit_buy_to_close)
     monkeypatch.setattr(worker_module, "close_position", close_position)
+    monkeypatch.setattr(worker_module, "cancel_order", cancel_order)
     monkeypatch.setattr(worker_module, "check_drawdown", check_drawdown)
     monkeypatch.setattr(worker_module, "evaluate_rolls", evaluate_rolls)
     monkeypatch.setattr(worker_module, "submit_short_call", submit_short_call)
@@ -324,6 +329,9 @@ async def test_tick_kill_switch_engaged(
     monkeypatch: pytest.MonkeyPatch,
     _patch_dependencies: dict[str, AsyncMock],
 ) -> None:
+    """Kill switch freezes execution but not awareness: no strategy body,
+    no orders, no cancels, while assignment detection and the dashboard
+    position snapshot still run on the already-reconciled tick."""
     monkeypatch.setattr(
         worker_module, "get_clock_snapshot",
         AsyncMock(return_value=_clock(is_open=True)),
@@ -337,6 +345,61 @@ async def test_tick_kill_switch_engaged(
     _patch_dependencies["enqueue"].assert_awaited_once()
     _patch_dependencies["compute_and_record"].assert_not_awaited()
     _patch_dependencies["submit_short_put"].assert_not_awaited()
+    _patch_dependencies["cancel_order"].assert_not_awaited()
+    # Observation continues while killed.
+    _patch_dependencies["get_assignment_activities"].assert_awaited_once()
+    _patch_dependencies["record_position_snapshot"].assert_awaited_once()
+
+
+async def test_tick_kill_switch_records_assignment_and_fill(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """While killed, a fill reconciles into the orders table and an OPASN
+    assignment is recorded, so the account view stays accurate."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "kill_switch": True,
+    }
+    # A submitted order that filled while we were killed.
+    _patch_dependencies["pending_orders"].return_value = [_pending_row()]
+    _patch_dependencies["get_order_status"].return_value = _filled_status()
+    # An assignment activity for that underlying.
+    _patch_dependencies["get_assignment_activities"].return_value = [
+        AssignmentActivity(
+            activity_id="opasn-1",
+            activity_date=date(2026, 4, 27),
+            symbol="SPY260505P00050000",
+            qty=Decimal("1"),
+            status="executed",
+        )
+    ]
+    _patch_dependencies["filled_csps_and_assignments_for_symbols"].return_value = [
+        _pending_row()
+    ]
+    # Matcher correctness is covered in test_strategy_assignment; here we
+    # only prove the killed tick exercises the detection path.
+    monkeypatch.setattr(
+        worker_module,
+        "detect_assignments",
+        lambda activities, window: [],
+    )
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "Kill switch engaged" in summary
+    # The fill was written back even though the tick is killed.
+    _patch_dependencies["mark_status"].assert_awaited()
+    status_args = _patch_dependencies["mark_status"].await_args
+    assert status_args.args[1] == "filled"
+    # Assignment detection consulted the OPASN feed and the orders window.
+    _patch_dependencies["get_assignment_activities"].assert_awaited_once()
+    _patch_dependencies[
+        "filled_csps_and_assignments_for_symbols"
+    ].assert_awaited_once()
 
 
 async def test_tick_submits_when_flags_green(
@@ -578,35 +641,292 @@ def test_map_alpaca_status_translation() -> None:
 
 # ------------- drawdown integration -------------
 
-async def test_tick_drawdown_breach_short_circuits(
-    monkeypatch: pytest.MonkeyPatch,
-    _patch_dependencies: dict[str, AsyncMock],
-) -> None:
+def _breached_check() -> Any:
     from kai_trader.strategy.drawdown import DrawdownCheck
 
-    monkeypatch.setattr(
-        worker_module, "get_clock_snapshot",
-        AsyncMock(return_value=_clock(is_open=True)),
-    )
-    # Simulate the breaker tripping: first flags read says kill off, then
-    # check_drawdown engages it, then a re-read says kill on.
-    _patch_dependencies["get_flags"].side_effect = [
-        {"trading_enabled": True, "kill_switch": False},
-        {"trading_enabled": True, "kill_switch": True},
-    ]
-    _patch_dependencies["check_drawdown"].return_value = DrawdownCheck(
+    return DrawdownCheck(
         high_water_mark=Decimal("100000"),
         current_equity=Decimal("90000"),
         drawdown_pct=Decimal("10"),
         breached=True,
     )
 
+
+def _accepted_status(alpaca_order_id: str = "alpaca-w10") -> OrderStatusSnapshot:
+    """A non-terminal broker status, so reconcile leaves the row working."""
+    return OrderStatusSnapshot(
+        alpaca_order_id=alpaca_order_id,
+        status="accepted",
+        filled_qty=Decimal("0"),
+        filled_avg_price=None,
+        filled_at=None,
+        submitted_at=datetime(2026, 4, 27, 14, 30, tzinfo=UTC),
+        cancelled_at=None,
+        failed_at=None,
+    )
+
+
+async def test_tick_drawdown_breach_freezes_entries_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Scenario 1: breach with no working orders. The breaker freezes
+    entries (via check_drawdown) but the tick CONTINUES: regime records,
+    management paths run, and the summary carries the freeze banner. No
+    kill, no cancels, no liquidation."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    # First flags read: entries still on. Post-trip re-read: frozen.
+    _patch_dependencies["get_flags"].side_effect = [
+        {"trading_enabled": True, "new_entries_enabled": True,
+         "kill_switch": False},
+        {"trading_enabled": True, "new_entries_enabled": False,
+         "kill_switch": False},
+    ]
+    _patch_dependencies["check_drawdown"].return_value = _breached_check()
+
     summary = await worker_module.StrategyWorker().tick()
 
-    assert "Kill switch engaged" in summary
-    assert "Drawdown 10.00%" in summary
-    _patch_dependencies["compute_and_record"].assert_not_awaited()
+    # The tick ran its full body rather than short-circuiting.
+    _patch_dependencies["compute_and_record"].assert_awaited_once()
+    assert "Entry freeze" in summary
+    assert "10.00%" in summary
+    # The breaker was consulted with the flag state it needs to decide
+    # fresh-trip vs already-frozen.
+    dd_kwargs = _patch_dependencies["check_drawdown"].await_args.kwargs
+    assert dd_kwargs["entries_enabled"] is True
+    # Nothing was submitted, nothing needed cancelling, nothing killed.
     _patch_dependencies["submit_short_put"].assert_not_awaited()
+    _patch_dependencies["cancel_order"].assert_not_awaited()
+    assert "Kill switch engaged" not in summary
+    # One notification: the routine tick summary. (The trip's critical
+    # notification is enqueued inside check_and_trip, stubbed here.)
+    _patch_dependencies["enqueue"].assert_awaited_once()
+
+
+async def test_tick_drawdown_breach_cancels_working_entry_order(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Scenario 2: a CSP entry order is still working at the broker when
+    the breaker trips. The tick requests its cancellation, does NOT mark
+    the local row cancelled (reconciliation owns terminal states), and
+    tells the operator."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].side_effect = [
+        {"trading_enabled": True, "new_entries_enabled": True,
+         "kill_switch": False},
+        {"trading_enabled": True, "new_entries_enabled": False,
+         "kill_switch": False},
+    ]
+    _patch_dependencies["check_drawdown"].return_value = _breached_check()
+    _patch_dependencies["pending_orders"].return_value = [
+        _working_row(action="open_short_put")
+    ]
+    _patch_dependencies["get_order_status"].return_value = _accepted_status()
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["cancel_order"].assert_awaited_once_with("alpaca-w10")
+    # Reconciliation stays the single writer of terminal statuses: the
+    # sweep never marks rows cancelled on its own.
+    for call in _patch_dependencies["mark_status"].await_args_list:
+        assert call.args[1] != "cancelled"
+    # The sweep announced itself.
+    sweep_messages = [
+        call.args[0]
+        for call in _patch_dependencies["enqueue"].await_args_list
+        if "DRAWDOWN FREEZE" in call.args[0]
+    ]
+    assert len(sweep_messages) == 1
+    assert "Cancel requested" in sweep_messages[0]
+    assert "SPY open_short_put" in sweep_messages[0]
+
+
+async def test_tick_drawdown_breach_spares_working_close_orders(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Scenario 3: a working risk-REDUCING order (profit-take close) must
+    ride through the trip untouched so it can finish cutting exposure."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].side_effect = [
+        {"trading_enabled": True, "new_entries_enabled": True,
+         "kill_switch": False},
+        {"trading_enabled": True, "new_entries_enabled": False,
+         "kill_switch": False},
+    ]
+    _patch_dependencies["check_drawdown"].return_value = _breached_check()
+    _patch_dependencies["pending_orders"].return_value = [
+        _working_row(action="profit_take_close")
+    ]
+    _patch_dependencies["get_order_status"].return_value = _accepted_status()
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["cancel_order"].assert_not_awaited()
+
+
+async def test_tick_drawdown_breach_cancel_failure_is_surfaced(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Scenario 10: the broker refuses the cancel. The failure is surfaced
+    at critical priority, the local row is NOT marked cancelled, and the
+    order stays in the working set so the next breached tick retries."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].side_effect = [
+        {"trading_enabled": True, "new_entries_enabled": True,
+         "kill_switch": False},
+        {"trading_enabled": True, "new_entries_enabled": False,
+         "kill_switch": False},
+    ]
+    _patch_dependencies["check_drawdown"].return_value = _breached_check()
+    _patch_dependencies["pending_orders"].return_value = [
+        _working_row(action="open_short_put")
+    ]
+    _patch_dependencies["get_order_status"].return_value = _accepted_status()
+    _patch_dependencies["cancel_order"].return_value = CancelResult(
+        requested=False, reason="cancel_exception", flags={},
+        error="alpaca 500",
+    )
+
+    await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["cancel_order"].assert_awaited_once_with("alpaca-w10")
+    for call in _patch_dependencies["mark_status"].await_args_list:
+        assert call.args[1] != "cancelled"
+    failure_calls = [
+        call
+        for call in _patch_dependencies["enqueue"].await_args_list
+        if "Cancel FAILED" in call.args[0]
+    ]
+    assert len(failure_calls) == 1
+    assert failure_calls[0].args[1] == "critical"
+    assert "cancel_exception" in failure_calls[0].args[0]
+    assert "alpaca 500" in failure_calls[0].args[0]
+
+
+async def test_tick_freeze_holds_across_ticks_without_new_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Scenarios 4 and 11: a later tick (or a restarted worker; each test
+    builds a fresh StrategyWorker, which is exactly the restart case)
+    while the breach holds and entries are already off. The breaker sees
+    already-frozen, the empty working set means no cancels, and the only
+    notification is the routine tick summary."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].side_effect = [
+        {"trading_enabled": True, "new_entries_enabled": False,
+         "kill_switch": False},
+        {"trading_enabled": True, "new_entries_enabled": False,
+         "kill_switch": False},
+    ]
+    _patch_dependencies["check_drawdown"].return_value = _breached_check()
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    dd_kwargs = _patch_dependencies["check_drawdown"].await_args.kwargs
+    assert dd_kwargs["entries_enabled"] is False
+    _patch_dependencies["cancel_order"].assert_not_awaited()
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    assert "Entry freeze" in summary
+    _patch_dependencies["enqueue"].assert_awaited_once()
+
+
+async def test_tick_frozen_still_records_assignments_and_fills(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Scenarios 5 and 6: while the drawdown freeze is active, a short put
+    assignment is detected and recorded, and a fill on a pending order
+    reconciles, without any new trade going out."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": False,
+        "kill_switch": False,
+    }
+    _patch_dependencies["check_drawdown"].return_value = _breached_check()
+    _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
+    # A pending SPY order that filled while frozen.
+    _patch_dependencies["pending_orders"].return_value = [_pending_row()]
+    _patch_dependencies["get_order_status"].return_value = _filled_status()
+    # An OPASN assignment for the AMZN CSP recorded earlier.
+    _patch_dependencies["get_assignment_activities"].return_value = [
+        AssignmentActivity(
+            activity_id="opasn-amzn-frozen",
+            activity_date=date(2026, 5, 6),
+            symbol="AMZN260506P00250000",
+            qty=Decimal("1"),
+            status="executed",
+        )
+    ]
+    _patch_dependencies["filled_csps_and_assignments_for_symbols"].return_value = [
+        _filled_csp_for_amzn()
+    ]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "1 new assignment" in summary
+    _patch_dependencies["record_assignment"].assert_awaited_once()
+    fill_calls = [
+        call
+        for call in _patch_dependencies["mark_status"].await_args_list
+        if call.args[1] == "filled"
+    ]
+    assert len(fill_calls) == 1
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+
+
+async def test_tick_entries_off_management_still_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """Scenario 9: the recovery posture. Entries disabled, no breach, kill
+    off: profit-takes still execute while no new CSP goes out. This is the
+    state an operator lands in after a freeze once equity recovers, until
+    they deliberately re-enable entries."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": False,
+        "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_amzn_sleeve()]
+    _patch_dependencies["list_short_option_positions"].return_value = [
+        _short_put_position_for_amzn()
+    ]
+    _patch_dependencies["latest_filled_csps_for_option_symbols"].return_value = [
+        _filled_csp_for_amzn()
+    ]
+    _patch_dependencies["get_chain"].return_value = [_put_chain_at_threshold()]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "Closed 1 position for profit" in summary
+    _patch_dependencies["submit_buy_to_close"].assert_awaited_once()
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    _patch_dependencies["cancel_order"].assert_not_awaited()
 
 
 # ------------- roll execution -------------

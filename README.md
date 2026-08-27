@@ -42,8 +42,14 @@ the AI at all.
 1. Reconcile pending Alpaca orders (runs even when the market is
    closed, so overnight fills land at the next open).
 2. Drawdown circuit breaker: equity down 7% from the 7-day high-water
-   mark auto-engages `kill_switch`.
-3. Skip if the market is closed or the kill switch is on.
+   mark engages the entry freeze (`new_entries_enabled` off, never
+   `kill_switch`) and cancels working risk-increasing orders while the
+   breach holds. Profit-takes, manual closes, and all observation keep
+   running.
+3. Skip if the market is closed. If the kill switch is on (manual
+   only), stop after observation: fills, assignments, and position
+   snapshots still record, but no orders are placed, closed, or
+   cancelled.
 4. Compute the regime (VIX + SPY moving averages); log transitions.
 5. Evaluate rolls on challenged short puts (net-credit-only; the close
    leg must FILL before the reopen goes out).

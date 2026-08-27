@@ -532,6 +532,127 @@ async def test_close_position_handles_alpaca_exception(
     assert result.error == "alpaca down"
 
 
+async def test_close_position_submits_during_entry_freeze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The drawdown entry freeze (trading + entries off, kill off) must not
+    block a manual close: closing only reduces exposure."""
+    from unittest.mock import AsyncMock
+
+    class _FakeOrder:
+        id = "alpaca-uuid"
+        status = "accepted"
+
+    fake = MagicMock()
+    fake.close_position.return_value = _FakeOrder()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={
+            "kill_switch": False,
+            "trading_enabled": False,
+            "new_entries_enabled": False,
+        }),
+    )
+
+    result = await broker.close_position("SPY")
+    assert result.submitted is True
+    fake.close_position.assert_called_once_with("SPY")
+
+
+async def test_cancel_order_refused_when_kill_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """System kill means the bot mutates nothing at the broker, cancels
+    included. The drawdown freeze never engages kill, so the sweep is
+    unaffected; this gate only bites under a true manual kill."""
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.cancel_order_by_id = MagicMock()
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": True}),
+    )
+
+    result = await broker.cancel_order("alpaca-uuid")
+    assert result.requested is False
+    assert result.reason == "kill_switch_engaged"
+    fake.cancel_order_by_id.assert_not_called()
+
+
+async def test_cancel_order_requests_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Happy path, including during the entry freeze (entries + trading
+    off): the cancel goes to the broker and comes back requested=True."""
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.cancel_order_by_id.return_value = None
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={
+            "kill_switch": False,
+            "trading_enabled": False,
+            "new_entries_enabled": False,
+        }),
+    )
+
+    result = await broker.cancel_order("alpaca-uuid")
+    assert result.requested is True
+    assert result.reason is None
+    fake.cancel_order_by_id.assert_called_once_with("alpaca-uuid")
+
+
+async def test_cancel_order_already_terminal_is_benign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An order that already filled or died cannot be cancelled; that is a
+    no-op (reconciliation records the truth), not a failure."""
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.cancel_order_by_id.side_effect = RuntimeError(
+        '{"code":42210000,"message":"order is not cancelable"}'
+    )
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": False}),
+    )
+
+    result = await broker.cancel_order("alpaca-uuid")
+    assert result.requested is False
+    assert result.reason == "not_cancelable"
+
+
+async def test_cancel_order_surfaces_broker_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    fake = MagicMock()
+    fake.cancel_order_by_id.side_effect = RuntimeError("alpaca 500")
+    _install_fake_client(monkeypatch, fake)
+    monkeypatch.setattr(
+        broker,
+        "get_all_flags",
+        AsyncMock(return_value={"kill_switch": False}),
+    )
+
+    result = await broker.cancel_order("alpaca-uuid")
+    assert result.requested is False
+    assert result.reason == "cancel_exception"
+    assert result.error == "alpaca 500"
+
+
 async def test_close_position_detects_position_not_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

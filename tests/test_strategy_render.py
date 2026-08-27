@@ -268,6 +268,19 @@ def test_render_kill_switch_omits_drawdown_when_not_breached() -> None:
     assert "Drawdown" not in out
 
 
+def test_render_kill_switch_shows_observation_and_assignments() -> None:
+    out = render_kill_switch(
+        timestamp_label="2026-05-07 00:06 SGT",
+        reconciled=1,
+        drawdown_pct=None,
+        high_water_mark=None,
+        assignments_recorded=2,
+    )
+    assert "Still watching" in out
+    assert "Recorded 2 new assignment(s)" in out
+    assert "No orders placed" in out
+
+
 def test_render_market_closed_is_plain_string() -> None:
     out = render_market_closed(
         timestamp_label="2026-05-07 00:06 SGT",

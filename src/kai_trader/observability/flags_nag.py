@@ -1,11 +1,13 @@
 """Nag the operator when trading_enabled has been off too long during the open.
 
 The bot has three flag gates: trading_enabled, new_entries_enabled, and
-kill_switch. The kill switch is meant to be a manual brake; once it
-fires (drawdown circuit breaker, /kill from Telegram) we expect it to
-stay until the operator clears it. The other two are different - they
-are usually on, and "off" usually means "I turned it off to debug
-something and forgot to turn it back on."
+kill_switch. The kill switch is a manual brake (/kill from Telegram);
+once engaged we expect it to stay until the operator clears it. The
+other two are different - they are usually on, and "off" usually means
+"I turned it off to debug something and forgot to turn it back on."
+new_entries_enabled has one automatic writer: the drawdown circuit
+breaker flips it off on a 7% breach. In that case this nag doubles as
+the periodic reminder that the entry freeze is still in force.
 
 Without a nag, the strategy worker silently skips every entry day after
 day. The /flags command shows the current state but the operator has to
