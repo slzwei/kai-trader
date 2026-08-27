@@ -160,6 +160,8 @@ class SleeveDiagnostic:
     contract_ceiling_symbols: tuple[str, ...] = ()
     symbols_skipped_for_per_name_dollar_cap: int = 0
     per_name_dollar_cap_symbols: tuple[str, ...] = ()
+    symbols_skipped_for_economic_cap: int = 0
+    economic_cap_symbols: tuple[str, ...] = ()
     symbols_skipped_for_iv_rv_floor: int = 0
     iv_rv_floor_symbols: tuple[str, ...] = ()
     symbols_skipped_for_min_yield: int = 0
@@ -190,6 +192,7 @@ class BuildDiagnostics:
     contract_ceiling: int = MAX_CONTRACTS_PER_SYMBOL
     deployment_limited_by_buying_power: bool = False
     options_buying_power_usd: Decimal = Decimal("0")
+    per_name_economic_cap_dollars: Decimal = Decimal("0")
 
     def warning_lines(self) -> list[str]:
         active = [
@@ -250,6 +253,28 @@ class BuildDiagnostics:
             warnings.append(
                 f"{total_trend} symbol(s) skipped below 50-DMA trend "
                 f"filter{unknown_note}: {sample}{more}"
+            )
+        # S2: economic-cap skips stay visible even when other intents
+        # made it through. The operator must be able to see WHY a name
+        # the book already holds is not re-entering, without digging
+        # through logs.
+        total_econ = sum(
+            s.symbols_skipped_for_economic_cap for s in self.sleeves
+        )
+        if total_econ > 0:
+            econ_symbols = sorted({
+                sym for s in self.sleeves for sym in s.economic_cap_symbols
+            })
+            sample = ", ".join(econ_symbols[:5])
+            more = (
+                f" (+{len(econ_symbols) - 5} more)"
+                if len(econ_symbols) > 5
+                else ""
+            )
+            warnings.append(
+                f"{total_econ} candidate(s) rejected by per-name economic "
+                f"cap (shares + put face vs "
+                f"~${self.per_name_economic_cap_dollars:.0f}): {sample}{more}"
             )
         if not active:
             return warnings
@@ -678,6 +703,8 @@ async def build_intents(
     rv30_provider: RV30Provider | None = None,
     iv_percentile_provider: IVPercentileProvider | None = None,
     iv_percentile_floor: Decimal = IV_PERCENTILE_FLOOR_DEFAULT,
+    long_equity_positions: list[PositionSnapshot] | None = None,
+    per_name_economic_cap_pct: Decimal | None = None,
 ) -> list[TradeIntent]:
     """Walk active sleeves and produce intent rows up to the cap matrix.
 
@@ -698,6 +725,8 @@ async def build_intents(
         rv30_provider=rv30_provider,
         iv_percentile_provider=iv_percentile_provider,
         iv_percentile_floor=iv_percentile_floor,
+        long_equity_positions=long_equity_positions,
+        per_name_economic_cap_pct=per_name_economic_cap_pct,
     )
     return intents
 
@@ -717,6 +746,8 @@ async def build_intents_with_diagnostics(
     rv30_provider: RV30Provider | None = None,
     iv_percentile_provider: IVPercentileProvider | None = None,
     iv_percentile_floor: Decimal = IV_PERCENTILE_FLOOR_DEFAULT,
+    long_equity_positions: list[PositionSnapshot] | None = None,
+    per_name_economic_cap_pct: Decimal | None = None,
 ) -> tuple[list[TradeIntent], BuildDiagnostics]:
     """Build intents and return the per-sleeve diagnostic counters alongside.
 
@@ -741,6 +772,8 @@ async def build_intents_with_diagnostics(
         rv30_provider=rv30_provider,
         iv_percentile_provider=iv_percentile_provider,
         iv_percentile_floor=iv_percentile_floor,
+        long_equity_positions=long_equity_positions,
+        per_name_economic_cap_pct=per_name_economic_cap_pct,
     )
     return [a.intent for a in approved], diagnostics
 
@@ -761,6 +794,8 @@ async def build_approved_intents_with_diagnostics(
     iv_percentile_provider: IVPercentileProvider | None = None,
     iv_percentile_floor: Decimal = IV_PERCENTILE_FLOOR_DEFAULT,
     ai_filter: AIProposalFilter | None = None,
+    long_equity_positions: list[PositionSnapshot] | None = None,
+    per_name_economic_cap_pct: Decimal | None = None,
 ) -> tuple[list[ApprovedIntent], BuildDiagnostics]:
     """Screen, score, and gate: the worker's submission-path entry point.
 
@@ -1077,6 +1112,8 @@ async def build_approved_intents_with_diagnostics(
         existing_short_puts=tuple(short_puts),
         today_already_deployed=today_already,
         cooldown_symbols=frozenset(cooldown_set),
+        long_equity=tuple(long_equity_positions or []),
+        per_name_economic_cap_pct=per_name_economic_cap_pct,
     )
 
     # Phase A1: optional AI selection between screen and gate. The
@@ -1164,6 +1201,10 @@ async def build_approved_intents_with_diagnostics(
                 counters.symbols_skipped_for_per_name_dollar_cap
             ),
             per_name_dollar_cap_symbols=counters.per_name_dollar_cap_symbols,
+            symbols_skipped_for_economic_cap=(
+                counters.symbols_skipped_for_economic_cap
+            ),
+            economic_cap_symbols=counters.economic_cap_symbols,
             symbols_skipped_for_iv_rv_floor=screen.symbols_skipped_for_iv_rv_floor,
             iv_rv_floor_symbols=tuple(screen.iv_rv_floor_symbols),
             symbols_skipped_for_min_yield=screen.symbols_skipped_for_min_yield,
@@ -1192,6 +1233,9 @@ async def build_approved_intents_with_diagnostics(
             gate.totals.deployment_limited_by_buying_power
         ),
         options_buying_power_usd=gate.totals.options_buying_power_usd,
+        per_name_economic_cap_dollars=(
+            gate.totals.per_name_economic_cap_dollars
+        ),
     )
     return list(gate.approved), diagnostics
 

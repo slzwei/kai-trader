@@ -7,6 +7,7 @@ missing or malformed values fail loudly at boot instead of deep in a handler.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlparse
@@ -228,6 +229,29 @@ class Settings(BaseSettings):
     def ai_decision_enabled(self) -> bool:
         """True when any AI decision mode other than 'off' is active."""
         return self.ai_decision_mode != "off"
+
+    per_name_economic_cap_pct: Decimal = Field(
+        default=Decimal("0.20"),
+        ge=0,
+        le=1,
+        alias="PER_NAME_ECONOMIC_CAP_PCT",
+        description=(
+            "S2 assignment-aware per-name economic cap, as a fraction of "
+            "account equity. A new CSP is admitted only while held shares "
+            "at market value plus open and working short-put face plus the "
+            "proposed put's face stays within this fraction, so assignment "
+            "cannot move single-name exposure out of the risk budget. "
+            "0 disables the cap (pre-S2 behaviour: only put collateral "
+            "counts). Default 0.20."
+        ),
+    )
+
+    @property
+    def effective_per_name_economic_cap_pct(self) -> Decimal | None:
+        """The economic cap for the risk gate; ``None`` when disabled."""
+        if self.per_name_economic_cap_pct <= 0:
+            return None
+        return self.per_name_economic_cap_pct
 
     env: Environment = Field(default="dev", alias="ENV")
     log_level: LogLevel = Field(default="INFO", alias="LOG_LEVEL")

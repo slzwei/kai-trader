@@ -21,7 +21,12 @@ The gate enforces, in the original order per proposal:
    cannot skip it),
 4. the cumulative per-symbol contract ceiling (W-2),
 5. the per-name notional cap and sleeve/total dollar headroom (W-3),
-6. the per-tick and per-day deployment-velocity caps (W-4),
+6. the assignment-aware per-name economic cap (S2, when enabled):
+   held shares at market value plus open and working put face plus
+   the proposed put's face must fit the configured fraction of
+   equity, so assignment can never move exposure out of the risk
+   budget,
+7. the per-tick and per-day deployment-velocity caps (W-4),
 
 sizing each approved proposal to the largest quantity the caps admit.
 Collateral already locked by open short puts AND by working unfilled
@@ -179,6 +184,27 @@ POST_PROFIT_TAKE_COOLDOWN_MINUTES = 0
 # target, so tighten single-name notional a further notch.
 PER_NAME_NOTIONAL_CAP_PCT = Decimal("0.12")
 
+# S2 (2026-08-27): assignment-aware per-name ECONOMIC cap. The 12%
+# notional cap above counts short-put collateral only, so the moment a
+# put assigns, that exposure stops consuming the per-name budget and
+# the strategy is free to sell more puts on the same falling name. The
+# 2024-03..2026-08 drawdown forensics showed the wheel riding one name
+# to 45% of NAV this way (81.5% at worst), and that single name caused
+# 109% of the 39.6% max drawdown. The economic cap closes the hole:
+# before a new CSP is admitted, held shares at market value PLUS open
+# and working short-put face PLUS the proposed put's face must stay
+# within this fraction of equity. Shares covered by short calls are
+# counted once, at market (a covered call caps upside, not downside).
+# The cap only refuses or shrinks NEW entries; it never liquidates an
+# already-oversized position (the wheel manages those as always).
+# Backtested at 20%: max DD 28.7% -> 21.7% against the production-
+# faithful (with-trend) baseline at zero measurable CAGR cost, with
+# peak single-name exposure falling from 59.8% to 24.0% of NAV.
+# Runtime value comes from settings (PER_NAME_ECONOMIC_CAP_PCT);
+# this constant is the production default. RiskContext receives None
+# when the control is disabled, which reproduces pre-S2 behaviour.
+PER_NAME_ECONOMIC_CAP_PCT_DEFAULT = Decimal("0.20")
+
 _PER_SYMBOL_CAP_TIERS: tuple[tuple[Decimal, Decimal], ...] = (
     (Decimal("50000"), Decimal("1.00")),
     (Decimal("150000"), Decimal("0.60")),
@@ -280,6 +306,36 @@ def _existing_contract_counts(
     return counts
 
 
+def _shares_market_value(
+    long_equity: Sequence[PositionSnapshot],
+) -> dict[str, Decimal]:
+    """Market value of held long shares per underlying symbol (S2).
+
+    Prefers the broker-reported ``market_value``, falling back to
+    ``current_price * qty`` and finally ``avg_entry_price * qty`` so a
+    missing mark can never silently zero out real exposure (cost basis
+    is the last resort, not the preferred measure: a control priced at
+    cost loosens exactly when shares are under water). Non-positive
+    quantities are skipped; the wheel never shorts stock and a short
+    equity position is not assignment-risk exposure.
+    """
+    out: dict[str, Decimal] = {}
+    for position in long_equity:
+        if position.qty <= 0:
+            continue
+        if position.market_value is not None:
+            value = position.market_value
+        elif position.current_price is not None:
+            value = position.current_price * position.qty
+        else:
+            value = position.avg_entry_price * position.qty
+        if value <= 0:
+            continue
+        symbol = position.symbol.upper()
+        out[symbol] = out.get(symbol, Decimal("0")) + value
+    return out
+
+
 def _max_qty_for_strike(
     strike: Decimal,
     *,
@@ -348,6 +404,7 @@ GateRejectionReason = Literal[
     "cooldown",
     "contract_ceiling",
     "per_name_cap",
+    "economic_cap",
     "insufficient_headroom",
     "per_tick_cap",
     "per_day_cap",
@@ -366,6 +423,14 @@ class RiskContext:
     ``existing_short_puts`` must already include synthetic stubs for
     working unfilled orders (W-10); the gate treats every entry as
     locked collateral.
+
+    ``long_equity`` and ``per_name_economic_cap_pct`` drive the S2
+    assignment-aware economic cap. Both default to the disabled state
+    (empty book, ``None`` cap) so every pre-S2 caller and fixture
+    reproduces the historical gate exactly; the strategy worker wires
+    the live long book and the configured cap. A caller that enables
+    the cap MUST supply the long book it fetched this tick; passing an
+    empty book with the cap enabled silently understates exposure.
     """
 
     equity: Decimal
@@ -374,6 +439,8 @@ class RiskContext:
     existing_short_puts: tuple[PositionSnapshot, ...]
     today_already_deployed: Decimal
     cooldown_symbols: frozenset[str]
+    long_equity: tuple[PositionSnapshot, ...] = ()
+    per_name_economic_cap_pct: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -407,6 +474,8 @@ class SleeveGateCounters:
     contract_ceiling_symbols: tuple[str, ...] = ()
     symbols_skipped_for_per_name_dollar_cap: int = 0
     per_name_dollar_cap_symbols: tuple[str, ...] = ()
+    symbols_skipped_for_economic_cap: int = 0
+    economic_cap_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -422,6 +491,10 @@ class GateTotals:
     deployment_limited_by_buying_power: bool
     options_buying_power_usd: Decimal
     per_symbol_cap_dollars: Decimal
+    # S2: dollar value of the economic cap for this batch. Zero when
+    # the cap is disabled (defaulted so legacy constructors keep
+    # building).
+    per_name_economic_cap_dollars: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -443,6 +516,8 @@ class _SleeveFillState:
         "ceiling_symbols",
         "closed",
         "config",
+        "econ_cap_skips",
+        "econ_cap_symbols",
         "intents_built",
         "per_name_skips",
         "per_name_symbols",
@@ -458,6 +533,8 @@ class _SleeveFillState:
         self.ceiling_symbols: list[str] = []
         self.per_name_skips = 0
         self.per_name_symbols: list[str] = []
+        self.econ_cap_skips = 0
+        self.econ_cap_symbols: list[str] = []
         self.closed: GateRejectionReason | None = None
 
 
@@ -508,6 +585,20 @@ def partition_symbol_headroom(
     existing_contracts = _existing_contract_counts(ctx.existing_short_puts)
     per_symbol_cap_dollars = equity * per_symbol_cap_pct(equity)
     contract_ceiling = max_contracts_per_symbol(equity)
+    # S2: a symbol whose held exposure (shares at market plus put face)
+    # already exhausts the economic cap is just as provably rejected as
+    # a ceiling-met one, so it should not spend an AI evaluation
+    # either. Order-independent: uses held state only, never the
+    # batch-accepted face.
+    econ_cap_pct = ctx.per_name_economic_cap_pct
+    econ_cap_dollars = (
+        equity * econ_cap_pct if econ_cap_pct is not None else Decimal("0")
+    )
+    shares_mv = (
+        _shares_market_value(ctx.long_equity)
+        if econ_cap_pct is not None
+        else {}
+    )
     viable: list[TradeIntent] = []
     capped: list[TradeIntent] = []
     for proposal in proposals:
@@ -517,7 +608,17 @@ def partition_symbol_headroom(
             per_symbol_cap_dollars - committed, Decimal("0")
         )
         per_contract = proposal.strike * Decimal("100")
-        if existing_qty >= contract_ceiling or per_symbol_remaining < per_contract:
+        econ_capped = False
+        if econ_cap_pct is not None:
+            econ_remaining = econ_cap_dollars - (
+                shares_mv.get(proposal.symbol, Decimal("0")) + committed
+            )
+            econ_capped = econ_remaining < per_contract
+        if (
+            existing_qty >= contract_ceiling
+            or per_symbol_remaining < per_contract
+            or econ_capped
+        ):
             capped.append(proposal)
         else:
             viable.append(proposal)
@@ -579,6 +680,21 @@ def apply_gate(
     # P7: per-symbol contract ceiling tiered on equity. Smaller books
     # see 10; $150k+ books see 25; $500k+ books see 50.
     contract_ceiling = max_contracts_per_symbol(equity)
+
+    # S2: assignment-aware economic cap. Price the long book once per
+    # batch; ``batch_econ_face`` accumulates the face of proposals
+    # already approved in this batch so two sleeves proposing the same
+    # underlying cannot each claim the full economic headroom.
+    econ_cap_pct = ctx.per_name_economic_cap_pct
+    econ_cap_dollars = (
+        equity * econ_cap_pct if econ_cap_pct is not None else Decimal("0")
+    )
+    shares_mv = (
+        _shares_market_value(ctx.long_equity)
+        if econ_cap_pct is not None
+        else {}
+    )
+    batch_econ_face: dict[str, Decimal] = {}
 
     # W-4 tick-level guard rails. These are global across sleeves so a
     # multi-sleeve config still respects the per-tick and per-day caps.
@@ -698,6 +814,57 @@ def apply_gate(
             rejected.append(GateRejection(intent=proposal, reason=reason))
             continue
 
+        # S2: assignment-aware economic cap. The per-name notional cap
+        # above budgets put collateral only; this one adds held shares
+        # at market value plus face already approved this batch, so
+        # assigned inventory keeps consuming the symbol's risk budget
+        # and a new CSP is admitted only if the book could absorb its
+        # assignment. Reduce-when-possible, reject-when-not; a trade
+        # is never admitted merely because its own collateral fits.
+        if econ_cap_pct is not None:
+            per_contract_collateral = proposal.strike * Decimal("100")
+            symbol_shares_mv = shares_mv.get(proposal.symbol, Decimal("0"))
+            already_accepted = batch_econ_face.get(
+                proposal.symbol, Decimal("0")
+            )
+            econ_exposure = (
+                symbol_shares_mv + committed_for_underlying + already_accepted
+            )
+            econ_remaining = econ_cap_dollars - econ_exposure
+            econ_qty = (
+                int(econ_remaining // per_contract_collateral)
+                if econ_remaining > 0
+                else 0
+            )
+            if econ_qty < qty:
+                _log.info(
+                    "strategy.sleeve.economic_cap",
+                    sleeve=sleeve.sleeve,
+                    symbol=proposal.symbol,
+                    equity=str(equity),
+                    econ_cap_pct=str(econ_cap_pct),
+                    econ_cap_dollars=str(econ_cap_dollars),
+                    shares_market_value=str(symbol_shares_mv),
+                    open_put_face_incl_working=str(committed_for_underlying),
+                    batch_accepted_face=str(already_accepted),
+                    requested_qty=qty,
+                    permitted_qty=econ_qty,
+                    proposed_face=str(per_contract_collateral * qty),
+                    post_assignment_exposure=str(
+                        econ_exposure + per_contract_collateral * qty
+                    ),
+                    decision="reduced" if econ_qty >= 1 else "rejected",
+                )
+            if econ_qty < 1:
+                state.econ_cap_skips += 1
+                if proposal.symbol not in state.econ_cap_symbols:
+                    state.econ_cap_symbols.append(proposal.symbol)
+                rejected.append(
+                    GateRejection(intent=proposal, reason="economic_cap")
+                )
+                continue
+            qty = min(qty, econ_qty)
+
         # W-4: enforce per-tick and per-day deployment caps. The
         # per-name caps (W-2, W-3) above already reduced qty as
         # needed; here we further reduce or drop the candidate when
@@ -742,6 +909,11 @@ def apply_gate(
         per_tick_remaining -= final.collateral
         per_day_remaining -= final.collateral
         existing_contracts[proposal.symbol] = existing_qty + final.qty
+        if econ_cap_pct is not None:
+            batch_econ_face[proposal.symbol] = (
+                batch_econ_face.get(proposal.symbol, Decimal("0"))
+                + final.collateral
+            )
         state.intents_built += 1
         approved.append(ApprovedIntent(intent=final))
 
@@ -753,6 +925,8 @@ def apply_gate(
             contract_ceiling_symbols=tuple(state.ceiling_symbols),
             symbols_skipped_for_per_name_dollar_cap=state.per_name_skips,
             per_name_dollar_cap_symbols=tuple(state.per_name_symbols),
+            symbols_skipped_for_economic_cap=state.econ_cap_skips,
+            economic_cap_symbols=tuple(state.econ_cap_symbols),
         )
         for name, state in states.items()
     }
@@ -770,5 +944,6 @@ def apply_gate(
             deployment_limited_by_buying_power=deployment_limited_by_buying_power,
             options_buying_power_usd=options_buying_power_usd,
             per_symbol_cap_dollars=per_symbol_cap_dollars,
+            per_name_economic_cap_dollars=econ_cap_dollars,
         ),
     )

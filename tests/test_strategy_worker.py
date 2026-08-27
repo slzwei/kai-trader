@@ -1234,6 +1234,70 @@ async def test_tick_fails_closed_when_existing_shorts_fetch_fails(
     _patch_dependencies["submit_short_put"].assert_not_awaited()
 
 
+async def test_tick_fails_closed_when_held_equity_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """S2: with the long book unknown, the economic cap would treat
+    share exposure as zero and re-open the assignment loophole. Skip
+    new entries instead; management flows keep running."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": True,
+        "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
+    _patch_dependencies["get_chain"].return_value = [_put_contract()]
+    _patch_dependencies["list_long_equity_positions"].side_effect = (
+        RuntimeError("alpaca positions endpoint down")
+    )
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    assert "fail-closed" in summary
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+
+
+async def test_assigned_shares_block_new_entry_via_economic_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    _patch_dependencies: dict[str, AsyncMock],
+) -> None:
+    """S2 end to end: the configured cap flows from settings into the
+    gate. $19.9k of held SPY on a $100k book leaves less than one $5k
+    contract of economic headroom, so the otherwise-valid P50 entry is
+    refused and the tick summary says why."""
+    monkeypatch.setattr(
+        worker_module, "get_clock_snapshot",
+        AsyncMock(return_value=_clock(is_open=True)),
+    )
+    _patch_dependencies["get_flags"].return_value = {
+        "trading_enabled": True, "new_entries_enabled": True,
+        "kill_switch": False,
+    }
+    _patch_dependencies["get_sleeves"].return_value = [_sleeve()]
+    _patch_dependencies["get_chain"].return_value = [_put_contract()]
+    _patch_dependencies["list_long_equity_positions"].return_value = [
+        PositionSnapshot(
+            symbol="SPY",
+            qty=Decimal("40"),
+            side="long",
+            avg_entry_price=Decimal("400"),
+            current_price=Decimal("497.50"),
+            market_value=Decimal("19900"),
+            unrealized_pl=None,
+            unrealized_intraday_pl=None,
+        )
+    ]
+
+    summary = await worker_module.StrategyWorker().tick()
+
+    _patch_dependencies["submit_short_put"].assert_not_awaited()
+    assert "economic cap" in summary
+
+
 async def test_reconcile_partial_fill_on_cancel_marked_filled(
     monkeypatch: pytest.MonkeyPatch,
     _patch_dependencies: dict[str, AsyncMock],

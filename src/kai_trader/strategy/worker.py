@@ -555,6 +555,23 @@ class StrategyWorker:
             )
         shorts_for_caps = [*existing_shorts, *working_stubs]
 
+        # S2: the assignment-aware economic cap needs the long book
+        # BEFORE the CSP build, so assigned shares keep consuming the
+        # per-name risk budget. Fetched once here and reused by the
+        # position snapshot, assignment-adjacent surfaces, the CC
+        # builder, and the tick render below (B10). Same fail-closed
+        # posture as the shorts fetch: with the long book unknown, the
+        # cap math would treat share exposure as zero and re-open the
+        # exact loophole S2 closes, so the tick skips the CSP build
+        # instead and says so in the summary.
+        held_equity_fetch_failed = False
+        try:
+            held_equity = await list_long_equity_positions()
+        except Exception as exc:
+            _log.warning("strategy.held_equity.fetch_failed", error=str(exc))
+            held_equity = []
+            held_equity_fetch_failed = True
+
         # W-4: feed the deployment-velocity caps and cool-down into the
         # builder. today_already_deployed is the running daily total of
         # new collateral committed since UTC midnight; cooldown_symbols
@@ -649,10 +666,15 @@ class StrategyWorker:
 
             ai_filter = _ai_filter
 
-        if shorts_fetch_failed:
+        if shorts_fetch_failed or held_equity_fetch_failed:
             approved: list[ApprovedIntent] = []
+            failed_fetch = (
+                "Existing-positions"
+                if shorts_fetch_failed
+                else "Held-equity"
+            )
             diagnostic_warnings = [
-                "Existing-positions fetch failed; new entries skipped "
+                f"{failed_fetch} fetch failed; new entries skipped "
                 "this tick (fail-closed)."
             ]
         else:
@@ -668,6 +690,10 @@ class StrategyWorker:
                 today_already_deployed=today_already_deployed,
                 cooldown_symbols=cooldown_symbols,
                 ai_filter=ai_filter,
+                long_equity_positions=held_equity,
+                per_name_economic_cap_pct=(
+                    settings.effective_per_name_economic_cap_pct
+                ),
                 # Phase 5 retuning (2026-05-09): IV/RV gate disabled. The
                 # IV percentile filter is the primary VRP signal; running
                 # both gates double-rejected candidates in the 8-name
@@ -713,16 +739,11 @@ class StrategyWorker:
         # Covered-call leg. Assignment detection (OPASN-driven, idempotent)
         # records the audit row for any newly assigned put; the CC builder
         # then sells calls against shares actually on the books.
-        # B10: held equity is fetched once for the CC builder and the tick
-        # render. Assignment detection no longer keys off it (see
-        # _handle_assignments), so a wheeled name cannot be mis-flagged.
-        held_equity_fetch_failed = False
-        try:
-            held_equity = await list_long_equity_positions()
-        except Exception as exc:
-            _log.warning("strategy.held_equity.fetch_failed", error=str(exc))
-            held_equity = []
-            held_equity_fetch_failed = True
+        # B10: held equity was fetched once, above the CSP build (S2
+        # moved it earlier so the economic cap sees it); the CC builder
+        # and the tick render reuse that fetch. Assignment detection no
+        # longer keys off it (see _handle_assignments), so a wheeled
+        # name cannot be mis-flagged.
 
         # Phase D1: persist the position book this tick already fetched so
         # the read-only web dashboard renders near-live positions from
