@@ -253,6 +253,30 @@ class Settings(BaseSettings):
             return None
         return self.per_name_economic_cap_pct
 
+    sleeve_economic_cap_mult: Decimal = Field(
+        default=Decimal("0"),
+        ge=0,
+        le=5,
+        alias="SLEEVE_ECONOMIC_CAP_MULT",
+        description=(
+            "S3 sleeve-level assignment-aware economic cap, as a multiplier "
+            "on each sleeve's own target_pct. The sleeve budget otherwise "
+            "counts short-put collateral only, so assigned shares escape it "
+            "the same way they escaped the per-name cap before S2. 1.0 "
+            "enforces the sleeve mandate against held shares plus put face; "
+            "above 1.0 grants headroom for assigned inventory to sit in "
+            "while the wheel works it off. 0 (default) disables and "
+            "reproduces pre-S3 behaviour."
+        ),
+    )
+
+    @property
+    def effective_sleeve_economic_cap_mult(self) -> Decimal | None:
+        """The sleeve economic multiplier; ``None`` when disabled."""
+        if self.sleeve_economic_cap_mult <= 0:
+            return None
+        return self.sleeve_economic_cap_mult
+
     env: Environment = Field(default="dev", alias="ENV")
     log_level: LogLevel = Field(default="INFO", alias="LOG_LEVEL")
     timezone: str = Field(default="Asia/Singapore", alias="TIMEZONE")

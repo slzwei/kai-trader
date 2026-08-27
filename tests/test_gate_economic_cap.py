@@ -20,6 +20,7 @@ from kai_trader.db.sleeve_config import SleeveConfig
 from kai_trader.risk.gate import (
     RiskContext,
     _shares_market_value,
+    _shares_value_by_sleeve,
     apply_gate,
     partition_symbol_headroom,
 )
@@ -645,3 +646,166 @@ def test_warning_line_surfaces_economic_cap_skips() -> None:
     assert any(
         "economic cap" in line and "MARA" in line for line in lines
     )
+
+
+# ------------- S3: sleeve-level economic cap -------------
+
+
+def _ctx_sleeve(
+    *,
+    equity: str = "100000",
+    existing: list[PositionSnapshot] | None = None,
+    long_equity: list[PositionSnapshot] | None = None,
+    sleeves: list[SleeveConfig] | None = None,
+    mult: str | None = "1.0",
+) -> RiskContext:
+    return RiskContext(
+        equity=Decimal(equity),
+        options_buying_power=None,
+        sleeves=tuple(sleeves if sleeves is not None else [_sleeve()]),
+        existing_short_puts=tuple(existing or []),
+        today_already_deployed=Decimal("0"),
+        cooldown_symbols=frozenset(),
+        long_equity=tuple(long_equity or []),
+        per_name_economic_cap_pct=None,
+        sleeve_economic_cap_mult=(Decimal(mult) if mult is not None else None),
+    )
+
+
+def _two_sleeves() -> list[SleeveConfig]:
+    return [
+        _sleeve("index_core", target_pct="0.35", whitelist=["MARA", "RIOT"]),
+        _sleeve("stable_largecap", target_pct="0.55", whitelist=["BAC", "KO"]),
+    ]
+
+
+def test_sleeve_shares_attributed_to_owning_sleeve() -> None:
+    sleeves = _two_sleeves()
+    mv = _shares_value_by_sleeve(
+        [
+            _shares("MARA", "500", avg_cost="20", market_value="10000"),
+            _shares("BAC", "100", avg_cost="50", market_value="5000"),
+            _shares("NVDA", "10", avg_cost="100", market_value="1000"),
+        ],
+        sleeves,
+    )
+    assert mv["index_core"] == Decimal("10000")
+    assert mv["stable_largecap"] == Decimal("5000")
+    # Unwhitelisted names belong to no sleeve budget.
+    assert sum(mv.values()) == Decimal("15000")
+
+
+def test_sleeve_shares_counted_once_when_two_sleeves_list_it() -> None:
+    """A symbol on two whitelists is attributed to the first enabled one."""
+    sleeves = [
+        _sleeve("index_core", target_pct="0.35", whitelist=["SOFI"]),
+        _sleeve("opportunistic", target_pct="0.45", whitelist=["SOFI"]),
+    ]
+    mv = _shares_value_by_sleeve(
+        [_shares("SOFI", "200", avg_cost="19", market_value="3800")], sleeves
+    )
+    assert mv["index_core"] == Decimal("3800")
+    assert mv["opportunistic"] == Decimal("0")
+
+
+def test_sleeve_economic_cap_blocks_when_shares_fill_the_mandate() -> None:
+    """Assigned shares consume the sleeve budget, not just put face."""
+    sleeves = _two_sleeves()
+    # index_core mandate at 1.0x = 35% of 100k = $35,000, already held
+    # as shares. No room for a new put even though the sleeve's PUT
+    # face is zero.
+    ctx = _ctx_sleeve(
+        sleeves=sleeves,
+        long_equity=[
+            _shares("MARA", "1750", avg_cost="20", market_value="35000")
+        ],
+    )
+    result = apply_gate([_proposal("MARA", "20", sleeve="index_core")], ctx)
+    assert result.approved == ()
+    assert [r.reason for r in result.rejected] == ["sleeve_economic_cap"]
+    assert result.sleeve_counters[
+        "index_core"
+    ].candidates_skipped_for_sleeve_economic_cap == 1
+
+
+def test_sleeve_economic_cap_disabled_admits_the_same_trade() -> None:
+    """Pre-S3 parity: with the cap off, shares are invisible again."""
+    sleeves = _two_sleeves()
+    shares = [_shares("MARA", "1750", avg_cost="20", market_value="35000")]
+    off = _ctx_sleeve(sleeves=sleeves, long_equity=shares, mult=None)
+    result = apply_gate([_proposal("MARA", "20", sleeve="index_core")], off)
+    assert len(result.approved) == 1
+
+
+def test_sleeve_economic_cap_downsizes_rather_than_rejects() -> None:
+    sleeves = _two_sleeves()
+    # $30,000 of shares against a $35,000 mandate leaves $5,000, which
+    # is two $20 contracts even though the per-name and sleeve dollar
+    # caps would allow more.
+    ctx = _ctx_sleeve(
+        sleeves=sleeves,
+        long_equity=[
+            _shares("MARA", "1500", avg_cost="20", market_value="30000")
+        ],
+    )
+    result = apply_gate([_proposal("MARA", "20", sleeve="index_core")], ctx)
+    assert len(result.approved) == 1
+    assert result.approved[0].intent.qty == 2
+
+
+def test_sleeve_economic_cap_is_consumed_across_the_batch() -> None:
+    """Two names in one sleeve share a single sleeve budget."""
+    sleeves = _two_sleeves()
+    ctx = _ctx_sleeve(
+        sleeves=sleeves,
+        long_equity=[
+            _shares("MARA", "1250", avg_cost="20", market_value="25000")
+        ],
+    )
+    # $10,000 of headroom. MARA takes 3 x $2,000 = $6,000, leaving
+    # $4,000, so RIOT gets 2 not 3.
+    result = apply_gate(
+        [
+            _proposal("MARA", "20", sleeve="index_core"),
+            _proposal("RIOT", "20", sleeve="index_core"),
+        ],
+        ctx,
+    )
+    granted = [(a.intent.symbol, a.intent.qty) for a in result.approved]
+    assert sum(q for _s, q in granted) * Decimal("2000") <= Decimal("10000")
+
+
+def test_sleeve_economic_cap_does_not_leak_across_sleeves() -> None:
+    """One sleeve breaching its mandate must not block the other."""
+    sleeves = _two_sleeves()
+    ctx = _ctx_sleeve(
+        sleeves=sleeves,
+        long_equity=[
+            _shares("MARA", "2000", avg_cost="20", market_value="40000")
+        ],
+    )
+    result = apply_gate(
+        [
+            _proposal("MARA", "20", sleeve="index_core"),
+            _proposal("BAC", "20", sleeve="stable_largecap"),
+        ],
+        ctx,
+    )
+    approved = {a.intent.symbol for a in result.approved}
+    assert "MARA" not in approved
+    assert "BAC" in approved
+
+
+def test_sleeve_multiplier_grants_headroom_above_the_mandate() -> None:
+    sleeves = _two_sleeves()
+    shares = [_shares("MARA", "1800", avg_cost="20", market_value="36000")]
+    strict = apply_gate(
+        [_proposal("MARA", "20", sleeve="index_core")],
+        _ctx_sleeve(sleeves=sleeves, long_equity=shares, mult="1.0"),
+    )
+    loose = apply_gate(
+        [_proposal("MARA", "20", sleeve="index_core")],
+        _ctx_sleeve(sleeves=sleeves, long_equity=shares, mult="1.5"),
+    )
+    assert strict.approved == ()
+    assert len(loose.approved) == 1

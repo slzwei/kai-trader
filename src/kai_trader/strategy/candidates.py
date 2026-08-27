@@ -705,6 +705,7 @@ async def build_intents(
     iv_percentile_floor: Decimal = IV_PERCENTILE_FLOOR_DEFAULT,
     long_equity_positions: list[PositionSnapshot] | None = None,
     per_name_economic_cap_pct: Decimal | None = None,
+    sleeve_economic_cap_mult: Decimal | None = None,
 ) -> list[TradeIntent]:
     """Walk active sleeves and produce intent rows up to the cap matrix.
 
@@ -727,6 +728,7 @@ async def build_intents(
         iv_percentile_floor=iv_percentile_floor,
         long_equity_positions=long_equity_positions,
         per_name_economic_cap_pct=per_name_economic_cap_pct,
+        sleeve_economic_cap_mult=sleeve_economic_cap_mult,
     )
     return intents
 
@@ -748,6 +750,7 @@ async def build_intents_with_diagnostics(
     iv_percentile_floor: Decimal = IV_PERCENTILE_FLOOR_DEFAULT,
     long_equity_positions: list[PositionSnapshot] | None = None,
     per_name_economic_cap_pct: Decimal | None = None,
+    sleeve_economic_cap_mult: Decimal | None = None,
 ) -> tuple[list[TradeIntent], BuildDiagnostics]:
     """Build intents and return the per-sleeve diagnostic counters alongside.
 
@@ -774,6 +777,7 @@ async def build_intents_with_diagnostics(
         iv_percentile_floor=iv_percentile_floor,
         long_equity_positions=long_equity_positions,
         per_name_economic_cap_pct=per_name_economic_cap_pct,
+        sleeve_economic_cap_mult=sleeve_economic_cap_mult,
     )
     return [a.intent for a in approved], diagnostics
 
@@ -796,6 +800,7 @@ async def build_approved_intents_with_diagnostics(
     ai_filter: AIProposalFilter | None = None,
     long_equity_positions: list[PositionSnapshot] | None = None,
     per_name_economic_cap_pct: Decimal | None = None,
+    sleeve_economic_cap_mult: Decimal | None = None,
 ) -> tuple[list[ApprovedIntent], BuildDiagnostics]:
     """Screen, score, and gate: the worker's submission-path entry point.
 
@@ -1114,6 +1119,7 @@ async def build_approved_intents_with_diagnostics(
         cooldown_symbols=frozenset(cooldown_set),
         long_equity=tuple(long_equity_positions or []),
         per_name_economic_cap_pct=per_name_economic_cap_pct,
+        sleeve_economic_cap_mult=sleeve_economic_cap_mult,
     )
 
     # Phase A1: optional AI selection between screen and gate. The

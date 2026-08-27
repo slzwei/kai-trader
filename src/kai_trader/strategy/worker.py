@@ -694,6 +694,9 @@ class StrategyWorker:
                 per_name_economic_cap_pct=(
                     settings.effective_per_name_economic_cap_pct
                 ),
+                sleeve_economic_cap_mult=(
+                    settings.effective_sleeve_economic_cap_mult
+                ),
                 # Phase 5 retuning (2026-05-09): IV/RV gate disabled. The
                 # IV percentile filter is the primary VRP signal; running
                 # both gates double-rejected candidates in the 8-name

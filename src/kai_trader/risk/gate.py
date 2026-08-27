@@ -26,7 +26,10 @@ The gate enforces, in the original order per proposal:
    the proposed put's face must fit the configured fraction of
    equity, so assignment can never move exposure out of the risk
    budget,
-7. the per-tick and per-day deployment-velocity caps (W-4),
+7. the assignment-aware per-SLEEVE economic cap (S3, when enabled):
+   the same rule one level up, so a sleeve's mandate governs its whole
+   economic footprint rather than just its option leg,
+8. the per-tick and per-day deployment-velocity caps (W-4),
 
 sizing each approved proposal to the largest quantity the caps admit.
 Collateral already locked by open short puts AND by working unfilled
@@ -205,6 +208,24 @@ PER_NAME_NOTIONAL_CAP_PCT = Decimal("0.12")
 # when the control is disabled, which reproduces pre-S2 behaviour.
 PER_NAME_ECONOMIC_CAP_PCT_DEFAULT = Decimal("0.20")
 
+# S3 (2026-08-28): the sleeve-level counterpart of S2. ``sleeve.target_pct``
+# is enforced against short-put collateral only (see
+# ``_committed_collateral``), so assigned shares escape the sleeve budget
+# exactly as they escaped the per-name cap before S2. Measured over
+# 2024-03 to 2026-08 on the production-faithful config, index_core held
+# its PUT face at its 35% mandate (peak 36.8%) while its true economic
+# footprint ran at 46% of NAV on average and 72% at peak. The sleeve
+# split is a risk preference (large-cap ballast against high-beta
+# premium); today it only describes the option leg, not the book.
+#
+# The cap is expressed as a MULTIPLIER on each sleeve's own target_pct
+# rather than a flat percentage, because the whole point is to make the
+# existing mandate mean something rather than to introduce a second,
+# unrelated number. 1.0 enforces the mandate exactly; above 1.0 grants
+# deliberate headroom for assigned inventory to sit in while the wheel
+# works it off. None disables and reproduces pre-S3 behaviour.
+SLEEVE_ECONOMIC_CAP_MULT_DEFAULT = Decimal("0")
+
 _PER_SYMBOL_CAP_TIERS: tuple[tuple[Decimal, Decimal], ...] = (
     (Decimal("50000"), Decimal("1.00")),
     (Decimal("150000"), Decimal("0.60")),
@@ -253,12 +274,7 @@ def _committed_collateral(
     per_symbol: dict[str, Decimal] = {}
     total = Decimal("0")
 
-    underlying_to_sleeve: dict[str, str] = {}
-    for sleeve in sleeves:
-        if not sleeve.enabled:
-            continue
-        for symbol in sleeve.symbol_whitelist:
-            underlying_to_sleeve.setdefault(symbol.upper(), sleeve.sleeve)
+    underlying_to_sleeve = _underlying_to_sleeve(sleeves)
 
     for position in short_puts:
         try:
@@ -304,6 +320,44 @@ def _existing_contract_counts(
             continue
         counts[underlying] = counts.get(underlying, 0) + int(qty)
     return counts
+
+
+def _underlying_to_sleeve(sleeves: Sequence[SleeveConfig]) -> dict[str, str]:
+    """Map each whitelisted underlying to the enabled sleeve that owns it.
+
+    First enabled sleeve wins, matching the historical behaviour: a
+    symbol whitelisted by more than one sleeve (SOFI, MARA and RIOT all
+    appear in both index_core and opportunistic) is attributed once, so
+    sleeve budgets cannot double-count it.
+    """
+    out: dict[str, str] = {}
+    for sleeve in sleeves:
+        if not sleeve.enabled:
+            continue
+        for symbol in sleeve.symbol_whitelist:
+            out.setdefault(symbol.upper(), sleeve.sleeve)
+    return out
+
+
+def _shares_value_by_sleeve(
+    long_equity: Sequence[PositionSnapshot],
+    sleeves: Sequence[SleeveConfig],
+) -> dict[str, Decimal]:
+    """Market value of held shares aggregated by owning sleeve (S3).
+
+    Shares whose underlying is not whitelisted by any enabled sleeve
+    belong to no sleeve budget, exactly as unwhitelisted put collateral
+    is left out of the per-sleeve buckets in
+    :func:`_committed_collateral`.
+    """
+    owner = _underlying_to_sleeve(sleeves)
+    per_symbol = _shares_market_value(long_equity)
+    out: dict[str, Decimal] = {s.sleeve: Decimal("0") for s in sleeves}
+    for symbol, value in per_symbol.items():
+        sleeve_name = owner.get(symbol)
+        if sleeve_name is not None:
+            out[sleeve_name] = out.get(sleeve_name, Decimal("0")) + value
+    return out
 
 
 def _shares_market_value(
@@ -405,6 +459,7 @@ GateRejectionReason = Literal[
     "contract_ceiling",
     "per_name_cap",
     "economic_cap",
+    "sleeve_economic_cap",
     "insufficient_headroom",
     "per_tick_cap",
     "per_day_cap",
@@ -441,6 +496,12 @@ class RiskContext:
     cooldown_symbols: frozenset[str]
     long_equity: tuple[PositionSnapshot, ...] = ()
     per_name_economic_cap_pct: Decimal | None = None
+    # S3: multiplier on each sleeve's own ``target_pct``, applied to the
+    # sleeve's ECONOMIC exposure (held shares at market plus open and
+    # working put face plus face accepted this tick). None disables and
+    # reproduces the pre-S3 gate, where the sleeve budget saw put
+    # collateral only.
+    sleeve_economic_cap_mult: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -476,6 +537,7 @@ class SleeveGateCounters:
     per_name_dollar_cap_symbols: tuple[str, ...] = ()
     symbols_skipped_for_economic_cap: int = 0
     economic_cap_symbols: tuple[str, ...] = ()
+    candidates_skipped_for_sleeve_economic_cap: int = 0
 
 
 @dataclass(frozen=True)
@@ -521,12 +583,21 @@ class _SleeveFillState:
         "intents_built",
         "per_name_skips",
         "per_name_symbols",
+        "sleeve_econ_remaining",
+        "sleeve_econ_skips",
         "sleeve_remaining",
     )
 
-    def __init__(self, config: SleeveConfig, sleeve_remaining: Decimal) -> None:
+    def __init__(
+        self,
+        config: SleeveConfig,
+        sleeve_remaining: Decimal,
+        sleeve_econ_remaining: Decimal | None = None,
+    ) -> None:
         self.config = config
         self.sleeve_remaining = sleeve_remaining
+        self.sleeve_econ_remaining = sleeve_econ_remaining
+        self.sleeve_econ_skips = 0
         self.intents_built = 0
         self.cap_rejected = 0
         self.ceiling_skips = 0
@@ -696,6 +767,17 @@ def apply_gate(
     )
     batch_econ_face: dict[str, Decimal] = {}
 
+    # S3: sleeve-level economic budget. Held shares owned by the sleeve
+    # are priced once here and consume the sleeve's mandate alongside
+    # its put collateral, so assignment cannot move exposure out of the
+    # sleeve the way it used to move it out of the per-name cap.
+    sleeve_mult = ctx.sleeve_economic_cap_mult
+    sleeve_shares = (
+        _shares_value_by_sleeve(ctx.long_equity, ctx.sleeves)
+        if sleeve_mult is not None
+        else {}
+    )
+
     # W-4 tick-level guard rails. These are global across sleeves so a
     # multi-sleeve config still respects the per-tick and per-day caps.
     per_tick_remaining = equity * PER_TICK_DEPLOYMENT_CAP_PCT
@@ -723,6 +805,14 @@ def apply_gate(
             continue
         state = states.get(proposal.sleeve)
         if state is None:
+            econ_remaining: Decimal | None = None
+            if sleeve_mult is not None:
+                econ_remaining = max(
+                    equity * sleeve.target_pct * sleeve_mult
+                    - committed_per_sleeve.get(sleeve.sleeve, Decimal("0"))
+                    - sleeve_shares.get(sleeve.sleeve, Decimal("0")),
+                    Decimal("0"),
+                )
             state = _SleeveFillState(
                 config=sleeve,
                 sleeve_remaining=max(
@@ -730,6 +820,7 @@ def apply_gate(
                     - committed_per_sleeve.get(sleeve.sleeve, Decimal("0")),
                     Decimal("0"),
                 ),
+                sleeve_econ_remaining=econ_remaining,
             )
             states[proposal.sleeve] = state
 
@@ -865,6 +956,45 @@ def apply_gate(
                 continue
             qty = min(qty, econ_qty)
 
+        # S3: the sleeve's economic budget, same shape one level up.
+        # Unlike the per-name cap this one is consumed as the batch
+        # fills, so ``sleeve_econ_remaining`` is decremented on approval
+        # rather than recomputed per proposal.
+        if state.sleeve_econ_remaining is not None:
+            per_contract_collateral = proposal.strike * Decimal("100")
+            sleeve_qty = int(
+                state.sleeve_econ_remaining // per_contract_collateral
+            )
+            if sleeve_qty < qty:
+                _log.info(
+                    "strategy.sleeve.sleeve_economic_cap",
+                    sleeve=sleeve.sleeve,
+                    symbol=proposal.symbol,
+                    equity=str(equity),
+                    sleeve_target_pct=str(sleeve.target_pct),
+                    sleeve_cap_mult=str(sleeve_mult),
+                    sleeve_cap_dollars=str(
+                        equity * sleeve.target_pct * (sleeve_mult or Decimal("0"))
+                    ),
+                    sleeve_shares_value=str(
+                        sleeve_shares.get(sleeve.sleeve, Decimal("0"))
+                    ),
+                    sleeve_put_face=str(
+                        committed_per_sleeve.get(sleeve.sleeve, Decimal("0"))
+                    ),
+                    sleeve_econ_remaining=str(state.sleeve_econ_remaining),
+                    requested_qty=qty,
+                    permitted_qty=max(sleeve_qty, 0),
+                    decision="reduced" if sleeve_qty >= 1 else "rejected",
+                )
+            if sleeve_qty < 1:
+                state.sleeve_econ_skips += 1
+                rejected.append(
+                    GateRejection(intent=proposal, reason="sleeve_economic_cap")
+                )
+                continue
+            qty = min(qty, sleeve_qty)
+
         # W-4: enforce per-tick and per-day deployment caps. The
         # per-name caps (W-2, W-3) above already reduced qty as
         # needed; here we further reduce or drop the candidate when
@@ -914,6 +1044,8 @@ def apply_gate(
                 batch_econ_face.get(proposal.symbol, Decimal("0"))
                 + final.collateral
             )
+        if state.sleeve_econ_remaining is not None:
+            state.sleeve_econ_remaining -= final.collateral
         state.intents_built += 1
         approved.append(ApprovedIntent(intent=final))
 
@@ -927,6 +1059,7 @@ def apply_gate(
             per_name_dollar_cap_symbols=tuple(state.per_name_symbols),
             symbols_skipped_for_economic_cap=state.econ_cap_skips,
             economic_cap_symbols=tuple(state.econ_cap_symbols),
+            candidates_skipped_for_sleeve_economic_cap=state.sleeve_econ_skips,
         )
         for name, state in states.items()
     }

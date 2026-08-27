@@ -383,6 +383,7 @@ async def _run_csp_entries(
     *,
     entry_controls: RiskControls | None = None,
     econ_cap_pct: Decimal | None = None,
+    sleeve_econ_mult: Decimal | None = None,
 ) -> tuple[int, int]:
     """Build and submit CSP intents. Returns (built, filled).
 
@@ -394,6 +395,14 @@ async def _run_csp_entries(
     cap, threaded straight into the production builder exactly as the
     live worker passes it; ``None`` disables (pre-S2 parity).
     """
+    marked_long = _marked_long_equity(state, asof)
+    if state.mark_long_equity_at_market:
+        # Feed the same asof-bounded marks the gate sees into the equity
+        # denominator, so the caps scale off market value on both sides
+        # exactly as production does.
+        state.long_equity_marks = {
+            p.symbol: (p.current_price or p.avg_entry_price) for p in marked_long
+        }
     account = state.account_snapshot()
     trend_provider = (
         make_trend_provider(asof)
@@ -411,8 +420,9 @@ async def _run_csp_entries(
         existing_short_puts=state.list_short_option_positions(),
         today_already_deployed=state.today_deployed,
         cooldown_symbols={s for s in state.cooldown_symbols},
-        long_equity_positions=_marked_long_equity(state, asof),
+        long_equity_positions=marked_long,
         per_name_economic_cap_pct=econ_cap_pct,
+        sleeve_economic_cap_mult=sleeve_econ_mult,
         # Phase 5 retuning (2026-05-09): IV/RV gate disabled in favour
         # of IV percentile alone. Running both was double-gating the
         # candidate stream into 80% rejection. The percentile rank is
@@ -522,6 +532,7 @@ async def run_tick(
     trading_day_index: dict[date, int] | None = None,
     entry_controls: RiskControls | None = None,
     econ_cap_pct: Decimal | None = None,
+    sleeve_econ_mult: Decimal | None = None,
     breaker_rule: BreakerRule | None = None,
 ) -> TickReport:
     """Execute one backtest tick at ``asof``.
@@ -575,6 +586,7 @@ async def run_tick(
         state, broker, fetcher, regime, asof,
         entry_controls=entry_controls,
         econ_cap_pct=econ_cap_pct,
+        sleeve_econ_mult=sleeve_econ_mult,
     )
     cc_built, cc_filled = await _run_cc_entries(state, broker, fetcher, regime, asof)
 
@@ -617,6 +629,7 @@ async def run_backtest(
     pt_rule: TimeAwarePTRule | None = None,
     entry_controls: RiskControls | None = None,
     econ_cap_pct: Decimal | None = None,
+    sleeve_econ_mult: Decimal | None = None,
     breaker_rule: BreakerRule | None = None,
 ) -> RunOutcome:
     """Walk every trading day; collect TickReport per day.
@@ -641,6 +654,7 @@ async def run_backtest(
                 trading_day_index=trading_day_index,
                 entry_controls=entry_controls,
                 econ_cap_pct=econ_cap_pct,
+                sleeve_econ_mult=sleeve_econ_mult,
                 breaker_rule=breaker_rule,
             )
         except Exception as exc:

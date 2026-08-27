@@ -313,7 +313,9 @@ async def _do_run(args: argparse.Namespace) -> int:
                 "pt_variant": args.pt_variant,
                 "entry_controls": args.entry_controls,
                 "econ_cap_pct": args.econ_cap_pct,
+                "sleeve_econ_mult": args.sleeve_econ_mult,
                 "breaker": args.breaker,
+                "mark_equity_at_market": args.mark_equity_at_market,
                 "sleeve_config": snapshot_path,
             },
             indent=2,
@@ -346,6 +348,7 @@ async def _do_run(args: argparse.Namespace) -> int:
         starting_capital=capital,
         sleeves=sleeves,
         margin_factor=margin_factor,
+        mark_long_equity_at_market=args.mark_equity_at_market,
     )
     broker = BacktestBroker(state=state, fill_model=fill_model, cost_model=DEFAULT_COST_MODEL)
 
@@ -369,11 +372,13 @@ async def _do_run(args: argparse.Namespace) -> int:
         else None
     )
     econ_cap = Decimal(args.econ_cap_pct)
+    sleeve_mult = Decimal(args.sleeve_econ_mult)
     outcome = await runner.run_backtest(
         state, broker, days, kill_switch_mode=args.kill_switch_mode,
         pt_rule=pt_rule,
         entry_controls=entry_controls,
         econ_cap_pct=econ_cap if econ_cap > 0 else None,
+        sleeve_econ_mult=sleeve_mult if sleeve_mult > 0 else None,
         breaker_rule=BREAKER_RULES[args.breaker],
     )
     metrics = reporting_summary.write_all_artefacts(
@@ -477,6 +482,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--mark-equity-at-market",
+        action="store_true",
+        help=(
+            "Research fidelity switch. By default the harness reports "
+            "account equity with held shares at COST, so every "
+            "equity-scaled cap runs looser than production while shares "
+            "are under water. This flag marks them at the asof close, "
+            "matching the market equity production reads from Alpaca."
+        ),
+    )
+    parser.add_argument(
         "--breaker",
         default="baseline",
         choices=sorted(BREAKER_RULES.keys()),
@@ -486,6 +502,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "a slow anchor (all-time peak or a 30-day window) whose "
             "breach also freezes new entries (see "
             "backtest.experiments.breaker_rules)."
+        ),
+    )
+    parser.add_argument(
+        "--sleeve-econ-mult",
+        default="0",
+        help=(
+            "S3 sleeve-level assignment-aware economic cap, as a multiplier "
+            "on each sleeve's own target_pct. 1.0 enforces the sleeve "
+            "mandate against held shares plus put face; above 1.0 grants "
+            "headroom for assigned inventory. 0 (default) disables and "
+            "reproduces the pre-S3 gate, where the sleeve budget saw put "
+            "collateral only."
         ),
     )
     parser.add_argument(
