@@ -271,3 +271,117 @@ def test_base64_token_with_plus_survives_url_mangling(
     page = client.get("/")
     assert page.status_code == 200
     assert "Kai Trader" in page.text
+
+
+# ------------- Phase U1: pending approvals on the web -------------
+
+
+def _pending_row() -> dict[str, Any]:
+    return {
+        "id": "22222222-2222-2222-2222-222222222222",
+        "kind": "watchlist_edit",
+        "payload": {"sleeve": "stable_largecap",
+                    "symbols": ["AAA", "BBB", "NEW"]},
+        "current_state": {"sleeve": "stable_largecap",
+                          "symbol_whitelist": ["AAA", "BBB", "OLD"]},
+        "reason": "Universe review v1.0.0: add NEW: durable; retire OLD: deteriorated",
+        "created_at": datetime(2026, 8, 27, 3, 0, tzinfo=UTC),
+    }
+
+
+def test_approvals_section_renders_diff_and_buttons() -> None:
+    data = _data()
+    data.pending_approvals = [_pending_row()]
+    page = render_page(data, generated_at=datetime.now(UTC))
+    assert "Pending approvals" in page
+    assert "Watchlist change for stable_largecap" in page
+    assert "+ NEW" in page
+    assert "- OLD" in page
+    assert 'action="/approve"' in page
+    assert 'action="/reject"' in page
+    assert "Universe review v1.0.0" in page
+
+
+def test_approvals_section_shows_queued_state_without_buttons() -> None:
+    data = _data()
+    data.pending_approvals = [_pending_row()]
+    data.queued_pending_ids = {"22222222-2222-2222-2222-222222222222"}
+    page = render_page(data, generated_at=datetime.now(UTC))
+    assert "queued: the bot will apply this" in page
+    assert 'action="/approve"' not in page
+
+
+def test_approvals_section_empty_state() -> None:
+    page = render_page(_data(), generated_at=datetime.now(UTC))
+    assert "nothing awaiting approval" in page
+
+
+def _authed_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, AsyncMock]:
+    execute = AsyncMock()
+    conn = MagicMock()
+    conn.execute = execute
+    acquire_cm = MagicMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=None)
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=acquire_cm)
+    monkeypatch.setattr(
+        dash_main.asyncpg, "create_pool", AsyncMock(return_value=pool)
+    )
+    monkeypatch.setattr(
+        dash_main, "fetch_dashboard_data", AsyncMock(return_value=_data())
+    )
+    config = DashboardConfig(
+        database_url_ro="postgresql://ro@x/db", token="secret-token"
+    )
+    client = _client(config)
+    client.get("/?token=secret-token", follow_redirects=False)  # set cookie
+    return client, execute
+
+
+def test_approve_post_files_queue_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, execute = _authed_client(monkeypatch)
+    response = client.post(
+        "/approve",
+        data={"pending_id": "22222222-2222-2222-2222-222222222222"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    sql = execute.await_args.args[0]
+    assert "insert into web_actions" in sql
+    assert execute.await_args.args[2] == "approve"
+
+
+def test_reject_post_files_queue_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, execute = _authed_client(monkeypatch)
+    response = client.post(
+        "/reject",
+        data={"pending_id": "22222222-2222-2222-2222-222222222222"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert execute.await_args.args[2] == "reject"
+
+
+def test_action_posts_require_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        dash_main.asyncpg, "create_pool", AsyncMock(return_value=MagicMock())
+    )
+    config = DashboardConfig(
+        database_url_ro="postgresql://ro@x/db", token="secret-token"
+    )
+    client = _client(config)
+    response = client.post(
+        "/approve",
+        data={"pending_id": "22222222-2222-2222-2222-222222222222"},
+    )
+    assert response.status_code == 401
+
+
+def test_action_posts_reject_invalid_uuid(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, execute = _authed_client(monkeypatch)
+    response = client.post(
+        "/approve", data={"pending_id": "not-a-uuid"}, follow_redirects=False
+    )
+    assert response.status_code == 400
+    execute.assert_not_awaited()

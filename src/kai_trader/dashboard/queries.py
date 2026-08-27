@@ -8,6 +8,7 @@ an error note rather than a blank page, mirroring the chat layer's
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,6 +27,8 @@ class DashboardData:
     orders: list[dict[str, Any]] = field(default_factory=list)
     regime: dict[str, Any] | None = None
     flags: dict[str, str] = field(default_factory=dict)
+    pending_approvals: list[dict[str, Any]] = field(default_factory=list)
+    queued_pending_ids: set[str] = field(default_factory=set)
     errors: list[str] = field(default_factory=list)
 
 
@@ -133,5 +136,37 @@ async def fetch_dashboard_data(pool: asyncpg.Pool) -> DashboardData:
         pool, data, "flags", "select key, value from system_flags"
     )
     data.flags = {str(r["key"]): str(r["value"]) for r in flag_rows}
+
+    pending_rows = await _rows(
+        pool,
+        data,
+        "pending_approvals",
+        """
+        select id, kind, payload, current_state, reason, created_at
+          from pending_changes
+         where status = 'pending'
+         order by created_at
+        """,
+    )
+    for row in pending_rows:
+        for key in ("payload", "current_state"):
+            value = row.get(key)
+            if isinstance(value, str):
+                try:
+                    row[key] = json.loads(value)
+                except ValueError:
+                    row[key] = {}
+        row["id"] = str(row["id"])
+    data.pending_approvals = pending_rows
+
+    queued_rows = await _rows(
+        pool,
+        data,
+        "web_actions",
+        "select pending_change_id from web_actions where processed_at is null",
+    )
+    data.queued_pending_ids = {
+        str(r["pending_change_id"]) for r in queued_rows
+    }
 
     return data

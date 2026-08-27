@@ -48,6 +48,14 @@ tr:last-child td { border-bottom: none; }
 .muted { color: #93A29A; }
 .thesis { color: #B9C4BE; font-size: 12px; max-width: 640px; }
 .err { color: #E07A6F; font-size: 12px; }
+.approval { border-left: 3px solid #CDB35C; }
+.btn { font: inherit; border-radius: 6px; padding: 6px 16px; cursor: pointer;
+       border: 1px solid #2C3630; background: #202825; color: #E6ECE8; }
+.btn.ok { border-color: #52B492; color: #52B492; }
+.btn.no { border-color: #E07A6F; color: #E07A6F; }
+.btn:hover { filter: brightness(1.25); }
+form.inline { display: inline-block; margin-right: 8px; }
+.diff-add { color: #52B492; } .diff-del { color: #E07A6F; }
 svg { display: block; width: 100%; height: 84px; }
 """
 
@@ -205,6 +213,71 @@ def _ai_section(data: DashboardData) -> str:
     )
 
 
+def _approvals_section(data: DashboardData) -> str:
+    """Pending watchlist proposals with Approve/Reject actions.
+
+    The buttons file a request into the web_actions queue; the bot
+    process validates and applies it. Nothing on this page can change
+    configuration directly.
+    """
+    if not data.pending_approvals:
+        return (
+            '<div class="card muted">nothing awaiting approval. The weekly '
+            "universe review files proposals here (and as Telegram cards); "
+            "/universe_review in Telegram runs one on demand.</div>"
+        )
+    blocks: list[str] = []
+    for p in data.pending_approvals:
+        payload = p.get("payload") or {}
+        current = p.get("current_state") or {}
+        title = f"{_esc(p.get('kind'))}"
+        diff_html = ""
+        if p.get("kind") == "watchlist_edit":
+            sleeve = payload.get("sleeve", "?")
+            new_symbols = set(payload.get("symbols") or [])
+            old_symbols = set(current.get("symbol_whitelist") or [])
+            adds = sorted(new_symbols - old_symbols)
+            removes = sorted(old_symbols - new_symbols)
+            title = f"Watchlist change for {_esc(sleeve)}"
+            parts = []
+            if adds:
+                parts.append(
+                    '<span class="diff-add">+ ' + ", ".join(map(_esc, adds)) + "</span>"
+                )
+            if removes:
+                parts.append(
+                    '<span class="diff-del">- ' + ", ".join(map(_esc, removes)) + "</span>"
+                )
+            keep = sorted(new_symbols & old_symbols)
+            parts.append(
+                '<span class="muted">= ' + ", ".join(map(_esc, keep)) + "</span>"
+            )
+            diff_html = "<div>" + "<br>".join(parts) + "</div>"
+        queued = p["id"] in data.queued_pending_ids
+        if queued:
+            actions = (
+                '<div class="muted">queued: the bot will apply this within a '
+                "few seconds; refresh to see the outcome</div>"
+            )
+        else:
+            actions = (
+                f'<form class="inline" method="post" action="/approve">'
+                f'<input type="hidden" name="pending_id" value="{_esc(p["id"])}">'
+                f'<button class="btn ok" type="submit">Approve</button></form>'
+                f'<form class="inline" method="post" action="/reject">'
+                f'<input type="hidden" name="pending_id" value="{_esc(p["id"])}">'
+                f'<button class="btn no" type="submit">Reject</button></form>'
+            )
+        blocks.append(
+            f'<div class="card approval"><b>{title}</b>'
+            f'<div class="sub">proposed {_sgt(p.get("created_at"))} SGT</div>'
+            f"{diff_html}"
+            f'<div class="thesis" style="margin:8px 0">{_esc(p.get("reason") or "")}</div>'
+            f"{actions}</div>"
+        )
+    return "".join(blocks)
+
+
 def _short_num(value: Any) -> str:
     if value is None:
         return "-"
@@ -256,6 +329,8 @@ def render_page(data: DashboardData, *, generated_at: datetime) -> str:
 auto-refreshes every 5 min</div>
 <meta http-equiv="refresh" content="300">
 {errors}
+<h2>Pending approvals</h2>
+{_approvals_section(data)}
 <h2>Account</h2>
 {_account_section(data)}
 <h2>Equity (7d)</h2>

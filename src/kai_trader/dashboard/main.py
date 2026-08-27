@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import hmac
 import os
+import urllib.parse
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -128,6 +130,53 @@ def create_app(config: DashboardConfig | None = None) -> FastAPI:
         return HTMLResponse(
             render_page(data, generated_at=datetime.now(UTC))
         )
+
+    async def _queue_action(request: Request, action: str) -> Response:
+        """File one approve/reject request into web_actions.
+
+        The dashboard's only write, into its only writable table. The
+        bot process validates the pending change is still pending and
+        executes with its own credentials; this endpoint cannot apply
+        anything itself.
+        """
+        missing = cfg.missing()
+        if missing:
+            return HTMLResponse(render_setup_page(missing), status_code=503)
+        if not is_authorized(cfg, request):
+            return HTMLResponse(render_unauthorized_page(), status_code=401)
+        # Hand-parse the urlencoded body: one known field, and it keeps
+        # python-multipart out of the image.
+        body = (await request.body()).decode("utf-8", "replace")
+        fields = urllib.parse.parse_qs(body)
+        raw_id = (fields.get("pending_id") or [""])[0]
+        try:
+            pending_uuid = uuid.UUID(raw_id)
+        except ValueError:
+            return PlainTextResponse("invalid pending_id", status_code=400)
+        pool = await _pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                insert into web_actions (pending_change_id, action)
+                values ($1, $2)
+                """,
+                pending_uuid,
+                action,
+            )
+        _log.info(
+            "dashboard.action_queued",
+            pending_id=raw_id,
+            action=action,
+        )
+        return RedirectResponse(url="/", status_code=303)
+
+    @app.post("/approve")
+    async def approve(request: Request) -> Response:
+        return await _queue_action(request, "approve")
+
+    @app.post("/reject")
+    async def reject(request: Request) -> Response:
+        return await _queue_action(request, "reject")
 
     @app.on_event("shutdown")
     async def _close_pool() -> None:

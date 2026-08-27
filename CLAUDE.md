@@ -221,8 +221,30 @@ kai-trader/
 
 ## Current state
 
-Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, 5c, 5d, 5e, R1, A1, **and D1** shipped:
+Phases 1, 2, 2.5, 2.7, 2.8, 2.9, 3.1-3.6, 4, 5a, 5b, 5c, 5d, 5e, R1, A1, D1, **and U1** shipped:
 
+- Phase U1 (2026-08-27) adds the weekly universe review and web
+  approvals. New `kai_trader/universe/` package: a curated candidate
+  pool (`pool.py`, changed only by PR), a deterministic eligibility
+  screen (`screen.py`: weekly put near the delta band, spread quality,
+  strike fits the per-name cap at current equity, bid-yield floor,
+  trend, known earnings calendar), and an AI curator pass
+  (`prompts.py` v1.0.0, strict ADD/SKIP/KEEP/RETIRE verdicts in
+  `models.py`, fail-closed to SKIP/KEEP). Guardrails: max 2 adds and 2
+  retires per run, sleeve size 4-10, and nothing is ever applied
+  directly; changes are filed as ordinary `pending_changes`
+  watchlist_edit proposals (proposed_by -1) with the thesis in the
+  reason. Runs weekly via `UniverseReviewWorker` (immediately at first
+  boot, then every ~6.5 days) or on demand with `/universe_review`;
+  every run lands in `weekly_reviews`. Web approvals: the dashboard
+  shows Pending approvals with the add/retire diff and Approve/Reject
+  buttons that INSERT a request into the new `web_actions` table
+  (migration 037; kai_chat_ro gets SELECT+INSERT on that one table
+  only). The bot's `WebActionWorker` is the sole executor: it
+  revalidates the change is still pending and drives the same state
+  machine as the Telegram buttons, so web and Telegram approvals
+  cannot double-apply and the web service still holds no broker keys
+  or write access to trading config.
 - Phase D1 (2026-08-27) adds the read-only web dashboard: a second
   Render service (`kai-trader-dashboard`, free tier, same Docker image,
   `dockerCommand: uv run python -m kai_trader.dashboard.main`) serving

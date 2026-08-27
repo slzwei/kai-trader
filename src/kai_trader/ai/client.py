@@ -81,29 +81,35 @@ class ProviderResult:
     model: str
 
 
-async def request_decision(
+async def request_structured(
     *,
+    system_prompt: str,
     user_message: str,
     model: str,
+    tool_name: str,
+    tool_description: str,
+    tool_schema: dict[str, Any],
+    max_tokens: int = MAX_DECISION_TOKENS,
 ) -> ProviderResult:
-    """Send one forced-tool decision request and return the raw payload.
+    """One forced-tool request; returns the raw tool payload plus usage.
 
-    ``payload`` is the first ``record_wheel_decision`` tool input block,
-    or ``None`` when the response carried no such block (the engine
-    treats that as invalid output and fails closed). Exceptions from
-    the SDK propagate to the engine, which owns retry and fail-closed
-    handling; timeouts are enforced by the engine's ``wait_for``.
+    Shared transport for every structured judgment this package makes
+    (per-candidate trade decisions, the weekly universe review). The
+    system prompt is cache-marked so consecutive calls in a batch pay
+    the cached-prompt price. Exceptions propagate to the caller, which
+    owns retry and fail-closed handling; timeouts are enforced by the
+    caller's ``wait_for``.
     """
     client = _get_client()
     response = await client.messages.create(
         model=model,
-        max_tokens=MAX_DECISION_TOKENS,
+        max_tokens=max_tokens,
         system=cast(
             Any,
             [
                 {
                     "type": "text",
-                    "text": SYSTEM_PROMPT,
+                    "text": system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
@@ -112,22 +118,19 @@ async def request_decision(
             Any,
             [
                 {
-                    "name": DECISION_TOOL_NAME,
-                    "description": (
-                        "Record the final TAKE/REJECT underwriting decision "
-                        "for the candidate in this conversation."
-                    ),
-                    "input_schema": DECISION_TOOL_SCHEMA,
+                    "name": tool_name,
+                    "description": tool_description,
+                    "input_schema": tool_schema,
                 }
             ],
         ),
-        tool_choice=cast(Any, {"type": "tool", "name": DECISION_TOOL_NAME}),
+        tool_choice=cast(Any, {"type": "tool", "name": tool_name}),
         messages=cast(Any, [{"role": "user", "content": user_message}]),
     )
     payload: dict[str, Any] | None = None
     for block in response.content:
         if getattr(block, "type", None) == "tool_use" and (
-            getattr(block, "name", None) == DECISION_TOOL_NAME
+            getattr(block, "name", None) == tool_name
         ):
             raw_input = getattr(block, "input", None)
             if isinstance(raw_input, dict):
@@ -140,4 +143,28 @@ async def request_decision(
         input_tokens=getattr(usage, "input_tokens", None) if usage else None,
         output_tokens=getattr(usage, "output_tokens", None) if usage else None,
         model=str(getattr(response, "model", model)),
+    )
+
+
+async def request_decision(
+    *,
+    user_message: str,
+    model: str,
+) -> ProviderResult:
+    """Send one forced-tool trade decision request.
+
+    ``payload`` is the first ``record_wheel_decision`` tool input block,
+    or ``None`` when the response carried no such block (the engine
+    treats that as invalid output and fails closed).
+    """
+    return await request_structured(
+        system_prompt=SYSTEM_PROMPT,
+        user_message=user_message,
+        model=model,
+        tool_name=DECISION_TOOL_NAME,
+        tool_description=(
+            "Record the final TAKE/REJECT underwriting decision "
+            "for the candidate in this conversation."
+        ),
+        tool_schema=DECISION_TOOL_SCHEMA,
     )

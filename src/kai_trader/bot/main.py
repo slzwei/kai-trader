@@ -20,6 +20,7 @@ from telegram.ext import (
     filters,
 )
 
+from kai_trader.approvals.web_worker import WebActionWorker
 from kai_trader.bot.handlers import (
     account,
     ai_status,
@@ -46,6 +47,7 @@ from kai_trader.bot.handlers import (
     status,
     strategy_status,
     trade_now,
+    universe_review,
 )
 from kai_trader.bot.handlers import help as help_handler
 from kai_trader.config import Settings, get_settings
@@ -72,6 +74,7 @@ from kai_trader.observability.snapshot_writer import SnapshotWorker
 from kai_trader.observability.watchdog import TaskWatchdog
 from kai_trader.strategy.worker import StrategyWorker
 from kai_trader.streams.trading_stream import TradingStreamWorker
+from kai_trader.universe.worker import UniverseReviewWorker
 
 _worker: NotificationWorker | None = None
 _strategy_worker: StrategyWorker | None = None
@@ -83,6 +86,8 @@ _daily_report_worker: DailyReportWorker | None = None
 _weekly_chart_worker: WeeklyEquityChartWorker | None = None
 _flags_nag_worker: FlagsNagWorker | None = None
 _watchdog: TaskWatchdog | None = None
+_web_action_worker: WebActionWorker | None = None
+_universe_worker: UniverseReviewWorker | None = None
 
 
 async def _telegram_error_handler(
@@ -144,6 +149,7 @@ def build_application(settings: Settings) -> Application:  # type: ignore[type-a
     app.add_handler(CommandHandler("decisions", decisions.handle))
     app.add_handler(CommandHandler("dlq", dlq.handle))
     app.add_handler(CommandHandler("ai_status", ai_status.handle))
+    app.add_handler(CommandHandler("universe_review", universe_review.handle))
 
     # Free-form text from the owner is routed to the conversational
     # chat handler. Slash commands are matched by the CommandHandlers
@@ -164,6 +170,7 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
     global _memory_profile_worker, _snapshot_worker, _daily_report_worker
     global _weekly_chart_worker, _flags_nag_worker, _watchdog
+    global _web_action_worker, _universe_worker
 
     # Refuse to start when a required wheel went missing. lxml has
     # done this once already; surface that class of failure at boot
@@ -256,6 +263,17 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     _flags_nag_worker = FlagsNagWorker()
     await _flags_nag_worker.start()
 
+    # Phase U1: executes approve/reject requests the read-only web
+    # dashboard files into web_actions. The applier and all write
+    # credentials stay in this process.
+    _web_action_worker = WebActionWorker()
+    await _web_action_worker.start()
+
+    # Phase U1: weekly universe review. Proposes watchlist changes
+    # through pending_changes; never applies anything itself.
+    _universe_worker = UniverseReviewWorker()
+    await _universe_worker.start()
+
     # B6: supervise every long-lived worker spawned above. If any of
     # them dies via an unhandled exception, the watchdog respawns it
     # and fires a critical Telegram alert. Healthchecks.io covers the
@@ -270,6 +288,8 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
         ("daily_report", _daily_report_worker),
         ("weekly_chart", _weekly_chart_worker),
         ("flags_nag", _flags_nag_worker),
+        ("web_actions", _web_action_worker),
+        ("universe_review", _universe_worker),
     ])
     await _watchdog.start()
 
@@ -278,11 +298,18 @@ async def _shutdown(_app: Application) -> None:  # type: ignore[type-arg]
     global _worker, _strategy_worker, _event_dispatcher, _trading_stream
     global _memory_profile_worker, _snapshot_worker, _daily_report_worker
     global _weekly_chart_worker, _flags_nag_worker, _watchdog
+    global _web_action_worker, _universe_worker
     # Stop the watchdog FIRST so it does not respawn workers we are
     # about to shut down.
     if _watchdog is not None:
         await _watchdog.stop()
         _watchdog = None
+    if _universe_worker is not None:
+        await _universe_worker.stop()
+        _universe_worker = None
+    if _web_action_worker is not None:
+        await _web_action_worker.stop()
+        _web_action_worker = None
     if _flags_nag_worker is not None:
         await _flags_nag_worker.stop()
         _flags_nag_worker = None
