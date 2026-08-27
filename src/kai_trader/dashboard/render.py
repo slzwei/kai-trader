@@ -128,7 +128,7 @@ def _account_section(data: DashboardData) -> str:
         f'<div class="v">{_money(acct.get("equity"))}</div></div>'
         f'<div class="stat"><div class="k">Cash</div>'
         f'<div class="v">{_money(acct.get("cash"))}</div></div>'
-        f'<div class="stat"><div class="k">Options BP</div>'
+        f'<div class="stat"><div class="k">Buying power</div>'
         f'<div class="v">{_money(acct.get("buying_power"))}</div></div>'
         f'<div class="stat"><div class="k">Day P&amp;L</div>'
         f'<div class="v">{_signed(acct.get("day_pl"))}</div></div>'
