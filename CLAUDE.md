@@ -180,6 +180,7 @@ kai-trader/
 | WEEKLY_CHART_UTC_TIME | no       | `HH:MM` UTC for the weekly chart post. Default `00:00`. |
 | WEEKLY_CHART_ENABLED  | no       | `true` (default) or `false` to suppress the weekly chart entirely. |
 | EODHD_API_KEY         | strongly recommended | EODHD Calendar API key. Primary earnings source for the live bot (`src/kai_trader/strategy/earnings.py`) with yfinance as fallback, and required by the backtest harness. Without it the live bot falls through to yfinance only; coverage gaps trigger fail-closed unknown-skips across the universe. |
+| FINNHUB_API_KEY       | recommended | Finnhub earnings calendar (free tier). Third source in the earnings union with EODHD and yfinance; independent calendars cross-check so fail-closed unknowns and stale-date risk both shrink. |
 | AI_DECISION_MODE      | no       | `off` (default) or `filter`. `filter` lets the AI decision layer TAKE/REJECT screened CSP candidates before the risk gate; failures fail closed for new entries. Position management never depends on it. |
 | AI_DECISION_MODEL     | no       | Claude model id for the decision layer. Default `claude-sonnet-4-6`. Persisted with every decision. |
 | AI_DECISION_TIMEOUT_SECONDS | no | Per-candidate request ceiling. Default 30. |

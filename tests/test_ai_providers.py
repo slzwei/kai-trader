@@ -142,3 +142,15 @@ def test_earnings_sources_note_reports_degraded_without_key() -> None:
     # Hermetic env has no EODHD key: the note must say degraded, never
     # present the pair as healthy.
     assert "DEGRADED" in earnings_sources_note()
+
+
+def test_earnings_sources_note_lists_finnhub_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kai_trader.config as config_module
+
+    monkeypatch.setenv("FINNHUB_API_KEY", "fh-test-key")
+    config_module.reset_settings_cache()
+    note = earnings_sources_note()
+    assert "Finnhub" in note
+    assert "DEGRADED" not in note

@@ -376,3 +376,119 @@ async def test_cache_ttl_expires(monkeypatch: pytest.MonkeyPatch) -> None:
     now[0] = now[0] + timedelta(hours=25)
     await earnings.get_next_earnings_date("AMZN")
     assert calls == 2
+
+
+# ------------- Phase F1: Finnhub as the third calendar source -------------
+
+
+def _finnhub_payload(*dates: str) -> dict:
+    return {
+        "earningsCalendar": [
+            {"date": d, "symbol": "KO", "hour": "bmo"} for d in dates
+        ]
+    }
+
+
+async def test_finnhub_returns_soonest_upcoming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FINNHUB_API_KEY", "fh-test-key")
+    import kai_trader.config as config_module
+
+    config_module.reset_settings_cache()
+    import io
+    import json as json_mod
+
+    def fake_urlopen(url: str, timeout: int = 0):  # type: ignore[no-untyped-def]
+        assert "finnhub.io" in url and "token=fh-test-key" in url
+
+        class _Resp(io.BytesIO):
+            def __enter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __exit__(self, *args):  # type: ignore[no-untyped-def]
+                return None
+
+        return _Resp(
+            json_mod.dumps(
+                _finnhub_payload("2026-11-04", "2026-10-21", "2020-01-01")
+            ).encode()
+        )
+
+    monkeypatch.setattr(earnings.urllib.request, "urlopen", fake_urlopen)
+    result = earnings._fetch_finnhub_sync("KO")
+    assert result == date(2026, 10, 21)  # soonest upcoming; past date ignored
+
+
+async def test_finnhub_returns_none_without_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    import kai_trader.config as config_module
+
+    config_module.reset_settings_cache()
+    assert earnings._fetch_finnhub_sync("KO") is None
+
+
+async def test_finnhub_empty_calendar_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FINNHUB_API_KEY", "fh-test-key")
+    import kai_trader.config as config_module
+
+    config_module.reset_settings_cache()
+    import io
+
+    def fake_urlopen(url: str, timeout: int = 0):  # type: ignore[no-untyped-def]
+        class _Resp(io.BytesIO):
+            def __enter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __exit__(self, *args):  # type: ignore[no-untyped-def]
+                return None
+
+        return _Resp(b'{"earningsCalendar": []}')
+
+    monkeypatch.setattr(earnings.urllib.request, "urlopen", fake_urlopen)
+    assert earnings._fetch_finnhub_sync("KO") is None
+
+
+async def test_union_picks_soonest_across_three_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        earnings, "_fetch_eodhd_sync", lambda s: date(2026, 11, 4)
+    )
+    monkeypatch.setattr(
+        earnings, "_fetch_finnhub_sync", lambda s: date(2026, 10, 21)
+    )
+    monkeypatch.setattr(
+        earnings, "_fetch_yfinance_sync", lambda s: date(2026, 12, 1)
+    )
+    assert earnings._fetch_earnings_sync("KO") == date(2026, 10, 21)
+
+
+async def test_union_tolerates_finnhub_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(_s: str) -> date:
+        raise ValueError("finnhub down")
+
+    monkeypatch.setattr(earnings, "_fetch_eodhd_sync", lambda s: None)
+    monkeypatch.setattr(earnings, "_fetch_finnhub_sync", _boom)
+    monkeypatch.setattr(
+        earnings, "_fetch_yfinance_sync", lambda s: date(2026, 10, 27)
+    )
+    assert earnings._fetch_earnings_sync("KO") == date(2026, 10, 27)
+
+
+async def test_union_all_sources_failing_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(_s: str) -> date:
+        raise ValueError("down")
+
+    monkeypatch.setattr(earnings, "_fetch_eodhd_sync", _boom)
+    monkeypatch.setattr(earnings, "_fetch_finnhub_sync", _boom)
+    monkeypatch.setattr(earnings, "_fetch_yfinance_sync", _boom)
+    assert earnings._fetch_earnings_sync("KO") is None

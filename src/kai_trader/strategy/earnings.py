@@ -110,6 +110,64 @@ def reset_cache() -> None:
 _EODHD_CALENDAR_URL: Final[str] = "https://eodhd.com/api/calendar/earnings"
 _EODHD_TIMEOUT_S: Final[int] = 10
 
+_FINNHUB_CALENDAR_URL: Final[str] = "https://finnhub.io/api/v1/calendar/earnings"
+_FINNHUB_TIMEOUT_S: Final[int] = 10
+# Finnhub's free tier serves the earnings calendar over a bounded date
+# range; 90 days comfortably covers the next report for any quarterly
+# filer without tripping range limits.
+_FINNHUB_LOOKAHEAD_DAYS: Final[int] = 90
+
+
+def _fetch_finnhub_sync(symbol: str) -> date | None:
+    """Finnhub earnings-calendar fetch, same contract as the EODHD one.
+
+    Returns the soonest scheduled earnings date >= today, or None when
+    no upcoming event is listed or the key is not configured. HTTP and
+    parse errors propagate so the caller logs them and falls through
+    to the other sources (union-min semantics). Free-tier keys are
+    sufficient: the calendar endpoint's date and symbol fields are not
+    premium-gated.
+
+    Response shape::
+
+        {"earningsCalendar": [
+            {"date": "2026-10-21", "symbol": "KO", "hour": "bmo", ...},
+            ...
+        ]}
+    """
+    settings = get_settings()
+    if settings.finnhub_api_key is None:
+        return None
+    key = settings.finnhub_api_key.get_secret_value()
+    if not key:
+        return None
+    today = _now().date()
+    params = urllib.parse.urlencode({
+        "from": today.isoformat(),
+        "to": (today + timedelta(days=_FINNHUB_LOOKAHEAD_DAYS)).isoformat(),
+        "symbol": symbol.upper(),
+        "token": key,
+    })
+    url = f"{_FINNHUB_CALENDAR_URL}?{params}"
+    with urllib.request.urlopen(url, timeout=_FINNHUB_TIMEOUT_S) as resp:
+        body = resp.read().decode("utf-8")
+    payload = json.loads(body)
+    events = payload.get("earningsCalendar") or []
+    upcoming: list[date] = []
+    for event in events:
+        raw = event.get("date")
+        if not isinstance(raw, str):
+            continue
+        try:
+            parsed = date.fromisoformat(raw)
+        except ValueError:
+            continue
+        if parsed >= today:
+            upcoming.append(parsed)
+    if not upcoming:
+        return None
+    return min(upcoming)
+
 
 def _fetch_eodhd_sync(symbol: str) -> date | None:
     """Primary earnings fetch via EODHD Calendar API.
@@ -198,7 +256,13 @@ def _fetch_yfinance_sync(symbol: str) -> date | None:
 
 
 def _fetch_earnings_sync(symbol: str) -> date | None:
-    """Union of EODHD and yfinance — return the SOONEST upcoming date.
+    """Union of EODHD, Finnhub, and yfinance: the SOONEST upcoming date.
+
+    Phase F1 adds Finnhub as a third independent calendar so the
+    fail-closed filter cross-checks sources even while the EODHD
+    subscription is lapsed. Each source fails independently; the union
+    of survivors decides. All three failing returns None, which the
+    caller treats as unknown and skips.
 
     Live preflight on 2026-05-10 surfaced two distinct failure modes:
 
@@ -229,6 +293,20 @@ def _fetch_earnings_sync(symbol: str) -> date | None:
             symbol=symbol,
             error=str(exc),
         )
+    finnhub_date: date | None = None
+    try:
+        finnhub_date = _fetch_finnhub_sync(symbol)
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        TimeoutError,
+        ValueError,
+    ) as exc:
+        _log.warning(
+            "strategy.earnings.finnhub_failed",
+            symbol=symbol,
+            error=str(exc),
+        )
     yf_date: date | None = None
     try:
         yf_date = _fetch_yfinance_sync(symbol)
@@ -238,7 +316,9 @@ def _fetch_earnings_sync(symbol: str) -> date | None:
             symbol=symbol,
             error=str(exc),
         )
-    candidates = [d for d in (eodhd_date, yf_date) if d is not None]
+    candidates = [
+        d for d in (eodhd_date, finnhub_date, yf_date) if d is not None
+    ]
     if not candidates:
         return None
     return min(candidates)

@@ -212,3 +212,31 @@ def log_eodhd_key_status() -> None:
         length=len(raw),
         prefix=raw[:6] if len(raw) >= 6 else raw,
     )
+
+
+def log_finnhub_key_status() -> None:
+    """Log whether FINNHUB_API_KEY made it into the live process at boot.
+
+    Same rationale as the EODHD probe: the earnings union degrades
+    silently when a source's key is absent, and deploy logs are the
+    cheapest place to see which calendars this container actually has.
+    """
+    from kai_trader.config import get_settings
+
+    settings = get_settings()
+    key = settings.finnhub_api_key
+    if key is None or not key.get_secret_value():
+        _log.warning(
+            "finnhub_key_probe.missing",
+            note=(
+                "FINNHUB_API_KEY not set; the earnings union runs "
+                "without the Finnhub calendar source."
+            ),
+        )
+        return
+    raw = key.get_secret_value()
+    _log.info(
+        "finnhub_key_probe.present",
+        length=len(raw),
+        prefix=raw[:4] if len(raw) >= 4 else raw,
+    )

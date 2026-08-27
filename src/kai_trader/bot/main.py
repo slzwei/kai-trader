@@ -63,6 +63,7 @@ from kai_trader.observability.dependency_probe import (
     assert_alpaca_keys_resolvable,
     assert_dependencies_loadable,
     log_eodhd_key_status,
+    log_finnhub_key_status,
 )
 from kai_trader.observability.equity_chart import WeeklyEquityChartWorker
 from kai_trader.observability.flags_nag import FlagsNagWorker
@@ -189,6 +190,7 @@ async def _startup(app: Application) -> None:  # type: ignore[type-arg]
     # the bot logs "unknown, fail-closed" across the universe; that
     # symptom is hard to root-cause from tick output alone.
     log_eodhd_key_status()
+    log_finnhub_key_status()
 
     # W-7: enable allocation tracking before the bot starts opening
     # connections so the snapshot worker captures every long-lived

@@ -149,6 +149,16 @@ class Settings(BaseSettings):
         ),
     )
 
+    finnhub_api_key: SecretStr | None = Field(
+        default=None,
+        alias="FINNHUB_API_KEY",
+        description=(
+            "Finnhub API key (free tier is enough). Third earnings-"
+            "calendar source, unioned with EODHD and yfinance so the "
+            "fail-closed earnings filter has independent calendars to "
+            "cross-check. Optional; unset means the source is skipped."
+        ),
+    )
     eodhd_api_key: SecretStr | None = Field(
         default=None,
         alias="EODHD_API_KEY",

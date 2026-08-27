@@ -88,14 +88,20 @@ class EventContextProvider(Protocol):
 def earnings_sources_note() -> str:
     """Describe the earnings data path honestly, including degradation."""
     settings = get_settings()
-    key = settings.eodhd_api_key
-    if key is not None and key.get_secret_value():
-        return (
-            "EODHD calendar primary with yfinance fallback (union of both; "
-            "note: a lapsed EODHD subscription degrades this to yfinance "
-            "only at runtime)"
-        )
-    return "DEGRADED: yfinance only (EODHD key not configured)"
+    sources = []
+    eodhd = settings.eodhd_api_key
+    if eodhd is not None and eodhd.get_secret_value():
+        sources.append("EODHD")
+    finnhub = settings.finnhub_api_key
+    if finnhub is not None and finnhub.get_secret_value():
+        sources.append("Finnhub")
+    sources.append("yfinance")
+    if len(sources) == 1:
+        return "DEGRADED: yfinance only (no calendar API key configured)"
+    return (
+        "union of " + " + ".join(sources) + " (soonest upcoming date wins; "
+        "a lapsed key degrades that source silently at runtime)"
+    )
 
 
 def _parse_headline(raw: Any, *, now: datetime) -> Headline | None:
