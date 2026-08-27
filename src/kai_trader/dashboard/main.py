@@ -62,7 +62,14 @@ def load_config() -> DashboardConfig:
 
 
 def is_authorized(config: DashboardConfig, request: Request) -> bool:
-    """Constant-time token check against query param or cookie."""
+    """Constant-time token check against query param or cookie.
+
+    Render-generated tokens are base64-like and can contain ``+``;
+    query-string decoding turns a raw ``+`` into a space, so a token
+    pasted straight into the URL bar arrives mangled. Accept the
+    space-restored form too: a literal space cannot appear in a real
+    token, so this loosens nothing.
+    """
     if not config.token:
         return False
     supplied = request.query_params.get("token") or request.cookies.get(
@@ -70,7 +77,8 @@ def is_authorized(config: DashboardConfig, request: Request) -> bool:
     )
     if not supplied:
         return False
-    return hmac.compare_digest(supplied, config.token)
+    candidates = (supplied, supplied.replace(" ", "+"))
+    return any(hmac.compare_digest(c, config.token) for c in candidates)
 
 
 def create_app(config: DashboardConfig | None = None) -> FastAPI:

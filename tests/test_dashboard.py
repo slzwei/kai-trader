@@ -246,3 +246,28 @@ def test_token_bootstrap_sets_cookie_then_cookie_serves_page(
     assert page.status_code == 200
     assert "Kai Trader" in page.text
     assert "REJECT" in page.text
+
+
+def test_base64_token_with_plus_survives_url_mangling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw '+' in the query decodes to a space; auth must still pass,
+    and the corrected canonical token must round-trip via the cookie."""
+    monkeypatch.setattr(
+        dash_main, "fetch_dashboard_data", AsyncMock(return_value=_data())
+    )
+    monkeypatch.setattr(
+        dash_main.asyncpg, "create_pool", AsyncMock(return_value=MagicMock())
+    )
+    token = "aLhH+dip/nbeHvHQE9GBd5Inh+IOAas+u28Fyz5v/4="
+    client = _client(
+        DashboardConfig(database_url_ro="postgresql://ro@x/db", token=token)
+    )
+
+    # Pasted raw into the URL bar: '+' arrives as ' ' after decoding.
+    bootstrap = client.get(f"/?token={token}", follow_redirects=False)
+    assert bootstrap.status_code == 303
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "Kai Trader" in page.text
