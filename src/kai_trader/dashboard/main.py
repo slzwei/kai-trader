@@ -9,6 +9,12 @@ service's dockerCommand). Reads exactly three environment variables:
   the setup notice renders; the app never falls open.
 - ``PORT``: injected by Render.
 
+One optional extra, ``PER_NAME_ECONOMIC_CAP_PCT``, is read for display
+only: it draws the concentration cap line at the value the bot
+enforces. Unset, the page falls back to the same 0.20 default the risk
+gate uses, so a stale copy shows a stale line and never a wrong number
+of dollars.
+
 Auth: first visit with ``?token=<secret>`` sets an HttpOnly cookie for
 30 days; later visits ride the cookie. Comparisons are constant-time.
 """
@@ -21,6 +27,7 @@ import urllib.parse
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 
 import asyncpg
 from fastapi import FastAPI, Request
@@ -40,12 +47,16 @@ _COOKIE_NAME = "kai_dash"
 _COOKIE_MAX_AGE_SECONDS = 30 * 24 * 3600
 
 
+_DEFAULT_PER_NAME_CAP = Decimal("0.20")
+
+
 @dataclass(frozen=True)
 class DashboardConfig:
     """The service's entire configuration surface."""
 
     database_url_ro: str | None
     token: str | None
+    per_name_cap_pct: Decimal = _DEFAULT_PER_NAME_CAP
 
     def missing(self) -> list[str]:
         out: list[str] = []
@@ -56,10 +67,24 @@ class DashboardConfig:
         return out
 
 
+def _cap_from_env() -> Decimal:
+    """Read the per-name cap for display, falling back to the gate default."""
+    raw = os.environ.get("PER_NAME_ECONOMIC_CAP_PCT")
+    if not raw:
+        return _DEFAULT_PER_NAME_CAP
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        _log.warning("dashboard.bad_cap_env", value=raw)
+        return _DEFAULT_PER_NAME_CAP
+    return value if value > 0 else _DEFAULT_PER_NAME_CAP
+
+
 def load_config() -> DashboardConfig:
     return DashboardConfig(
         database_url_ro=os.environ.get("DATABASE_URL_RO") or None,
         token=os.environ.get("DASHBOARD_TOKEN") or None,
+        per_name_cap_pct=_cap_from_env(),
     )
 
 
@@ -128,7 +153,11 @@ def create_app(config: DashboardConfig | None = None) -> FastAPI:
             return redirect
         data = await fetch_dashboard_data(await _pool())
         return HTMLResponse(
-            render_page(data, generated_at=datetime.now(UTC))
+            render_page(
+                data,
+                generated_at=datetime.now(UTC),
+                per_name_cap_pct=cfg.per_name_cap_pct,
+            )
         )
 
     async def _queue_action(request: Request, action: str) -> Response:
