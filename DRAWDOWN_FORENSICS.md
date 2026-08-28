@@ -17,8 +17,19 @@ caveat found during that validation: `state.account_snapshot()`
 carries long equity at cost, so the backtest's cap dollars run
 slightly loose when shares are under water; live production sizes
 off Alpaca market equity and is tighter in exactly that regime.
-Recommendation 3 (breaker numbness in slow grinds) remains open as a
-separate research item. The body below is preserved as written.
+ADDENDUM 2 (2026-08-28): recommendation 3 (breaker numbness in slow
+grinds) has now been tested and REJECTED. The numbness is real (81 of
+620 days sat more than 10% below the peak with the breaker silent),
+but adding a slow anchor moves max drawdown by zero under the current
+production configuration (23.185% with and without, identical to four
+decimal places, on a path that differs on 339 of 620 days) while
+nearly tripling freeze duration. An entry freeze cannot reduce
+drawdown carried by inventory already on the books, and it blocks the
+covered-call income that funds the recovery. Pre-S2 the anchors do buy
+2-3 drawdown points, at 1.5-1.6 CAGR points each: roughly double the
+worst control tested below, for protection S2 already provides more
+cheaply. Full write-up in `BREAKER_SLOW_ANCHOR.md`. The body below is
+preserved as written.
 
 ## Question
 

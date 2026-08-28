@@ -154,3 +154,42 @@ class TestEquityCurve:
         assert snap.equity == Decimal("100250.00")
         # Buying power excludes the $17,000 locked behind the CSP.
         assert snap.buying_power == Decimal("83250.00")
+
+
+class TestLongEquityMarking:
+    """The research fidelity switch for equity-scaled caps.
+
+    Production reads Alpaca's market equity. The harness default carries
+    held shares at cost, which inflates equity (and every cap scaled off
+    it) exactly while shares are under water. These pin both behaviours
+    so the default can never drift silently.
+    """
+
+    def _state_with_shares(self) -> BacktestState:
+        state = _state(Decimal("10000"))
+        state.add_long_shares("AAPL", Decimal("100"), Decimal("50"))
+        return state
+
+    def test_default_carries_shares_at_cost(self) -> None:
+        state = self._state_with_shares()
+        # Cash 10,000 - 5,000 spent = 5,000; shares carried at cost 5,000.
+        assert state.account_snapshot().equity == Decimal("10000")
+
+    def test_marks_are_ignored_unless_enabled(self) -> None:
+        state = self._state_with_shares()
+        state.long_equity_marks = {"AAPL": Decimal("30")}
+        assert state.account_snapshot().equity == Decimal("10000")
+
+    def test_enabled_marks_shares_at_market(self) -> None:
+        state = self._state_with_shares()
+        state.mark_long_equity_at_market = True
+        state.long_equity_marks = {"AAPL": Decimal("30")}
+        # 5,000 cash + 100 shares at 30 = 8,000: the drawdown is visible
+        # to every equity-scaled cap, as it is in production.
+        assert state.account_snapshot().equity == Decimal("8000")
+
+    def test_missing_mark_falls_back_to_cost(self) -> None:
+        state = self._state_with_shares()
+        state.mark_long_equity_at_market = True
+        state.long_equity_marks = {}
+        assert state.account_snapshot().equity == Decimal("10000")
