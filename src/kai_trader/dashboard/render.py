@@ -51,6 +51,14 @@ _DEFAULT_PER_NAME_CAP = Decimal("0.20")
 #: lands at 40% of the track (which is where the CSS draws it).
 _CONC_SCALE_MULT = Decimal("2.5")
 
+#: Full-bar reference for the quant composite and the final score. The
+#: composite is annualised yield x spread quality, roughly 0.05 to 3+
+#: for weekly candidates, so it has no natural 100%. Both meters share
+#: this reference because final = composite x wheel fit: the final bar
+#: is always the quant bar shrunk by the model's ownership judgment,
+#: and drawing them on one scale is what makes that readable.
+_COMPOSITE_SCALE = Decimal("3")
+
 _REFRESH_SECONDS = 300
 
 _SLEEVE_LABELS = {
@@ -1526,19 +1534,41 @@ def _concentration_section(data: DashboardData, *, cap_pct: Decimal) -> str:
 # --------------------------------------------------------------------
 
 
-def _score(label: str, value: Any, *, final: bool = False) -> str:
+def _score(
+    label: str,
+    value: Any,
+    *,
+    final: bool = False,
+    scale: Decimal | None = None,
+) -> str:
+    """One labelled meter.
+
+    Two different units share this component, which is why ``scale``
+    exists. ``confidence`` and ``wheel_suitability`` are 0..1 and read
+    naturally as percentages. The quant composite is NOT: it is the
+    screener's annualised-yield x spread-quality product, roughly 0.05
+    to 3+, and ``final_score`` is that composite multiplied by
+    wheel_suitability. Printing either as a percentage produced
+    nonsense like "147%", so an unbounded value renders as a plain
+    number and its bar is drawn against ``scale``.
+    """
     dec = _dec(value)
     if dec is None:
         return (
             f'<div class="kt-score"><dt class="kt-eyebrow">{_esc(label)}</dt>'
             '<dd class="kt-score-val" style="margin:0">n/a</dd></div>'
         )
-    pct = dec * 100
-    width = max(Decimal(0), min(Decimal(100), pct))
+    if scale is None:
+        shown = f"{dec * 100:.0f}%"
+        fraction = dec
+    else:
+        shown = f"{dec:.2f}"
+        fraction = dec / scale
+    width = max(Decimal(0), min(Decimal(1), fraction)) * 100
     klass = ' class="is-final"' if final else ""
     return (
         f'<div class="kt-score"><dt class="kt-eyebrow">{_esc(label)}</dt>'
-        f'<dd class="kt-score-val" style="margin:0">{pct:.0f}%</dd>'
+        f'<dd class="kt-score-val" style="margin:0">{_esc(shown)}</dd>'
         f'<div class="kt-meter" aria-hidden="true">'
         f'<i{klass} style="width:{width:.0f}%"></i></div></div>'
     )
@@ -1591,9 +1621,14 @@ def _decision_card(row: dict[str, Any], *, now: datetime, today: date) -> str:
         middle = (
             '<dl class="kt-scores">'
             + _score("Confidence", row.get("confidence"))
-            + _score("AI score", row.get("ai_score"))
-            + _score("Quant score", row.get("quant_score"))
-            + _score("Final score", row.get("final_score"), final=True)
+            + _score("Wheel fit", row.get("ai_score"))
+            + _score("Quant score", row.get("quant_score"), scale=_COMPOSITE_SCALE)
+            + _score(
+                "Final score",
+                row.get("final_score"),
+                final=True,
+                scale=_COMPOSITE_SCALE,
+            )
             + "</dl>"
         )
         thesis = str(row.get("thesis") or "").strip()
@@ -1647,8 +1682,10 @@ def _ai_section(data: DashboardData, *, now: datetime, today: date) -> str:
     return (
         '<section class="kt-block" aria-labelledby="h-ai">'
         '<div class="kt-block-head"><h2 id="h-ai">AI decisions</h2>'
-        '<p class="kt-block-note">Latest 20. Candidates are scored by the model '
-        "before the deterministic risk gate sees them.</p></div>"
+        '<p class="kt-block-note">Latest 20, scored before the deterministic '
+        "risk gate sees them. Wheel fit is the model asking whether owning the "
+        "shares would be acceptable if the put assigns. Quant score is the "
+        "screener's own ranking, and final score is the two multiplied.</p></div>"
         f"{errors}{body}</section>"
     )
 

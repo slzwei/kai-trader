@@ -200,6 +200,36 @@ def test_render_page_decodes_occ_symbols() -> None:
     assert "expires Fri 4 Sep 2026" in page
 
 
+def test_ai_score_is_labelled_wheel_fit_for_what_it_stores() -> None:
+    """The column is named ai_score but holds wheel_suitability."""
+    page = render_page(_data(), generated_at=_GENERATED)
+    assert "Wheel fit" in page
+    assert "AI score" not in page
+
+
+def test_unbounded_scores_render_as_numbers_not_percentages() -> None:
+    """quant_composite runs ~0.05 to 3+, so a percentage read as nonsense."""
+    data = _data()
+    data.ai_decisions[0]["quant_score"] = Decimal("1.4745")
+    data.ai_decisions[0]["final_score"] = Decimal("0.2654")
+    page = render_page(data, generated_at=_GENERATED)
+    assert ">1.47</dd>" in page
+    assert ">0.27</dd>" in page
+    assert "147%" not in page
+    # The genuinely 0..1 fields still read as percentages.
+    assert ">72%</dd>" in page  # confidence 0.72
+    assert ">38%</dd>" in page  # wheel fit 0.38
+
+
+def test_meter_bars_never_overflow_their_track() -> None:
+    data = _data()
+    data.ai_decisions[0]["quant_score"] = Decimal("9.9")
+    page = render_page(data, generated_at=_GENERATED)
+    assert ">9.90</dd>" in page
+    assert "width:100%" in page
+    assert "width:330%" not in page
+
+
 def test_flag_tiles_show_all_three_flags_healthy() -> None:
     page = render_page(_data(), generated_at=_GENERATED)
     assert "Orders may be sent to the broker." in page
