@@ -154,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
                 # Historical reproduction: this experiment predates the
                 # S2 gate-native economic cap (CLI default 0.20).
                 "--econ-cap-pct", "0",
+                "--sleeve-econ-mult", "0",
                 "--sleeve-config", str(sleeve_path),
                 "--output", str(out_dir),
                 "--skip-warmup",

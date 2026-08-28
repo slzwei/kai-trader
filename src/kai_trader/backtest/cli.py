@@ -506,14 +506,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--sleeve-econ-mult",
-        default="0",
+        default="1.0",
         help=(
             "S3 sleeve-level assignment-aware economic cap, as a multiplier "
             "on each sleeve's own target_pct. 1.0 enforces the sleeve "
             "mandate against held shares plus put face; above 1.0 grants "
-            "headroom for assigned inventory. 0 (default) disables and "
-            "reproduces the pre-S3 gate, where the sleeve budget saw put "
-            "collateral only."
+            "headroom for assigned inventory. Default 1.0, matching "
+            "production. Pass 0 to disable and reproduce the pre-S3 gate, "
+            "where the sleeve budget saw put collateral only."
         ),
     )
     parser.add_argument(

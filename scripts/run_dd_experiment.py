@@ -122,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
                 # post-filters; the S2 gate-native cap (CLI default
                 # 0.20) must stay off here or baseline_parity drifts.
                 "--econ-cap-pct", "0",
+                "--sleeve-econ-mult", "0",
                 "--sleeve-config", str(sleeve_path),
                 "--output", str(out_dir),
                 "--skip-warmup",

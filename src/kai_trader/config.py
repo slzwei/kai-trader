@@ -254,7 +254,7 @@ class Settings(BaseSettings):
         return self.per_name_economic_cap_pct
 
     sleeve_economic_cap_mult: Decimal = Field(
-        default=Decimal("0"),
+        default=Decimal("1.0"),
         ge=0,
         le=5,
         alias="SLEEVE_ECONOMIC_CAP_MULT",
@@ -265,8 +265,8 @@ class Settings(BaseSettings):
             "the same way they escaped the per-name cap before S2. 1.0 "
             "enforces the sleeve mandate against held shares plus put face; "
             "above 1.0 grants headroom for assigned inventory to sit in "
-            "while the wheel works it off. 0 (default) disables and "
-            "reproduces pre-S3 behaviour."
+            "while the wheel works it off. 0 disables and reproduces "
+            "pre-S3 behaviour. Default 1.0."
         ),
     )
 

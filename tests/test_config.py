@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from kai_trader import config as config_module
@@ -136,3 +138,28 @@ def test_effective_alpaca_key_live_does_not_fallback_to_paper(
     # But the effective resolver refuses it.
     with pytest.raises(ValueError):
         _ = s.effective_alpaca_api_key
+
+
+def test_economic_cap_defaults_are_the_shipped_values() -> None:
+    """S2 and S3 ship ON. A silent regression here disables a safety cap."""
+    s = config_module.get_settings()
+    assert s.per_name_economic_cap_pct == Decimal("0.20")
+    assert s.effective_per_name_economic_cap_pct == Decimal("0.20")
+    assert s.sleeve_economic_cap_mult == Decimal("1.0")
+    assert s.effective_sleeve_economic_cap_mult == Decimal("1.0")
+
+
+@pytest.mark.parametrize("raw", ["0", "0.0"])
+def test_zero_disables_each_economic_cap(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Zero must read as disabled (None), not as a cap of zero dollars."""
+    monkeypatch.setenv("PER_NAME_ECONOMIC_CAP_PCT", raw)
+    monkeypatch.setenv("SLEEVE_ECONOMIC_CAP_MULT", raw)
+    config_module.get_settings.cache_clear()
+    try:
+        s = config_module.get_settings()
+        assert s.effective_per_name_economic_cap_pct is None
+        assert s.effective_sleeve_economic_cap_mult is None
+    finally:
+        config_module.get_settings.cache_clear()
