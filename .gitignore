@@ -47,3 +47,10 @@ backtest_runs/
 
 # Claude Code harness state (per-session locks, scheduled-task metadata)
 .claude/
+
+# Purchased options data (large, not regenerable from code)
+2021_3G/
+Greeks/
+
+# FMP mirror bulk download (large, re-fetchable)
+fmp_data/

@@ -150,7 +150,13 @@ class ContractMeta:
 
 @dataclass(frozen=True)
 class OptionDailyBar:
-    """One day of OHLCV for a single contract."""
+    """One day of OHLCV for a single contract.
+
+    ``bid``/``ask`` are the real end-of-day quotes when the vendor archive
+    has been merged in (see ``scripts/merge_vendor_quotes.py``). They are
+    ``None`` for contract-days the archive does not cover, in which case
+    the caller falls back to estimating a spread from volume.
+    """
 
     asof: date
     open: Decimal
@@ -158,6 +164,8 @@ class OptionDailyBar:
     low: Decimal
     close: Decimal
     volume: int
+    bid: Decimal | None = None
+    ask: Decimal | None = None
 
 
 def _contracts_path(underlying: str) -> Path:
@@ -563,6 +571,50 @@ def _build_contract(
     if days_to_exp <= 0:
         return None
     t_years = days_to_exp / 365.0
+
+    # Real end-of-day quotes when the vendor archive covers this contract-day.
+    # Measured against the estimator this path replaces, the volume-bucket
+    # spreads ran 3.4-4.5x too wide, which understated every entry credit and
+    # overstated every buy-to-close. The quote midpoint also prices the Greeks
+    # better than the last trade, which can be stale or sit on one side of the
+    # spread, so both come from the same source rather than mixing the two.
+    if bar.bid is not None and bar.ask is not None and bar.ask >= bar.bid:
+        if bar.bid <= 0:
+            # No bid means the contract cannot be sold at any size. The
+            # estimator used to floor this at _MIN_OPTION_PRICE and invent a
+            # tradable quote; the archive shows these are genuinely untraded.
+            return None
+        bid = bar.bid
+        ask = bar.ask
+        mid = (bid + ask) / Decimal("2")
+        if mid < _MIN_OPTION_PRICE:
+            return None
+        greeks = reconstruct_greeks(
+            option_type="call" if meta.option_type == "call" else "put",
+            market_price=float(mid),
+            spot=float(underlying_spot),
+            strike=float(meta.strike),
+            rate=rate,
+            t_years=t_years,
+        )
+        if greeks is None:
+            return None
+        return OptionContract(
+            symbol=meta.symbol,
+            underlying=meta.underlying,
+            option_type=meta.option_type,
+            strike=meta.strike,
+            expiration=meta.expiration,
+            bid=bid.quantize(Decimal("0.01")),
+            ask=ask.quantize(Decimal("0.01")),
+            last=mid.quantize(Decimal("0.01")),
+            delta=Decimal(str(greeks.delta)),
+            gamma=Decimal(str(greeks.gamma)),
+            theta=Decimal(str(greeks.theta)),
+            vega=Decimal(str(greeks.vega)),
+            implied_volatility=Decimal(str(greeks.iv)),
+        )
+
     mid = bar.close
     spread_frac = _spread_frac_for_volume(bar.volume)
     # Use the bar's actual intraday trade range as a floor on the spread.
@@ -684,6 +736,8 @@ def get_chain(
         if (asof - bar_asof).days > 7:
             continue
         try:
+            raw_bid = bar_dict.get("bid")
+            raw_ask = bar_dict.get("ask")
             bar = OptionDailyBar(
                 asof=bar_asof,
                 open=Decimal(bar_dict["open"]),
@@ -691,8 +745,10 @@ def get_chain(
                 low=Decimal(bar_dict["low"]),
                 close=Decimal(bar_dict["close"]),
                 volume=int(bar_dict["volume"]),
+                bid=Decimal(raw_bid) if raw_bid is not None else None,
+                ask=Decimal(raw_ask) if raw_ask is not None else None,
             )
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, ArithmeticError):
             continue
         meta = ContractMeta(
             symbol=sym,
